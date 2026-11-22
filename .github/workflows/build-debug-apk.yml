@@ -29,35 +29,69 @@ jobs:
           distribution: temurin
           java-version: "21"
 
-      - name: Accept Android SDK licenses
+      - name: Install Android SDK 36.1 and accept licenses
         run: |
           SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
           SDKMANAGER="$({ find "$SDK_ROOT/cmdline-tools" -name sdkmanager -type f 2>/dev/null || true; } | sort -V | tail -n 1)"
           if [ -z "$SDKMANAGER" ]; then
             SDKMANAGER="$(command -v sdkmanager || true)"
           fi
-          if [ -n "$SDKMANAGER" ]; then
-            echo "Using sdkmanager: $SDKMANAGER"
-            yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
-          else
-            echo "Warning: sdkmanager not found under $SDK_ROOT"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "Error: sdkmanager not found under $SDK_ROOT"
+            exit 1
           fi
+
+          echo "Using sdkmanager: $SDKMANAGER"
+          set +o pipefail
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null
+          LICENSE_STATUS=${PIPESTATUS[1]}
+          echo "sdkmanager --licenses exit code: $LICENSE_STATUS"
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
+            "platform-tools" \
+            "build-tools;36.0.0" \
+            "platforms;android-36.1" \
+            "platforms;android-36"
+          INSTALL_STATUS=${PIPESTATUS[1]}
+          set -o pipefail
+
+          if [ "$INSTALL_STATUS" -ne 0 ]; then
+            echo "Error: sdkmanager package installation failed with exit code $INSTALL_STATUS"
+            exit "$INSTALL_STATUS"
+          fi
+
+          echo "Installed SDK platforms:"
+          ls -1 "$SDK_ROOT/platforms" || true
+          echo "Installed SDK build-tools:"
+          ls -1 "$SDK_ROOT/build-tools" || true
 
       - name: Set up Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "9.3.1"
 
-      - name: Prepare debug keystore
+      - name: Prepare debug keystore and build config defaults
         run: |
-          if [ -f debug.keystore ]; then
-            echo "Using existing debug.keystore"
-          elif [ -f debug.keystore.base64 ]; then
+          if [ ! -f .env ] && [ ! -f .env.example ]; then
+            echo "# CI fallback defaults for Secrets Gradle Plugin" > .env.example
+          fi
+
+          if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
             echo "Decoding debug.keystore from debug.keystore.base64"
-            base64 --decode debug.keystore.base64 > debug.keystore
-          else
+            tr -d '\r\n ' < debug.keystore.base64 | base64 --decode > debug.keystore || rm -f debug.keystore
+          fi
+
+          if [ -f debug.keystore ]; then
+            if ! keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey >/dev/null 2>&1; then
+              echo "Existing debug.keystore is invalid; regenerating a fresh CI debug keystore"
+              rm -f debug.keystore
+            fi
+          fi
+
+          if [ ! -f debug.keystore ]; then
             echo "Generating local debug.keystore for CI debug signing"
             keytool -genkeypair -v \
               -keystore debug.keystore \
@@ -70,10 +104,23 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      - name: Run unit tests and assemble Debug APK
-        run: gradle :app:testDebugUnitTest :app:assembleDebug --stacktrace
+      - name: Assemble Debug APK
+        id: assemble
+        run: |
+          gradle :app:assembleDebug \
+            --no-daemon \
+            --no-configuration-cache \
+            -Dorg.gradle.jvmargs="-Xmx3g -Dfile.encoding=UTF-8"
+
+      - name: Run Unit Tests
+        run: |
+          gradle :app:testDebugUnitTest \
+            --no-daemon \
+            --no-configuration-cache \
+            -Dorg.gradle.jvmargs="-Xmx3g -Dfile.encoding=UTF-8"
 
       - name: Upload Debug APK artifact
+        if: ${{ !cancelled() && steps.assemble.outcome == 'success' }}
         uses: actions/upload-artifact@v4
         with:
           name: WebViewDiagnosticsApp-debug-apk

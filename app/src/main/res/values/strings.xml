@@ -1,0 +1,33 @@
+<resources>
+    <string name="app_name">WebViewDiagnosticsApp</string>
+    <string name="url_input_hint">Enter target URL (https://...)</string>
+    <string name="action_load">Go</string>
+    <string name="action_reload">Reload</string>
+    <string name="action_desktop_ua">Desktop UA</string>
+    <string name="action_mobile_ua">Mobile UA</string>
+    <string name="step_1_inspect_scope">1. Inspect Global Scope</string>
+    <string name="step_2a_capture_baseline">2A. Capture State Baseline</string>
+    <string name="step_2b_compute_delta">2B. Compute State Delta</string>
+    <string name="step_2_instruction">Shift application focus or trigger movement in the web view, then tap 2B.</string>
+    <string name="step_3_scan_entities">3. Scan Active Entities</string>
+    <string name="step_5_export_report">Export Diagnostic Report</string>
+    <string name="action_share_report">Share JSON</string>
+    <string name="action_js_drawer">JS Console</string>
+    <string name="action_execute_script">Execute Script</string>
+    <string name="js_input_hint">Enter JS expression or query path…</string>
+    <string name="console_title">TELEMETRY CONSOLE</string>
+    <string name="console_empty_title">Diagnostic Engine Armed</string>
+    <string name="console_empty_subtitle">Load any web application URL above, then run Steps 1 → 3 to inspect runtime state, coordinate deltas, canvas projections, and asset streams.</string>
+    <string name="cd_reload_page">Reload current page</string>
+    <string name="cd_toggle_desktop_ua">Toggle desktop user agent mode</string>
+    <string name="cd_toggle_js_drawer">Toggle manual JavaScript execution drawer</string>
+    <string name="cd_clear_logs">Clear telemetry logs</string>
+    <string name="cd_toggle_split">Toggle console split height</string>
+    <string name="cd_copy_log">Copy log payload</string>
+    <string name="cd_share_report">Share exported JSON report</string>
+    <string name="cd_close_drawer">Close JavaScript drawer</string>
+    <string name="toast_report_saved">Diagnostic report saved to Downloads: %1$s</string>
+    <string name="toast_report_failed">Failed to export report: %1$s</string>
+    <string name="toast_log_copied">Log entry copied to clipboard</string>
+    <string name="share_report_chooser_title">Share Diagnostic Telemetry Report</string>
+</resources>

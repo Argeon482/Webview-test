@@ -95,21 +95,28 @@ import java.util.Locale
 fun TelemetryConsolePanel(
     state: DiagnosticsUiState,
     onRunStep1: () -> Unit,
+    onPauseStep1: () -> Unit,
+    onResumeStep1: () -> Unit,
     onRunStep2A: () -> Unit,
     onRunStep2B: () -> Unit,
     onRunStep3: () -> Unit,
     onExportReport: () -> Unit,
     onShareReport: () -> Unit,
+    onExportLogDumpTxt: () -> Unit,
+    onExportLogDumpJson: () -> Unit,
+    onShareLogDump: () -> Unit,
     onSelectConsoleTab: (ConsoleTab) -> Unit,
     onSelectFilter: (LogCategory) -> Unit,
     onTogglePinCandidate: (String) -> Unit,
     onTogglePinnedOnly: () -> Unit,
+    onStagingSearchQueryChanged: (String) -> Unit,
     onClearUnpinnedCandidates: () -> Unit,
     onLockCandidateForLivePolling: (String) -> Unit,
     onPinExternalPath: (path: String, sourceStep: String, detail: String) -> Unit,
     onToggleJsDrawer: () -> Unit,
     onManualJsChanged: (String) -> Unit,
     onExecuteManualJs: () -> Unit,
+    onClearAssetCache: () -> Unit,
     onClearLogs: () -> Unit,
     onToggleExpanded: () -> Unit,
     onCopyPayload: (String) -> Unit,
@@ -152,6 +159,8 @@ fun TelemetryConsolePanel(
                     GuidedFourStepWizard(
                         state = state,
                         onRunStep1 = onRunStep1,
+                        onPauseStep1 = onPauseStep1,
+                        onResumeStep1 = onResumeStep1,
                         onRunStep2A = onRunStep2A,
                         onRunStep2B = onRunStep2B,
                         onRunStep3 = onRunStep3,
@@ -171,8 +180,11 @@ fun TelemetryConsolePanel(
                         state = state,
                         onTogglePin = onTogglePinCandidate,
                         onTogglePinnedOnly = onTogglePinnedOnly,
+                        onSearchQueryChanged = onStagingSearchQueryChanged,
                         onClearUnpinned = onClearUnpinnedCandidates,
                         onTrackLive = onLockCandidateForLivePolling,
+                        onPauseBatchScan = onPauseStep1,
+                        onResumeBatchScan = onResumeStep1,
                         onCopyPath = onCopyPayload,
                         modifier = Modifier
                             .weight(1f)
@@ -192,10 +204,25 @@ fun TelemetryConsolePanel(
                     )
                 }
 
+                ConsoleTab.ASSETS -> {
+                    AssetMetadataInspectorView(
+                        state = state,
+                        onClearAssetCache = onClearAssetCache,
+                        onExportAssetDumpJson = onExportLogDumpJson,
+                        onCopyMetadata = onCopyPayload,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                    )
+                }
+
                 ConsoleTab.LOGS -> {
                     LiveLogConsoleView(
                         state = state,
                         onSelectFilter = onSelectFilter,
+                        onExportLogDumpTxt = onExportLogDumpTxt,
+                        onExportLogDumpJson = onExportLogDumpJson,
+                        onShareLogDump = onShareLogDump,
                         onCopyPayload = onCopyPayload,
                         modifier = Modifier
                             .weight(1f)
@@ -255,6 +282,13 @@ private fun ConsoleHeaderBar(
                     accent = TelemetryViolet,
                     testTag = "tab_entities_button",
                     onClick = { onSelectTab(ConsoleTab.ENTITIES) }
+                )
+                HeaderTabPill(
+                    label = "${stringResource(R.string.tab_assets)} (${state.interceptedAssets.size})",
+                    selected = state.activeConsoleTab == ConsoleTab.ASSETS,
+                    accent = ElectricCyan,
+                    testTag = "tab_assets_button",
+                    onClick = { onSelectTab(ConsoleTab.ASSETS) }
                 )
                 HeaderTabPill(
                     label = "${stringResource(R.string.tab_logs)} (${state.logs.size})",
@@ -422,6 +456,8 @@ private fun HeaderTabPill(
 private fun GuidedFourStepWizard(
     state: DiagnosticsUiState,
     onRunStep1: () -> Unit,
+    onPauseStep1: () -> Unit,
+    onResumeStep1: () -> Unit,
     onRunStep2A: () -> Unit,
     onRunStep2B: () -> Unit,
     onRunStep3: () -> Unit,
@@ -441,7 +477,7 @@ private fun GuidedFourStepWizard(
                 .padding(horizontal = 10.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // STEP 1 — Find Game Engine
+            // STEP 1 — Find Game Engine (100-item Batched Chunked Scan)
             WizardStepCard(
                 title = stringResource(R.string.wizard_step_1_title),
                 badge = state.step1Badge,
@@ -452,22 +488,31 @@ private fun GuidedFourStepWizard(
                     icon = Icons.Default.Radar,
                     accent = ElectricCyan,
                     enabled = true,
+                    isBusy = state.scopeBatchProgress.isActive && !state.scopeBatchProgress.isPaused,
                     testTag = "step_1_inspect_scope_button",
                     onClick = onRunStep1
                 )
+                if (state.scopeBatchProgress.isActive || state.scopeBatchProgress.isPaused) {
+                    BatchScanProgressBanner(
+                        progress = state.scopeBatchProgress,
+                        onPause = onPauseStep1,
+                        onResume = onResumeStep1,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
                 Text(
                     text = stringResource(R.string.wizard_step_1_instruction),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 if (state.step1Completed) {
-                    val timing = state.step1DurationMs?.let { String.format(Locale.US, "%.2fms", it) } ?: ""
+                    val timing = state.step1DurationMs?.let { String.format(Locale.US, "%.0fms", it) } ?: ""
                     val preview = state.customGlobals.take(6).joinToString(", ")
                     CapturedSnippetBox(
                         accent = ElectricCyan,
                         text = "Found ${state.customGlobals.size} custom globals ($timing) • ${state.stagingBuffer.size} staged" +
                             if (preview.isNotEmpty()) "\nGlobals: $preview" else "",
-                        actionLabel = "Open Staging (${state.stagingBuffer.size}) ›",
+                        actionLabel = "Search & Pin in Staging (${state.stagingBuffer.size}) ›",
                         onActionClick = onOpenStaging
                     )
                 }
@@ -1081,12 +1126,14 @@ private fun AsyncScanStatusPill(
     val accent = when (status) {
         AsyncScanStatus.IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
         AsyncScanStatus.RUNNING -> ElectricCyan
+        AsyncScanStatus.PAUSED -> AssetAmber
         AsyncScanStatus.COMPLETED -> SignalEmerald
         AsyncScanStatus.ERROR -> AlertCoral
     }
     val statusLabel = when (status) {
         AsyncScanStatus.IDLE -> stringResource(R.string.scan_status_idle)
         AsyncScanStatus.RUNNING -> stringResource(R.string.scan_status_running)
+        AsyncScanStatus.PAUSED -> stringResource(R.string.scan_status_paused)
         AsyncScanStatus.COMPLETED -> stringResource(R.string.scan_status_completed)
         AsyncScanStatus.ERROR -> stringResource(R.string.scan_status_error)
     }

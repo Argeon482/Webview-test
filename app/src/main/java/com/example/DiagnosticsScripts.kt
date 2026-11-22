@@ -22,7 +22,8 @@ object DiagnosticsScripts {
           discoveredEntityArrayPath: null,
           entityProjectionMode: '',
           discoveredEntities: [],
-          livePollId: null
+          livePollId: null,
+          scopeBatch: null
         });
 
         const __KNOWN_ENGINE_GLOBALS = new Set([
@@ -98,6 +99,23 @@ object DiagnosticsScripts {
           try {
             if (__bridge && typeof __bridge.updateScanStatus === 'function') {
               __bridge.updateScanStatus(String(status || 'IDLE'), String(detail || ''));
+            }
+          } catch (_) {}
+        };
+
+        const __setBatchProgress = function(currentBatch, totalBatches, itemStart, itemEnd, totalItems, foundCount, isActive, isPaused) {
+          try {
+            if (__bridge && typeof __bridge.updateBatchProgress === 'function') {
+              __bridge.updateBatchProgress(
+                currentBatch | 0,
+                totalBatches | 0,
+                itemStart | 0,
+                itemEnd | 0,
+                totalItems | 0,
+                foundCount | 0,
+                Boolean(isActive),
+                Boolean(isPaused)
+              );
             }
           } catch (_) {}
         };
@@ -481,118 +499,241 @@ object DiagnosticsScripts {
     """
 
     /**
-     * Step 1: Zero-Freeze Filtered Scope Check (<2 ms).
+     * Step 1: Non-Blocking Batched Chunked Global Variable Inspection (100 items per batch).
+     * Processes `Object.getOwnPropertyNames(window)` in staggered async batches of 100 items,
+     * streams live batch progress (`Scanning batch X/Y (items A–B)…`), accumulates newly discovered
+     * custom globals into Staging incrementally, and supports live Pause/Resume.
      */
     fun buildInspectGlobalScopeScript(): String = """
         (function() {
           try {
             $SHARED_RUNTIME
+            const BATCH_SIZE = 100;
+            const BATCH_STAGGER_MS = 18;
+
+            // Cancel any previously running batched scan cleanly
+            if (__state.scopeBatch && __state.scopeBatch.timerId !== null) {
+              clearTimeout(__state.scopeBatch.timerId);
+              __state.scopeBatch.timerId = null;
+            }
+
             const mySeq = ++__state.scanSeq;
-            const t0 = performance.now();
-            __setStatus('RUNNING', 'Step 1: Filtering custom globals…');
+            const rawKeys = Object.getOwnPropertyNames(window);
+            const totalItems = rawKeys.length;
+            const totalBatches = Math.max(1, Math.ceil(totalItems / BATCH_SIZE));
 
-            const filterRes = __filterCustomWindowKeys();
-            const customKeys = filterRes.customKeys;
-            const customObjects = [];
-            const globalContexts = [];
+            const job = {
+              seq: mySeq,
+              active: true,
+              paused: false,
+              rawKeys: rawKeys,
+              cursor: 0,
+              batchIndex: 0,
+              totalBatches: totalBatches,
+              batchSize: BATCH_SIZE,
+              totalItems: totalItems,
+              startTimeMs: performance.now(),
+              customObjects: [],
+              globalContexts: [],
+              timerId: null
+            };
+            __state.scopeBatch = job;
 
-            const limit = Math.min(customKeys.length, 120);
-            for (let i = 0; i < limit; i++) {
-              const k = customKeys[i];
-              let val;
-              try { val = window[k]; } catch (_) { continue; }
-              if (val === undefined || val === null) continue;
-              const t = typeof val;
-              if (t === 'object' && __isSpecialHostObject(val)) {
-                const desc = __describeSkippedObject(val);
-                if (desc.startsWith('[Context:')) {
-                  globalContexts.push({ source: 'window.' + k, kind: desc });
-                }
-                continue;
+            const scheduleNextBatch = function() {
+              if (!job.active || job.paused || job.seq !== __state.scanSeq) return;
+              job.timerId = setTimeout(function() {
+                job.timerId = null;
+                __yieldFrame(runOneBatch);
+              }, BATCH_STAGGER_MS);
+            };
+
+            const finalizeScan = function() {
+              if (job.seq !== __state.scanSeq) return;
+              job.active = false;
+              job.paused = false;
+
+              job.customObjects.sort(function(a, b) { return b.score - a.score; });
+
+              const canvases = [];
+              const domCanvases = document.querySelectorAll('canvas');
+              for (let c = 0; c < domCanvases.length && c < 8; c++) {
+                const el = domCanvases[c];
+                const rect = el.getBoundingClientRect();
+                let ctxHint = 'active';
+                try {
+                  if (el.__webgl || el.gl) ctxHint = 'WebGL';
+                  else if (el.width > 0 && el.height > 0 && el.getContext) {
+                    if (el.getContext('webgl2')) ctxHint = 'WebGL2';
+                    else if (el.getContext('webgl')) ctxHint = 'WebGL1';
+                    else if (el.getContext('2d')) ctxHint = 'Canvas2D';
+                  }
+                } catch (_) {}
+                canvases.push({
+                  index: c,
+                  id: el.id || null,
+                  width: el.width,
+                  height: el.height,
+                  cssWidth: Math.round(rect.width),
+                  cssHeight: Math.round(rect.height),
+                  context: ctxHint
+                });
               }
-              if (!__isCustomGlobalCandidate(k, val)) continue;
 
-              let ctor = t;
-              let keyCount = 0;
-              let previewKeys = [];
-              let heuristicBoost = __KNOWN_ENGINE_GLOBALS.has(k) ? 100 : 0;
-              try { ctor = val.constructor && val.constructor.name ? val.constructor.name : t; } catch (_) {}
-              try {
-                if (val instanceof Map || val instanceof Set) {
-                  keyCount = val.size;
-                } else {
-                  const ownKeys = Object.keys(val);
-                  keyCount = ownKeys.length;
-                  previewKeys = ownKeys.slice(0, 5);
-                  for (let pk = 0; pk < ownKeys.length && pk < 32; pk++) {
-                    if (__HEURISTIC_KEY_RE.test(ownKeys[pk])) {
-                      heuristicBoost += 20;
+              const durationMs = Number((performance.now() - job.startTimeMs).toFixed(2));
+              __state.customGlobals = job.customObjects.map(function(o) { return o.key; });
+              __state.shallowPaths = job.customObjects.map(function(o) { return o.path; });
+
+              __setBatchProgress(
+                job.totalBatches,
+                job.totalBatches,
+                Math.max(1, totalItems - BATCH_SIZE + 1),
+                totalItems,
+                totalItems,
+                job.customObjects.length,
+                false,
+                false
+              );
+              __setStatus('COMPLETED', 'Step 1: ' + job.customObjects.length + ' custom globals (' + job.totalBatches + ' batches)');
+
+              __emit('SCOPE', {
+                stage: 'GLOBAL_SCOPE_INSPECTED',
+                durationMs: durationMs,
+                batchesExecuted: job.totalBatches,
+                batchSize: BATCH_SIZE,
+                totalWindowKeysFiltered: totalItems,
+                customGlobalCount: job.customObjects.length,
+                customGlobals: job.customObjects.slice(0, 60),
+                canvasCount: domCanvases.length,
+                canvases: canvases,
+                globalContexts: job.globalContexts,
+                viewport: {
+                  width: window.innerWidth,
+                  height: window.innerHeight,
+                  dpr: window.devicePixelRatio || 1
+                }
+              });
+            };
+
+            const runOneBatch = function() {
+              if (!job.active || job.paused || job.seq !== __state.scanSeq) return;
+
+              const startIdx = job.cursor;
+              const endIdx = Math.min(startIdx + BATCH_SIZE, totalItems);
+              job.batchIndex++;
+              const itemStart = totalItems > 0 ? (startIdx + 1) : 0;
+              const itemEnd = endIdx;
+
+              const batchLabel = 'Scanning batch ' + job.batchIndex + '/' + job.totalBatches +
+                ' (items ' + itemStart + '–' + itemEnd + ')…';
+              __setStatus('RUNNING', batchLabel);
+              __setBatchProgress(
+                job.batchIndex,
+                job.totalBatches,
+                itemStart,
+                itemEnd,
+                totalItems,
+                job.customObjects.length,
+                true,
+                false
+              );
+
+              const batchFound = [];
+              for (let i = startIdx; i < endIdx; i++) {
+                const k = job.rawKeys[i];
+                if (/^\d+$/.test(k)) continue;
+                const isKnown = __KNOWN_ENGINE_GLOBALS.has(k);
+                if (!isKnown) {
+                  if (__BUILTIN_BLACKLIST_RE.test(k)) continue;
+                  if (__STANDARD_EXACT.has(k)) continue;
+                  if (__WEB_API_PREFIX_RE.test(k)) continue;
+                  if (__WEB_API_SUFFIX_RE.test(k)) continue;
+                }
+
+                let val;
+                try { val = window[k]; } catch (_) { continue; }
+                if (val === undefined || val === null) continue;
+                const t = typeof val;
+                if (t === 'object' && __isSpecialHostObject(val)) {
+                  const desc = __describeSkippedObject(val);
+                  if (desc.startsWith('[Context:')) {
+                    job.globalContexts.push({ source: 'window.' + k, kind: desc });
+                  }
+                  continue;
+                }
+                if (!__isCustomGlobalCandidate(k, val)) continue;
+
+                let ctor = t;
+                let keyCount = 0;
+                let previewKeys = [];
+                let heuristicBoost = isKnown ? 100 : 0;
+                try { ctor = val.constructor && val.constructor.name ? val.constructor.name : t; } catch (_) {}
+                try {
+                  if (val instanceof Map || val instanceof Set) {
+                    keyCount = val.size;
+                  } else {
+                    const ownKeys = Object.keys(val);
+                    keyCount = ownKeys.length;
+                    previewKeys = ownKeys.slice(0, 5);
+                    for (let pk = 0; pk < ownKeys.length && pk < 32; pk++) {
+                      if (__HEURISTIC_KEY_RE.test(ownKeys[pk])) {
+                        heuristicBoost += 20;
+                      }
                     }
                   }
-                }
-              } catch (_) {}
-              if (__HEURISTIC_KEY_RE.test(k)) heuristicBoost += 50;
+                } catch (_) {}
+                if (__HEURISTIC_KEY_RE.test(k)) heuristicBoost += 50;
 
-              customObjects.push({
-                key: k,
-                path: 'window.' + k,
-                type: t,
-                constructor: ctor,
-                keyCount: keyCount,
-                previewKeys: previewKeys,
-                score: heuristicBoost + Math.min(keyCount, 30)
-              });
-            }
-
-            customObjects.sort(function(a, b) { return b.score - a.score; });
-
-            const canvases = [];
-            const domCanvases = document.querySelectorAll('canvas');
-            for (let c = 0; c < domCanvases.length && c < 8; c++) {
-              const el = domCanvases[c];
-              const rect = el.getBoundingClientRect();
-              let ctxHint = 'active';
-              try {
-                if (el.__webgl || el.gl) ctxHint = 'WebGL';
-                else if (el.width > 0 && el.height > 0 && el.getContext) {
-                  if (el.getContext('webgl2')) ctxHint = 'WebGL2';
-                  else if (el.getContext('webgl')) ctxHint = 'WebGL1';
-                  else if (el.getContext('2d')) ctxHint = 'Canvas2D';
-                }
-              } catch (_) {}
-              canvases.push({
-                index: c,
-                id: el.id || null,
-                width: el.width,
-                height: el.height,
-                cssWidth: Math.round(rect.width),
-                cssHeight: Math.round(rect.height),
-                context: ctxHint
-              });
-            }
-
-            const durationMs = Number((performance.now() - t0).toFixed(2));
-            __state.customGlobals = customObjects.map(function(o) { return o.key; });
-            __state.shallowPaths = customObjects.map(function(o) { return o.path; });
-
-            if (mySeq !== __state.scanSeq) return;
-            __setStatus('COMPLETED', 'Step 1: ' + customObjects.length + ' globals in ' + durationMs + 'ms');
-
-            __emit('SCOPE', {
-              stage: 'GLOBAL_SCOPE_INSPECTED',
-              durationMs: durationMs,
-              totalWindowKeysFiltered: filterRes.totalWindowKeys,
-              customGlobalCount: customObjects.length,
-              customGlobals: customObjects.slice(0, 30),
-              canvasCount: domCanvases.length,
-              canvases: canvases,
-              globalContexts: globalContexts,
-              viewport: {
-                width: window.innerWidth,
-                height: window.innerHeight,
-                dpr: window.devicePixelRatio || 1
+                const entry = {
+                  key: k,
+                  path: 'window.' + k,
+                  type: t,
+                  constructor: ctor,
+                  keyCount: keyCount,
+                  previewKeys: previewKeys,
+                  score: heuristicBoost + Math.min(keyCount, 30)
+                };
+                job.customObjects.push(entry);
+                batchFound.push(entry);
               }
-            });
+
+              job.cursor = endIdx;
+
+              // Stream newly found custom globals directly into the Staging tab as batches finish
+              if (batchFound.length > 0) {
+                __emit('SCOPE', {
+                  stage: 'GLOBAL_SCOPE_BATCH',
+                  batchIndex: job.batchIndex,
+                  totalBatches: job.totalBatches,
+                  itemStart: itemStart,
+                  itemEnd: itemEnd,
+                  totalItems: totalItems,
+                  foundCount: job.customObjects.length,
+                  batchCustomGlobals: batchFound
+                });
+              }
+
+              __setBatchProgress(
+                job.batchIndex,
+                job.totalBatches,
+                itemStart,
+                itemEnd,
+                totalItems,
+                job.customObjects.length,
+                job.cursor < totalItems,
+                false
+              );
+
+              if (job.cursor < totalItems) {
+                scheduleNextBatch();
+              } else {
+                finalizeScan();
+              }
+            };
+
+            job.resumeRunner = scheduleNextBatch;
+            __setStatus('RUNNING', 'Scanning batch 1/' + totalBatches + ' (items 1–' + Math.min(BATCH_SIZE, totalItems) + ')…');
+            __setBatchProgress(1, totalBatches, totalItems > 0 ? 1 : 0, Math.min(BATCH_SIZE, totalItems), totalItems, 0, true, false);
+            __yieldFrame(runOneBatch);
           } catch (err) {
             try {
               if (window.TelemetryBridge) {
@@ -601,6 +742,51 @@ object DiagnosticsScripts {
               }
             } catch (_) {}
           }
+        })();
+    """.trimIndent()
+
+    /**
+     * Pauses an active Step 1 batched global scan cleanly between batches so the developer can
+     * inspect or search already-staged candidates without losing scan progress.
+     */
+    fun buildPauseScopeScanScript(): String = """
+        (function() {
+          try {
+            $SHARED_RUNTIME
+            const job = __state.scopeBatch;
+            if (!job || !job.active || job.paused) return;
+            job.paused = true;
+            if (job.timerId !== null) {
+              clearTimeout(job.timerId);
+              job.timerId = null;
+            }
+            const itemEnd = job.cursor;
+            const itemStart = Math.max(1, itemEnd - job.batchSize + 1);
+            __setStatus('PAUSED', 'Paused at batch ' + job.batchIndex + '/' + job.totalBatches + ' (items ' + itemStart + '–' + itemEnd + ')');
+            __setBatchProgress(job.batchIndex, job.totalBatches, itemStart, itemEnd, job.totalItems, job.customObjects.length, true, true);
+          } catch (_) {}
+        })();
+    """.trimIndent()
+
+    /**
+     * Resumes a paused Step 1 batched global scan from its saved batch cursor.
+     */
+    fun buildResumeScopeScanScript(): String = """
+        (function() {
+          try {
+            $SHARED_RUNTIME
+            const job = __state.scopeBatch;
+            if (!job || !job.active || !job.paused) return;
+            job.paused = false;
+            const nextBatch = Math.min(job.batchIndex + 1, job.totalBatches);
+            const itemStart = Math.min(job.cursor + 1, job.totalItems);
+            const itemEnd = Math.min(job.cursor + job.batchSize, job.totalItems);
+            __setStatus('RUNNING', 'Scanning batch ' + nextBatch + '/' + job.totalBatches + ' (items ' + itemStart + '–' + itemEnd + ')…');
+            __setBatchProgress(nextBatch, job.totalBatches, itemStart, itemEnd, job.totalItems, job.customObjects.length, true, false);
+            if (typeof job.resumeRunner === 'function') {
+              job.resumeRunner();
+            }
+          } catch (_) {}
         })();
     """.trimIndent()
 

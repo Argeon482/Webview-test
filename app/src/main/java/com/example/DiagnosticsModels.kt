@@ -6,6 +6,7 @@ import androidx.compose.runtime.Immutable
 enum class AsyncScanStatus(val label: String) {
     IDLE("Idle"),
     RUNNING("Scanning"),
+    PAUSED("Paused"),
     COMPLETED("Completed"),
     ERROR("Error");
 
@@ -13,12 +14,39 @@ enum class AsyncScanStatus(val label: String) {
         fun fromRaw(raw: String): AsyncScanStatus {
             return when (raw.trim().uppercase()) {
                 "RUNNING", "STARTED", "SCANNING" -> RUNNING
+                "PAUSED", "PAUSE" -> PAUSED
                 "COMPLETED", "DONE", "SUCCESS" -> COMPLETED
                 "ERROR", "FAILED" -> ERROR
                 else -> IDLE
             }
         }
     }
+}
+
+@Immutable
+data class ScopeBatchProgress(
+    val isActive: Boolean = false,
+    val isPaused: Boolean = false,
+    val currentBatch: Int = 0,
+    val totalBatches: Int = 0,
+    val itemStart: Int = 0,
+    val itemEnd: Int = 0,
+    val totalItems: Int = 0,
+    val foundCount: Int = 0
+) {
+    val fraction: Float
+        get() = if (totalBatches > 0) (currentBatch.toFloat() / totalBatches.toFloat()).coerceIn(0f, 1f) else 0f
+
+    val statusText: String
+        get() = when {
+            isPaused && totalBatches > 0 ->
+                "Paused at batch $currentBatch/$totalBatches (items $itemStart–$itemEnd) • $foundCount custom"
+            isActive && totalBatches > 0 ->
+                "Scanning batch $currentBatch/$totalBatches (items $itemStart–$itemEnd)…"
+            totalBatches > 0 && currentBatch >= totalBatches ->
+                "Completed $totalBatches/$totalBatches batches ($totalItems keys) • $foundCount custom"
+            else -> ""
+        }
 }
 
 enum class WizardStepBadge(val displayText: String) {
@@ -31,7 +59,15 @@ enum class ConsoleTab {
     WIZARD,
     STAGING,
     ENTITIES,
+    ASSETS,
     LOGS
+}
+
+enum class AssetCaptureStatus(val label: String) {
+    OBSERVED("Observed"),
+    CACHING("Syncing"),
+    CAPTURED("Cached ✓"),
+    FAILED("Metadata Only")
 }
 
 enum class LogCategory(val tag: String, val label: String) {
@@ -81,7 +117,20 @@ data class InterceptedAsset(
     val extension: String,
     val method: String,
     val timestamp: String,
-    val isForMainFrame: Boolean
+    val isForMainFrame: Boolean,
+    val fileName: String = "",
+    val captureStatus: AssetCaptureStatus = AssetCaptureStatus.OBSERVED,
+    val localRelativePath: String? = null,
+    val httpStatus: Int? = null,
+    val contentType: String = "",
+    val byteSize: Long = 0L,
+    val isTruncated: Boolean = false,
+    val sha256Prefix: String = "",
+    val magicSignature: String = "",
+    val hexHeaderPreview: String = "",
+    val entropyBits: Double = 0.0,
+    val structuralSummary: String = "",
+    val structuralDetails: String = ""
 )
 
 @Immutable
@@ -122,6 +171,7 @@ data class ExportReportOutcome(
     val fileName: String,
     val displayPath: String,
     val contentUri: Uri? = null,
+    val mimeType: String = "application/json",
     val errorMessage: String? = null
 )
 
@@ -140,10 +190,12 @@ data class DiagnosticsUiState(
     val scanCounter: Int = 0,
     val stagingBuffer: List<CandidateStagingItem> = emptyList(),
     val showPinnedOnly: Boolean = false,
-    // Step 1 state
+    val stagingSearchQuery: String = "",
+    // Step 1 state + Batched Chunked Scanning (100 items / batch)
     val step1Completed: Boolean = false,
     val customGlobals: List<String> = emptyList(),
     val step1DurationMs: Double? = null,
+    val scopeBatchProgress: ScopeBatchProgress = ScopeBatchProgress(),
     // Step 2 state + Live 200ms Reference Polling
     val baselineCaptured: Boolean = false,
     val baselineMetricCount: Int = 0,
@@ -169,11 +221,19 @@ data class DiagnosticsUiState(
     val isConsoleExpanded: Boolean = false,
     val isExporting: Boolean = false,
     val lastExport: ExportReportOutcome? = null,
+    val isExportingLogDump: Boolean = false,
+    val lastLogDumpExport: ExportReportOutcome? = null,
     val estimatedFps: Int? = null,
     val canvasCount: Int = 0
 ) {
     val pinnedCandidateCount: Int
         get() = stagingBuffer.count { it.isPinned }
+
+    val cachedAssetCount: Int
+        get() = interceptedAssets.count { it.captureStatus == AssetCaptureStatus.CAPTURED }
+
+    val totalCachedAssetBytes: Long
+        get() = interceptedAssets.filter { it.captureStatus == AssetCaptureStatus.CAPTURED }.sumOf { it.byteSize }
 
     val step1Badge: WizardStepBadge
         get() = if (step1Completed && (customGlobals.isNotEmpty() || canvasCount > 0)) {

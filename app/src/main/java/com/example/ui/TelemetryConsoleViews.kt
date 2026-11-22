@@ -15,24 +15,37 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.MyLocation
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.ViewInAr
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -45,6 +58,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -53,9 +67,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.CandidateStagingItem
 import com.example.DiagnosticsUiState
+import com.example.DiagnosticsViewModel
 import com.example.DiscoveredEntitySample
 import com.example.LogCategory
 import com.example.R
+import com.example.ScopeBatchProgress
 import com.example.TelemetryLogEntry
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
@@ -79,28 +95,53 @@ fun StagingBufferView(
     state: DiagnosticsUiState,
     onTogglePin: (String) -> Unit,
     onTogglePinnedOnly: () -> Unit,
+    onSearchQueryChanged: (String) -> Unit,
     onClearUnpinned: () -> Unit,
     onTrackLive: (String) -> Unit,
+    onPauseBatchScan: () -> Unit,
+    onResumeBatchScan: () -> Unit,
     onCopyPath: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val visibleItems = remember(state.stagingBuffer, state.showPinnedOnly) {
-        if (state.showPinnedOnly) state.stagingBuffer.filter { it.isPinned }
-        else state.stagingBuffer
+    val visibleItems = remember(state.stagingBuffer, state.showPinnedOnly, state.stagingSearchQuery) {
+        DiagnosticsViewModel.filterStagingBuffer(
+            items = state.stagingBuffer,
+            showPinnedOnly = state.showPinnedOnly,
+            rawQuery = state.stagingSearchQuery
+        )
     }
+    val quickKeywords = remember { listOf("pos", "coord", "player", "actor", "scene", "entity") }
 
     Column(modifier = modifier.background(ObsidianBg)) {
+        // Live Batched Scan Banner when Step 1 is actively scanning or paused
+        if (state.scopeBatchProgress.isActive || state.scopeBatchProgress.isPaused) {
+            BatchScanProgressBanner(
+                progress = state.scopeBatchProgress,
+                onPause = onPauseBatchScan,
+                onResume = onResumeBatchScan,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp, vertical = 5.dp)
+            )
+            HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
+        }
+
         // Staging Buffer Toolbar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(ObsidianSurface)
-                .padding(horizontal = 8.dp, vertical = 6.dp),
+                .padding(horizontal = 8.dp, vertical = 5.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
+            val countText = if (state.stagingSearchQuery.isNotBlank() || state.showPinnedOnly) {
+                "Showing ${visibleItems.size} / ${state.stagingBuffer.size}"
+            } else {
+                "Scans: ${state.scanCounter} • Staged: ${state.stagingBuffer.size}"
+            }
             Text(
-                text = "Scans: ${state.scanCounter} • Total: ${state.stagingBuffer.size}",
+                text = countText,
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.weight(1f)
@@ -163,6 +204,116 @@ fun StagingBufferView(
             }
         }
 
+        // Filtered Search & Quick Keyword Query Bar
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianSurface)
+                .padding(start = 8.dp, end = 8.dp, bottom = 6.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Surface(
+                shape = RoundedCornerShape(7.dp),
+                color = ObsidianBg,
+                border = BorderStroke(
+                    1.dp,
+                    if (state.stagingSearchQuery.isNotBlank()) ElectricCyan.copy(alpha = 0.7f) else ObsidianBorder
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 38.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Search,
+                        contentDescription = null,
+                        tint = if (state.stagingSearchQuery.isNotBlank()) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Box(
+                        modifier = Modifier.weight(1f),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        if (state.stagingSearchQuery.isEmpty()) {
+                            Text(
+                                text = stringResource(R.string.staging_search_hint),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                        BasicTextField(
+                            value = state.stagingSearchQuery,
+                            onValueChange = onSearchQueryChanged,
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = JetBrainsMonoFontFamily,
+                                color = MaterialTheme.colorScheme.onSurface
+                            ),
+                            cursorBrush = SolidColor(ElectricCyan),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .testTag("staging_search_input")
+                        )
+                    }
+                    if (state.stagingSearchQuery.isNotEmpty()) {
+                        IconButton(
+                            onClick = { onSearchQueryChanged("") },
+                            modifier = Modifier
+                                .size(24.dp)
+                                .testTag("staging_search_clear_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = stringResource(R.string.cd_clear_search),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                quickKeywords.forEach { kw ->
+                    val isSelected = state.stagingSearchQuery.trim().equals(kw, ignoreCase = true)
+                    Surface(
+                        onClick = { onSearchQueryChanged(if (isSelected) "" else kw) },
+                        shape = RoundedCornerShape(5.dp),
+                        color = if (isSelected) ElectricCyan.copy(alpha = 0.22f) else ObsidianBg,
+                        border = BorderStroke(
+                            1.dp,
+                            if (isSelected) ElectricCyan else ObsidianBorder.copy(alpha = 0.8f)
+                        ),
+                        modifier = Modifier.testTag("staging_quick_filter_$kw")
+                    ) {
+                        Text(
+                            text = kw,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                            color = if (isSelected) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+            }
+        }
+
         HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
 
         if (visibleItems.isEmpty()) {
@@ -178,21 +329,25 @@ fun StagingBufferView(
                     verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.BookmarkBorder,
+                        imageVector = if (state.stagingSearchQuery.isNotBlank()) Icons.Default.Search else Icons.Default.BookmarkBorder,
                         contentDescription = null,
-                        tint = AssetAmber.copy(alpha = 0.75f),
+                        tint = if (state.stagingSearchQuery.isNotBlank()) ElectricCyan.copy(alpha = 0.75f) else AssetAmber.copy(alpha = 0.75f),
                         modifier = Modifier.size(28.dp)
                     )
                     Text(
-                        text = if (state.showPinnedOnly) "No Pinned Candidates Yet" else stringResource(R.string.staging_empty_title),
+                        text = when {
+                            state.stagingSearchQuery.isNotBlank() -> "No matches for \"${state.stagingSearchQuery.trim()}\""
+                            state.showPinnedOnly -> "No Pinned Candidates Yet"
+                            else -> stringResource(R.string.staging_empty_title)
+                        },
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = if (state.showPinnedOnly) {
-                            "Tap the bookmark icon on any discovered path to pin it for JSON export."
-                        } else {
-                            stringResource(R.string.staging_empty_subtitle)
+                        text = when {
+                            state.stagingSearchQuery.isNotBlank() -> "Try a broader keyword (e.g. pos, coord, player, actor) or tap × to clear."
+                            state.showPinnedOnly -> "Tap the bookmark icon on any discovered path to pin it for export."
+                            else -> stringResource(R.string.staging_empty_subtitle)
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -218,6 +373,91 @@ fun StagingBufferView(
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * Reusable live batched scan progress banner with Pause / Resume controls (100 items / batch).
+ */
+@Composable
+fun BatchScanProgressBanner(
+    progress: ScopeBatchProgress,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val accent = if (progress.isPaused) AssetAmber else ElectricCyan
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = accent.copy(alpha = 0.12f),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.5f)),
+        modifier = modifier.testTag("batch_scan_progress_banner")
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        text = progress.statusText.ifBlank { "Scanning batches…" },
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        color = accent,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = "${progress.foundCount} custom globals staged • 100 items/batch",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 10.sp
+                    )
+                }
+
+                Surface(
+                    onClick = if (progress.isPaused) onResume else onPause,
+                    shape = RoundedCornerShape(6.dp),
+                    color = ObsidianBg,
+                    border = BorderStroke(1.dp, accent),
+                    modifier = Modifier.testTag("step1_pause_resume_button")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (progress.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                            contentDescription = null,
+                            tint = accent,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = stringResource(if (progress.isPaused) R.string.action_resume_scan else R.string.action_pause_scan),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = accent
+                        )
+                    }
+                }
+            }
+
+            LinearProgressIndicator(
+                progress = { progress.fraction },
+                color = accent,
+                trackColor = ObsidianBg,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(2.dp))
+            )
         }
     }
 }
@@ -654,6 +894,9 @@ private fun EntityInspectionCard(
 fun LiveLogConsoleView(
     state: DiagnosticsUiState,
     onSelectFilter: (LogCategory) -> Unit,
+    onExportLogDumpTxt: () -> Unit,
+    onExportLogDumpJson: () -> Unit,
+    onShareLogDump: () -> Unit,
     onCopyPayload: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -670,6 +913,102 @@ fun LiveLogConsoleView(
     }
 
     Column(modifier = modifier) {
+        // Dedicated Complete Log Dump Export Toolbar (.txt / .json + Share)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianSurface)
+                .padding(horizontal = 8.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Button(
+                onClick = onExportLogDumpTxt,
+                enabled = !state.isExportingLogDump,
+                shape = RoundedCornerShape(7.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = SignalEmerald.copy(alpha = 0.2f),
+                    contentColor = SignalEmerald,
+                    disabledContainerColor = ObsidianSurfaceElevated,
+                    disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                ),
+                border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.7f)),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                modifier = Modifier
+                    .weight(1f)
+                    .heightIn(min = 38.dp)
+                    .testTag("export_log_dump_txt_button")
+            ) {
+                if (state.isExportingLogDump) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = SignalEmerald
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.Download,
+                        contentDescription = null,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
+                Spacer(Modifier.width(5.dp))
+                Text(
+                    text = stringResource(R.string.action_export_log_dump_txt),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            OutlinedButton(
+                onClick = onExportLogDumpJson,
+                enabled = !state.isExportingLogDump,
+                shape = RoundedCornerShape(7.dp),
+                border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.7f)),
+                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 6.dp),
+                modifier = Modifier
+                    .heightIn(min = 38.dp)
+                    .testTag("export_log_dump_json_button")
+            ) {
+                Text(
+                    text = stringResource(R.string.action_export_log_dump_json),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = AssetAmber
+                )
+            }
+
+            if (state.lastLogDumpExport?.success == true && state.lastLogDumpExport.contentUri != null) {
+                OutlinedButton(
+                    onClick = onShareLogDump,
+                    shape = RoundedCornerShape(7.dp),
+                    border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.8f)),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                    modifier = Modifier
+                        .heightIn(min = 38.dp)
+                        .testTag("share_log_dump_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Share,
+                        contentDescription = stringResource(R.string.cd_share_log_dump),
+                        tint = ElectricCyan,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Text(
+                        text = stringResource(R.string.action_share_log_dump),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan
+                    )
+                }
+            }
+        }
+
+        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.6f), thickness = 1.dp)
+
         LogFilterRow(
             selectedFilter = state.selectedFilter,
             assetCount = state.interceptedAssets.size,

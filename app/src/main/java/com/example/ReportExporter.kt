@@ -20,21 +20,53 @@ import java.util.Locale
  */
 object ReportExporter {
 
-    fun exportJsonToDownloads(context: Context, jsonContent: String): ExportReportOutcome {
+    fun exportJsonToDownloads(
+        context: Context,
+        jsonContent: String,
+        filePrefix: String = "webview_diagnostics"
+    ): ExportReportOutcome {
         val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-        val fileName = "webview_diagnostics_$timestamp.json"
+        val fileName = "${filePrefix}_$timestamp.json"
+        return exportContentToDownloads(
+            context = context,
+            fileName = fileName,
+            mimeType = "application/json",
+            content = jsonContent
+        )
+    }
 
+    fun exportTextLogDumpToDownloads(
+        context: Context,
+        textContent: String
+    ): ExportReportOutcome {
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val fileName = "webview_log_dump_$timestamp.txt"
+        return exportContentToDownloads(
+            context = context,
+            fileName = fileName,
+            mimeType = "text/plain",
+            content = textContent
+        )
+    }
+
+    private fun exportContentToDownloads(
+        context: Context,
+        fileName: String,
+        mimeType: String,
+        content: String
+    ): ExportReportOutcome {
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                saveViaMediaStore(context, fileName, jsonContent)
+                saveViaMediaStore(context, fileName, mimeType, content)
             } else {
-                saveViaAppDownloads(context, fileName, jsonContent)
+                saveViaAppDownloads(context, fileName, mimeType, content)
             }
         } catch (e: Exception) {
             ExportReportOutcome(
                 success = false,
                 fileName = fileName,
                 displayPath = "",
+                mimeType = mimeType,
                 errorMessage = e.localizedMessage ?: "Unknown storage error"
             )
         }
@@ -43,12 +75,13 @@ object ReportExporter {
     private fun saveViaMediaStore(
         context: Context,
         fileName: String,
-        jsonContent: String
+        mimeType: String,
+        content: String
     ): ExportReportOutcome {
         val resolver = context.contentResolver
         val contentValues = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-            put(MediaStore.Downloads.MIME_TYPE, "application/json")
+            put(MediaStore.Downloads.MIME_TYPE, mimeType)
             put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
             put(MediaStore.Downloads.IS_PENDING, 1)
         }
@@ -58,9 +91,9 @@ object ReportExporter {
 
         try {
             resolver.openOutputStream(uri)?.use { stream ->
-                stream.write(jsonContent.toByteArray(Charsets.UTF_8))
+                stream.write(content.toByteArray(Charsets.UTF_8))
                 stream.flush()
-            } ?: throw IOException("Unable to open output stream for Downloads report.")
+            } ?: throw IOException("Unable to open output stream for Downloads export.")
 
             contentValues.clear()
             contentValues.put(MediaStore.Downloads.IS_PENDING, 0)
@@ -74,14 +107,16 @@ object ReportExporter {
             success = true,
             fileName = fileName,
             displayPath = "Downloads/$fileName",
-            contentUri = uri
+            contentUri = uri,
+            mimeType = mimeType
         )
     }
 
     private fun saveViaAppDownloads(
         context: Context,
         fileName: String,
-        jsonContent: String
+        mimeType: String,
+        content: String
     ): ExportReportOutcome {
         val downloadsDir = context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)
             ?: File(context.cacheDir, "reports")
@@ -89,7 +124,7 @@ object ReportExporter {
             downloadsDir.mkdirs()
         }
         val outputFile = File(downloadsDir, fileName)
-        outputFile.writeText(jsonContent, Charsets.UTF_8)
+        outputFile.writeText(content, Charsets.UTF_8)
 
         val uri = FileProvider.getUriForFile(
             context,
@@ -101,7 +136,8 @@ object ReportExporter {
             success = true,
             fileName = fileName,
             displayPath = "Downloads/$fileName",
-            contentUri = uri
+            contentUri = uri,
+            mimeType = mimeType
         )
     }
 }

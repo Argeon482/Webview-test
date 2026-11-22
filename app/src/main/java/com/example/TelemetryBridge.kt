@@ -23,7 +23,8 @@ class TelemetryBridge(
     private val onTelemetryReceived: (category: String, payload: String) -> Unit,
     private val onReportPayloadReceived: (jsonContent: String) -> Unit,
     private val onScanStatusChanged: (status: AsyncScanStatus, detail: String) -> Unit = { _, _ -> },
-    private val onPlayerCoordsUpdated: (path: String, x: Double, y: Double, z: Double) -> Unit = { _, _, _, _ -> }
+    private val onPlayerCoordsUpdated: (path: String, x: Double, y: Double, z: Double) -> Unit = { _, _, _, _ -> },
+    private val onBatchProgressChanged: (ScopeBatchProgress) -> Unit = { _ -> }
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exportArmed = AtomicBoolean(false)
@@ -86,6 +87,39 @@ class TelemetryBridge(
 
         mainHandler.post {
             onPlayerCoordsUpdated(safePath, x, y, z)
+        }
+    }
+
+    @JavascriptInterface
+    fun updateBatchProgress(
+        currentBatch: Int,
+        totalBatches: Int,
+        itemStart: Int,
+        itemEnd: Int,
+        totalItems: Int,
+        foundCount: Int,
+        isActive: Boolean,
+        isPaused: Boolean
+    ) {
+        val safeTotalBatches = totalBatches.coerceIn(0, 10_000)
+        val safeCurrentBatch = currentBatch.coerceIn(0, safeTotalBatches.coerceAtLeast(1))
+        val safeTotalItems = totalItems.coerceIn(0, 1_000_000)
+        val safeStart = itemStart.coerceIn(0, safeTotalItems)
+        val safeEnd = itemEnd.coerceIn(safeStart, safeTotalItems)
+        val safeFound = foundCount.coerceIn(0, 100_000)
+
+        val progress = ScopeBatchProgress(
+            isActive = isActive,
+            isPaused = isPaused,
+            currentBatch = safeCurrentBatch,
+            totalBatches = safeTotalBatches,
+            itemStart = safeStart,
+            itemEnd = safeEnd,
+            totalItems = safeTotalItems,
+            foundCount = safeFound
+        )
+        mainHandler.post {
+            onBatchProgressChanged(progress)
         }
     }
 

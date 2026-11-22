@@ -30,7 +30,7 @@ sealed interface DiagnosticsEffect {
     data class ApplyUserAgent(val desktopMode: Boolean, val reloadAfter: Boolean) : DiagnosticsEffect
     data class EvaluateJs(val script: String) : DiagnosticsEffect
     data class ShowToast(val message: String) : DiagnosticsEffect
-    data class ShareReport(val uri: Uri, val fileName: String) : DiagnosticsEffect
+    data class ShareReport(val uri: Uri, val fileName: String, val mimeType: String = "application/json") : DiagnosticsEffect
 }
 
 class DiagnosticsViewModel : ViewModel() {
@@ -65,6 +65,7 @@ class DiagnosticsViewModel : ViewModel() {
                         step1Completed = false,
                         customGlobals = emptyList(),
                         step1DurationMs = null,
+                        scopeBatchProgress = ScopeBatchProgress(),
                         baselineCaptured = false,
                         baselineMetricCount = 0,
                         isolatedPaths = emptyList(),
@@ -178,6 +179,22 @@ class DiagnosticsViewModel : ViewModel() {
         }
     }
 
+    fun onBatchProgressChanged(progress: ScopeBatchProgress) {
+        _uiState.update { state ->
+            val nextStatus = when {
+                progress.isPaused -> AsyncScanStatus.PAUSED
+                progress.isActive -> AsyncScanStatus.RUNNING
+                progress.totalBatches > 0 && progress.currentBatch >= progress.totalBatches -> AsyncScanStatus.COMPLETED
+                else -> state.scanStatus
+            }
+            state.copy(
+                scopeBatchProgress = progress,
+                scanStatus = nextStatus,
+                scanStatusDetail = progress.statusText.ifBlank { state.scanStatusDetail }
+            )
+        }
+    }
+
     fun onPlayerCoordsUpdated(path: String, x: Double, y: Double, z: Double) {
         _uiState.update { state ->
             state.copy(
@@ -207,6 +224,10 @@ class DiagnosticsViewModel : ViewModel() {
 
     fun onTogglePinnedOnlyFilter() {
         _uiState.update { it.copy(showPinnedOnly = !it.showPinnedOnly) }
+    }
+
+    fun onStagingSearchQueryChanged(query: String) {
+        _uiState.update { it.copy(stagingSearchQuery = query) }
     }
 
     fun onClearUnpinnedCandidates() {
@@ -242,15 +263,52 @@ class DiagnosticsViewModel : ViewModel() {
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildLockCandidateRefScript(candidatePath)))
     }
 
-    // Step 1: Zero-Freeze Filtered Custom Global Check (<2 ms)
+    // Step 1: Non-Blocking 100-Item Batched Global Variable Inspection (with Pause / Resume)
     fun runStep1InspectScope() {
-        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 1: Filtering custom globals…")
+        _uiState.update {
+            it.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Starting batched global scan (100/batch)…",
+                scopeBatchProgress = ScopeBatchProgress(
+                    isActive = true,
+                    isPaused = false,
+                    currentBatch = 1,
+                    totalBatches = 1,
+                    itemStart = 1,
+                    itemEnd = 100,
+                    totalItems = 100,
+                    foundCount = 0
+                )
+            )
+        }
         appendLog(
             LogCategory.SCOPE,
-            "Step 1: Scanning custom globals (appending to Staging)…",
-            "Filtering standard DOM/Web APIs out of window keys and checking active Canvas/WebGL contexts"
+            "Step 1: Starting batched global scan (100 items/batch)…",
+            "Processing window keys in staggered async batches of 100 items; custom globals stream live into Staging"
         )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildInspectGlobalScopeScript()))
+    }
+
+    fun pauseStep1BatchScan() {
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.PAUSED,
+                scopeBatchProgress = state.scopeBatchProgress.copy(isPaused = true)
+            )
+        }
+        appendLog(LogCategory.SCOPE, "Step 1: Paused batched scan", "You can search/pin staged items and resume anytime.")
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildPauseScopeScanScript()))
+    }
+
+    fun resumeStep1BatchScan() {
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scopeBatchProgress = state.scopeBatchProgress.copy(isPaused = false)
+            )
+        }
+        appendLog(LogCategory.SCOPE, "Step 1: Resumed batched scan", "Continuing remaining 100-item batches…")
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildResumeScopeScanScript()))
     }
 
     // Step 2A: Capture Standing Baseline
@@ -294,18 +352,25 @@ class DiagnosticsViewModel : ViewModel() {
     }
 
     // Passive Resource & Asset Request Monitor (called from WebViewClient.shouldInterceptRequest)
-    fun onResourceRequestObserved(request: WebResourceRequest) {
+    // Never modifies or blocks WebView traffic; asynchronously mirrors .bin/.wasm/.json to filesDir for ByteBuffer audit.
+    fun onResourceRequestObserved(context: Context, request: WebResourceRequest) {
         val uri = request.url ?: return
         val fullUrl = uri.toString()
         val pathLower = (uri.path ?: fullUrl).lowercase(Locale.US)
         val matchedExt = matchTrackedAssetExtension(pathLower) ?: return
+        val fileName = BinaryAssetInspector.extractFileName(fullUrl, matchedExt)
+        val shouldCache = BinaryAssetInspector.shouldCaptureLocally(matchedExt)
+        val appContext = context.applicationContext
 
-        val record = InterceptedAsset(
+        val initialRecord = InterceptedAsset(
             url = fullUrl,
             extension = matchedExt,
             method = request.method ?: "GET",
             timestamp = formatTimestamp(System.currentTimeMillis()),
-            isForMainFrame = request.isForMainFrame
+            isForMainFrame = request.isForMainFrame,
+            fileName = fileName,
+            captureStatus = if (shouldCache) AssetCaptureStatus.CACHING else AssetCaptureStatus.OBSERVED,
+            structuralSummary = if (shouldCache) "Mirroring to filesDir for ByteBuffer audit…" else "Observed network request"
         )
 
         viewModelScope.launch(Dispatchers.Main.immediate) {
@@ -315,15 +380,62 @@ class DiagnosticsViewModel : ViewModel() {
                 if (oldest != null) seenAssetUrls.remove(oldest)
             }
             _uiState.update { state ->
-                val updated = (state.interceptedAssets + record).takeLast(MAX_TRACKED_ASSETS)
+                val updated = (state.interceptedAssets + initialRecord).takeLast(MAX_TRACKED_ASSETS)
                 state.copy(interceptedAssets = updated)
             }
-            val fileLabel = uri.lastPathSegment ?: fullUrl.takeLast(48)
             appendLog(
                 category = LogCategory.ASSET,
-                summary = "Intercepted [$matchedExt] $fileLabel",
-                payload = "${record.method} $fullUrl"
+                summary = "Intercepted [$matchedExt] $fileName",
+                payload = "${initialRecord.method} $fullUrl"
             )
+
+            if (shouldCache) {
+                val activeReferer = _uiState.value.activeUrl
+                val userAgent = if (_uiState.value.isDesktopMode) DESKTOP_USER_AGENT else "Mozilla/5.0 (Linux; Android)"
+                val audited = withContext(Dispatchers.IO) {
+                    BinaryAssetInspector.fetchSaveAndInspect(
+                        context = appContext,
+                        asset = initialRecord,
+                        userAgent = userAgent,
+                        refererUrl = activeReferer
+                    )
+                }
+                _uiState.update { state ->
+                    val updatedList = state.interceptedAssets.map { item ->
+                        if (item.url == fullUrl) audited else item
+                    }
+                    state.copy(interceptedAssets = updatedList)
+                }
+                if (audited.captureStatus == AssetCaptureStatus.CAPTURED) {
+                    appendLog(
+                        category = LogCategory.ASSET,
+                        summary = "Audited [$matchedExt] $fileName (${BinaryAssetInspector.formatBytes(audited.byteSize)}) • ${audited.magicSignature}",
+                        payload = buildString {
+                            appendLine("URL: ${audited.url}")
+                            appendLine("Local: filesDir/${audited.localRelativePath}")
+                            appendLine("SHA-256: ${audited.sha256Prefix}…")
+                            appendLine(audited.structuralDetails)
+                        }.trimEnd()
+                    )
+                }
+            }
+        }
+    }
+
+    fun onClearAssetCache(context: Context) {
+        val appContext = context.applicationContext
+        viewModelScope.launch {
+            val removedCount = withContext(Dispatchers.IO) {
+                BinaryAssetInspector.clearLocalCache(appContext)
+            }
+            seenAssetUrls.clear()
+            _uiState.update { it.copy(interceptedAssets = emptyList()) }
+            appendLog(
+                LogCategory.ASSET,
+                "Cleared local binary asset cache ($removedCount files removed)",
+                "Cleared filesDir/captured_assets"
+            )
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Cleared $removedCount cached asset files"))
         }
     }
 
@@ -401,7 +513,71 @@ class DiagnosticsViewModel : ViewModel() {
     fun onShareLastReport() {
         val export = _uiState.value.lastExport
         if (export != null && export.success && export.contentUri != null) {
-            _effects.tryEmit(DiagnosticsEffect.ShareReport(export.contentUri, export.fileName))
+            _effects.tryEmit(DiagnosticsEffect.ShareReport(export.contentUri, export.fileName, export.mimeType))
+        }
+    }
+
+    // Complete Log Dump Export (.txt or .json) from Logs tab
+    fun exportFullLogDump(context: Context, asJson: Boolean = false) {
+        if (_uiState.value.isExportingLogDump) return
+        val appContext = context.applicationContext
+        val snapshot = _uiState.value
+        _uiState.update { it.copy(isExportingLogDump = true) }
+
+        viewModelScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                if (asJson) {
+                    val fallbackViewport = JSONObject()
+                        .put("url", snapshot.activeUrl)
+                        .put("width", snapshot.entityViewportWidth)
+                        .put("height", snapshot.entityViewportHeight)
+                        .toString()
+                    val jsonContent = buildFullReportJson(snapshot, fallbackViewport)
+                    ReportExporter.exportJsonToDownloads(
+                        context = appContext,
+                        jsonContent = jsonContent,
+                        filePrefix = "webview_log_dump"
+                    )
+                } else {
+                    val textDump = buildFullLogDumpText(snapshot)
+                    ReportExporter.exportTextLogDumpToDownloads(appContext, textDump)
+                }
+            }
+
+            _uiState.update {
+                it.copy(
+                    isExportingLogDump = false,
+                    lastLogDumpExport = outcome
+                )
+            }
+
+            if (outcome.success) {
+                appendLog(
+                    LogCategory.SYSTEM,
+                    "Exported full log dump -> ${outcome.displayPath}",
+                    "Saved ${snapshot.logs.size} logs, ${snapshot.stagingBuffer.size} staged variables, ${snapshot.discoveredEntities.size} entities, and ${snapshot.interceptedAssets.size} asset requests to ${outcome.displayPath}"
+                )
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_log_dump_saved, outcome.fileName)
+                    )
+                )
+            } else {
+                val err = outcome.errorMessage ?: "Unknown error"
+                appendLog(LogCategory.ERROR, "Log dump export failed", err)
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_report_failed, err)
+                    )
+                )
+            }
+        }
+    }
+
+    fun onShareLastLogDump() {
+        val export = _uiState.value.lastLogDumpExport
+        if (export != null && export.success && export.contentUri != null) {
+            _effects.tryEmit(DiagnosticsEffect.ShareReport(export.contentUri, export.fileName, export.mimeType))
         }
     }
 
@@ -451,9 +627,69 @@ class DiagnosticsViewModel : ViewModel() {
         val stage = json.optString("stage", "")
 
         return when (stage) {
+            "GLOBAL_SCOPE_BATCH" -> {
+                val batchIndex = json.optInt("batchIndex", 1)
+                val totalBatches = json.optInt("totalBatches", 1)
+                val itemStart = json.optInt("itemStart", 1)
+                val itemEnd = json.optInt("itemEnd", 100)
+                val totalItems = json.optInt("totalItems", itemEnd)
+                val foundCount = json.optInt("foundCount", 0)
+                val batchArray = json.optJSONArray("batchCustomGlobals") ?: JSONArray()
+                val batchKeys = mutableListOf<String>()
+                val stagingPairs = mutableListOf<Pair<String, String>>()
+
+                for (i in 0 until batchArray.length()) {
+                    val obj = batchArray.optJSONObject(i) ?: continue
+                    val key = obj.optString("key", "").trim()
+                    if (key.isEmpty()) continue
+                    batchKeys.add(key)
+                    val path = obj.optString("path", "window.$key")
+                    val ctor = obj.optString("constructor", obj.optString("type", "Object"))
+                    val keyCount = obj.optInt("keyCount", 0)
+                    val previewArr = obj.optJSONArray("previewKeys")
+                    val previewList = buildList {
+                        if (previewArr != null) {
+                            for (pi in 0 until minOf(previewArr.length(), 4)) {
+                                val pk = previewArr.optString(pi, "").trim()
+                                if (pk.isNotEmpty()) add(pk)
+                            }
+                        }
+                    }
+                    val previewSuffix = if (previewList.isNotEmpty()) " • ${previewList.joinToString(", ")}" else ""
+                    stagingPairs.add(path to "$ctor ($keyCount keys$previewSuffix)")
+                }
+
+                _uiState.update { state ->
+                    val currentScan = state.scanCounter.coerceAtLeast(1)
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Step 1 B$batchIndex",
+                        scanNumber = currentScan,
+                        timestamp = nowTs
+                    )
+                    state.copy(
+                        customGlobals = (state.customGlobals + batchKeys).distinct(),
+                        stagingBuffer = mergedStaging,
+                        scopeBatchProgress = ScopeBatchProgress(
+                            isActive = batchIndex < totalBatches,
+                            isPaused = false,
+                            currentBatch = batchIndex,
+                            totalBatches = totalBatches,
+                            itemStart = itemStart,
+                            itemEnd = itemEnd,
+                            totalItems = totalItems,
+                            foundCount = foundCount
+                        )
+                    )
+                }
+                "Batch $batchIndex/$totalBatches ($itemStart–$itemEnd): +${batchKeys.size} custom globals staged (${batchKeys.take(4).joinToString(", ")})"
+            }
+
             "GLOBAL_SCOPE_INSPECTED" -> {
                 val canvases = json.optInt("canvasCount", 0)
                 val durationMs = json.optDouble("durationMs", 0.0)
+                val batchesExecuted = json.optInt("batchesExecuted", 1)
                 val totalFiltered = json.optInt("totalWindowKeysFiltered", 0)
                 val customArray = json.optJSONArray("customGlobals") ?: JSONArray()
                 val globalKeys = mutableListOf<String>()
@@ -496,11 +732,21 @@ class DiagnosticsViewModel : ViewModel() {
                         step1DurationMs = durationMs,
                         canvasCount = canvases,
                         stagingBuffer = mergedStaging,
+                        scopeBatchProgress = ScopeBatchProgress(
+                            isActive = false,
+                            isPaused = false,
+                            currentBatch = batchesExecuted,
+                            totalBatches = batchesExecuted,
+                            itemStart = 1,
+                            itemEnd = totalFiltered,
+                            totalItems = totalFiltered,
+                            foundCount = globalKeys.size
+                        ),
                         scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "Scan #$nextScan: ${globalKeys.size} globals (${durationMs}ms)"
+                        scanStatusDetail = "Scan #$nextScan: ${globalKeys.size} globals ($batchesExecuted batches)"
                     )
                 }
-                "Step 1 (${durationMs}ms): Found ${globalKeys.size} custom globals (filtered $totalFiltered keys) • Accumulated in Staging"
+                "Step 1 ($batchesExecuted batches, ${durationMs}ms): Found ${globalKeys.size} custom globals across $totalFiltered keys • Staged"
             }
 
             "BASELINE_CAPTURED" -> {
@@ -884,19 +1130,40 @@ class DiagnosticsViewModel : ViewModel() {
                 .put("entities", entitiesArr)
         )
 
-        // 5. Intercepted asset URLs
+        // 5. Intercepted asset catalog with local ByteBuffer metadata
         val assetsArray = JSONArray()
         state.interceptedAssets.forEach { asset ->
             assetsArray.put(
                 JSONObject()
                     .put("url", asset.url)
+                    .put("fileName", asset.fileName)
                     .put("extension", asset.extension)
                     .put("method", asset.method)
                     .put("timestamp", asset.timestamp)
                     .put("isForMainFrame", asset.isForMainFrame)
+                    .put("captureStatus", asset.captureStatus.name)
+                    .put("localRelativePath", asset.localRelativePath ?: JSONObject.NULL)
+                    .put("httpStatus", asset.httpStatus ?: JSONObject.NULL)
+                    .put("contentType", asset.contentType)
+                    .put("byteSize", asset.byteSize)
+                    .put("isTruncated", asset.isTruncated)
+                    .put("sha256Prefix", asset.sha256Prefix)
+                    .put("magicSignature", asset.magicSignature)
+                    .put("entropyBits", asset.entropyBits)
+                    .put("hexHeaderPreview", asset.hexHeaderPreview)
+                    .put("structuralSummary", asset.structuralSummary)
+                    .put("structuralDetails", asset.structuralDetails)
             )
         }
         root.put("interceptedAssetUrls", assetsArray)
+        root.put(
+            "interceptedAssetCatalog",
+            JSONObject()
+                .put("totalObserved", state.interceptedAssets.size)
+                .put("totalCachedLocally", state.cachedAssetCount)
+                .put("totalCachedBytes", state.totalCachedAssetBytes)
+                .put("assets", assetsArray)
+        )
 
         // 6. Session logs
         val logsArray = JSONArray()
@@ -980,6 +1247,127 @@ class DiagnosticsViewModel : ViewModel() {
                 }
             }
             return sortStagingBuffer(map.values.toList()).take(MAX_STAGING_ITEMS)
+        }
+
+        fun filterStagingBuffer(
+            items: List<CandidateStagingItem>,
+            showPinnedOnly: Boolean,
+            rawQuery: String
+        ): List<CandidateStagingItem> {
+            val base = if (showPinnedOnly) items.filter { it.isPinned } else items
+            val tokens = rawQuery.trim()
+                .lowercase(Locale.US)
+                .split(Regex("\\s+"))
+                .filter { it.isNotBlank() }
+            if (tokens.isEmpty()) return base
+            return base.filter { item ->
+                val haystack = "${item.path} ${item.detail} ${item.sourceStep}".lowercase(Locale.US)
+                tokens.all { token -> haystack.contains(token) }
+            }
+        }
+
+        fun buildFullLogDumpText(state: DiagnosticsUiState): String {
+            val isoNow = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date())
+            return buildString {
+                appendLine("========================================================================")
+                appendLine("WebViewDiagnosticsApp — Complete Diagnostic Log Dump")
+                appendLine("========================================================================")
+                appendLine("Generated At : $isoNow")
+                appendLine("Active URL   : ${state.activeUrl}")
+                appendLine("Page Title   : ${state.pageTitle.ifBlank { "(untitled)" }}")
+                appendLine("User-Agent   : ${if (state.isDesktopMode) "Desktop" else "Mobile"}")
+                appendLine("Remote Debug : false (disabled)")
+                appendLine("Scans Run    : ${state.scanCounter}")
+                appendLine("Canvases     : ${state.canvasCount}")
+                if (state.entityViewportWidth > 0 && state.entityViewportHeight > 0) {
+                    appendLine("Viewport     : ${state.entityViewportWidth}x${state.entityViewportHeight}")
+                }
+                appendLine()
+
+                appendLine("--- [1] LIVE PLAYER COORDINATE LOCK ---")
+                appendLine("Confirmed Path : ${state.discoveredPlayerPath ?: "(not isolated)"}")
+                appendLine("Property Keys  : ${state.playerPropertyKeys.ifBlank { "(none)" }}")
+                state.livePlayerCoords?.let { coords ->
+                    appendLine(
+                        "Live Coords    : X=${String.format(Locale.US, "%.4f", coords.x)}, " +
+                            "Y=${String.format(Locale.US, "%.4f", coords.y)}, " +
+                            "Z=${String.format(Locale.US, "%.4f", coords.z)} (ticks=${state.livePollTickCount})"
+                    )
+                }
+                if (state.isolatedPaths.isNotEmpty()) {
+                    appendLine("Isolated Deltas (${state.isolatedPaths.size}):")
+                    state.isolatedPaths.forEach { d ->
+                        appendLine("  • ${d.path} | base=${d.baselineValue} -> cur=${d.currentValue} (Δ ${d.delta})")
+                    }
+                }
+                appendLine()
+
+                appendLine("--- [2] STAGED VARIABLES (${state.stagingBuffer.size} total, ${state.pinnedCandidateCount} pinned) ---")
+                if (state.stagingBuffer.isEmpty()) {
+                    appendLine("  (none)")
+                } else {
+                    state.stagingBuffer.forEach { item ->
+                        val pinTag = if (item.isPinned) "[PINNED] " else ""
+                        appendLine("  $pinTag${item.path} | ${item.detail} | ${item.sourceStep} #${item.scanNumber} (×${item.seenCount}, ${item.lastSeenTimestamp})")
+                    }
+                }
+                appendLine()
+
+                appendLine("--- [3] ENTITY SCAN RESULTS (${state.discoveredEntities.size} detected) ---")
+                appendLine("Entity Array   : ${state.discoveredEntityArrayPath ?: "(not scanned)"}")
+                if (state.entityProjectionMode.isNotBlank()) {
+                    appendLine("Projection     : ${state.entityProjectionMode}")
+                }
+                if (state.discoveredEntities.isEmpty()) {
+                    appendLine("  (none)")
+                } else {
+                    state.discoveredEntities.forEachIndexed { idx, e ->
+                        val vis = if (e.inViewport) "IN VIEW" else "OFFSCREEN"
+                        appendLine(
+                            "  [${idx + 1}] ${e.name}${if (e.id.isNotBlank()) " #${e.id}" else ""} ($vis) | " +
+                                "world=(${String.format(Locale.US, "%.2f", e.worldX)}, ${String.format(Locale.US, "%.2f", e.worldY)}, ${String.format(Locale.US, "%.2f", e.worldZ)}) | " +
+                                "dist=${String.format(Locale.US, "%.1f", e.distanceToPlayer)} | " +
+                                "screen=(${String.format(Locale.US, "%.1f", e.screenX)}px, ${String.format(Locale.US, "%.1f", e.screenY)}px) | " +
+                                "path=${e.path}"
+                        )
+                    }
+                }
+                appendLine()
+
+                appendLine("--- [4] INTERCEPTED ASSET CATALOG (${state.interceptedAssets.size} observed, ${state.cachedAssetCount} cached locally) ---")
+                if (state.interceptedAssets.isEmpty()) {
+                    appendLine("  (none)")
+                } else {
+                    state.interceptedAssets.forEach { asset ->
+                        val sizeStr = if (asset.byteSize > 0L) " | ${BinaryAssetInspector.formatBytes(asset.byteSize)}" else ""
+                        val magicStr = if (asset.magicSignature.isNotBlank()) " | ${asset.magicSignature}" else ""
+                        appendLine("  [${asset.timestamp}] ${asset.method} (${asset.extension}) ${asset.fileName.ifBlank { asset.url }}$sizeStr$magicStr")
+                        appendLine("    URL: ${asset.url}")
+                        if (!asset.localRelativePath.isNullOrBlank()) {
+                            appendLine("    Local: filesDir/${asset.localRelativePath} | SHA-256: ${asset.sha256Prefix}")
+                        }
+                        if (asset.structuralSummary.isNotBlank()) {
+                            appendLine("    Summary: ${asset.structuralSummary}")
+                        }
+                    }
+                }
+                appendLine()
+
+                appendLine("--- [5] COMPLETE ROLLING LOG HISTORY (${state.logs.size} entries) ---")
+                if (state.logs.isEmpty()) {
+                    appendLine("  (no log entries)")
+                } else {
+                    state.logs.forEach { entry ->
+                        appendLine("[${entry.timestamp}] [${entry.category.tag}] ${entry.summary}")
+                        if (entry.payload.isNotBlank() && entry.payload != entry.summary) {
+                            entry.payload.lineSequence().forEach { line ->
+                                appendLine("    $line")
+                            }
+                        }
+                    }
+                }
+                appendLine("========================================================================")
+            }
         }
 
         private fun sortStagingBuffer(items: List<CandidateStagingItem>): List<CandidateStagingItem> {

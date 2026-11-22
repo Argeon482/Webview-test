@@ -122,6 +122,9 @@ fun DiagnosticsScreen(
             },
             onPlayerCoordsUpdated = { path, x, y, z ->
                 viewModel.onPlayerCoordsUpdated(path, x, y, z)
+            },
+            onBatchProgressChanged = { progress ->
+                viewModel.onBatchProgressChanged(progress)
             }
         )
     }
@@ -161,7 +164,7 @@ fun DiagnosticsScreen(
                     Toast.makeText(context, effect.message, Toast.LENGTH_LONG).show()
                 }
                 is DiagnosticsEffect.ShareReport -> {
-                    shareJsonReport(context, effect.uri, effect.fileName)
+                    shareExportedFile(context, effect.uri, effect.fileName, effect.mimeType)
                 }
             }
         }
@@ -221,7 +224,7 @@ fun DiagnosticsScreen(
                         onPageStarted = viewModel::onPageStarted,
                         onPageFinished = viewModel::onPageFinished,
                         onProgressChanged = viewModel::onProgressChanged,
-                        onResourceObserved = viewModel::onResourceRequestObserved,
+                        onResourceObserved = { req -> viewModel.onResourceRequestObserved(context, req) },
                         onWebViewError = viewModel::onWebViewError,
                         onBlockedScheme = viewModel::onBlockedSchemeAttempt,
                         onConsoleError = { msg ->
@@ -235,6 +238,8 @@ fun DiagnosticsScreen(
                     TelemetryConsolePanel(
                         state = state,
                         onRunStep1 = viewModel::runStep1InspectScope,
+                        onPauseStep1 = viewModel::pauseStep1BatchScan,
+                        onResumeStep1 = viewModel::resumeStep1BatchScan,
                         onRunStep2A = viewModel::runStep2ACaptureBaseline,
                         onRunStep2B = viewModel::runStep2BComputeDelta,
                         onRunStep3 = viewModel::runStep3ScanEntities,
@@ -246,16 +251,21 @@ fun DiagnosticsScreen(
                             )
                         },
                         onShareReport = viewModel::onShareLastReport,
+                        onExportLogDumpTxt = { viewModel.exportFullLogDump(context, asJson = false) },
+                        onExportLogDumpJson = { viewModel.exportFullLogDump(context, asJson = true) },
+                        onShareLogDump = viewModel::onShareLastLogDump,
                         onSelectConsoleTab = viewModel::onSelectConsoleTab,
                         onSelectFilter = viewModel::onSelectFilter,
                         onTogglePinCandidate = viewModel::onTogglePinCandidate,
                         onTogglePinnedOnly = viewModel::onTogglePinnedOnlyFilter,
+                        onStagingSearchQueryChanged = viewModel::onStagingSearchQueryChanged,
                         onClearUnpinnedCandidates = viewModel::onClearUnpinnedCandidates,
                         onLockCandidateForLivePolling = viewModel::onLockCandidateForLivePolling,
                         onPinExternalPath = viewModel::onPinExternalPath,
                         onToggleJsDrawer = { viewModel.onToggleJsDrawer() },
                         onManualJsChanged = viewModel::onManualJsInputChanged,
                         onExecuteManualJs = viewModel::onExecuteManualScript,
+                        onClearAssetCache = { viewModel.onClearAssetCache(context) },
                         onClearLogs = viewModel::onClearLogs,
                         onToggleExpanded = viewModel::onToggleConsoleExpanded,
                         onCopyPayload = { text -> copyToClipboard(context, text) },
@@ -276,7 +286,7 @@ fun DiagnosticsScreen(
                         onPageStarted = viewModel::onPageStarted,
                         onPageFinished = viewModel::onPageFinished,
                         onProgressChanged = viewModel::onProgressChanged,
-                        onResourceObserved = viewModel::onResourceRequestObserved,
+                        onResourceObserved = { req -> viewModel.onResourceRequestObserved(context, req) },
                         onWebViewError = viewModel::onWebViewError,
                         onBlockedScheme = viewModel::onBlockedSchemeAttempt,
                         onConsoleError = { msg ->
@@ -290,6 +300,8 @@ fun DiagnosticsScreen(
                     TelemetryConsolePanel(
                         state = state,
                         onRunStep1 = viewModel::runStep1InspectScope,
+                        onPauseStep1 = viewModel::pauseStep1BatchScan,
+                        onResumeStep1 = viewModel::resumeStep1BatchScan,
                         onRunStep2A = viewModel::runStep2ACaptureBaseline,
                         onRunStep2B = viewModel::runStep2BComputeDelta,
                         onRunStep3 = viewModel::runStep3ScanEntities,
@@ -301,16 +313,21 @@ fun DiagnosticsScreen(
                             )
                         },
                         onShareReport = viewModel::onShareLastReport,
+                        onExportLogDumpTxt = { viewModel.exportFullLogDump(context, asJson = false) },
+                        onExportLogDumpJson = { viewModel.exportFullLogDump(context, asJson = true) },
+                        onShareLogDump = viewModel::onShareLastLogDump,
                         onSelectConsoleTab = viewModel::onSelectConsoleTab,
                         onSelectFilter = viewModel::onSelectFilter,
                         onTogglePinCandidate = viewModel::onTogglePinCandidate,
                         onTogglePinnedOnly = viewModel::onTogglePinnedOnlyFilter,
+                        onStagingSearchQueryChanged = viewModel::onStagingSearchQueryChanged,
                         onClearUnpinnedCandidates = viewModel::onClearUnpinnedCandidates,
                         onLockCandidateForLivePolling = viewModel::onLockCandidateForLivePolling,
                         onPinExternalPath = viewModel::onPinExternalPath,
                         onToggleJsDrawer = { viewModel.onToggleJsDrawer() },
                         onManualJsChanged = viewModel::onManualJsInputChanged,
                         onExecuteManualJs = viewModel::onExecuteManualScript,
+                        onClearAssetCache = { viewModel.onClearAssetCache(context) },
                         onClearLogs = viewModel::onClearLogs,
                         onToggleExpanded = viewModel::onToggleConsoleExpanded,
                         onCopyPayload = { text -> copyToClipboard(context, text) },
@@ -665,11 +682,11 @@ private fun copyToClipboard(context: Context, text: String) {
     Toast.makeText(context, context.getString(R.string.toast_log_copied), Toast.LENGTH_SHORT).show()
 }
 
-private fun shareJsonReport(context: Context, uri: Uri, fileName: String) {
+private fun shareExportedFile(context: Context, uri: Uri, fileName: String, mimeType: String) {
     val shareIntent = Intent(Intent.ACTION_SEND).apply {
-        type = "application/json"
+        type = mimeType.ifBlank { "text/plain" }
         putExtra(Intent.EXTRA_STREAM, uri)
-        putExtra(Intent.EXTRA_SUBJECT, "WebView Diagnostics Report: $fileName")
+        putExtra(Intent.EXTRA_SUBJECT, "WebView Diagnostics Export: $fileName")
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
     val chooser = Intent.createChooser(

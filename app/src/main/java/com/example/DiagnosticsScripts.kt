@@ -59,11 +59,40 @@ object DiagnosticsScripts {
           'encodeURI','encodeURIComponent','escape','unescape','eval'
         ]);
 
-        const __HEURISTIC_KEY_RE = /(player|actor|scene|game|pos|coord|hero|net|camera|cam|entity|entities|world|avatar|char|unit|mob|monster|npc|enemy|enemies|state|transform|vec|loc|vel|rot)/i;
+        const __BUILTIN_BLACKLIST_RE = /^(window|document|navigator|location|screen|history|localStorage|sessionStorage|performance|console|indexedDB|isSecureContext|atob|btoa|fetch|alert|confirm|prompt|setTimeout|clearTimeout|setInterval|clearInterval|requestAnimationFrame|cancelAnimationFrame|crypto|Event|CustomEvent|WebSocket|Iterator|AsyncDisposableStack|DisposableStack|Option|FeaturePolicy|ViewTimeline|UserActivation|TreeWalker|Subscriber|StaticRange|ScrollTimeline|Scheduling|ReportBody|ProcessingInstruction|Plugin|PermissionStatus|Observable|NetworkInformation|MimeType|LargestContentfulPaint|KeyframeEffect|DelegatedInkTrailPresenter|DataTransferItem|DataTransfer|\d+)$/i;
+
+        const __HEURISTIC_KEY_RE = /(player|actor|scene|game|pos|coord|hero|net|camera|cam|entity|entities|world|avatar|char|unit|mob|monster|npc|enemy|enemies|state|transform|vec|loc|vel|rot|manager|engine|stage|renderer|level|map)/i;
         const __TIME_KEY_RE = /(time|timestamp|elapsed|clock|frame|tick|now|date|epoch|ms|fps|ping|latency|delta|dt)/i;
         const __COORD_AXIS_RE = /(\.(x|y|z|w|vx|vy|vz|px|py|pz|lat|lng|lon|left|top|tx|ty|tz)|\[[0-2]\]$)/i;
         const __CHUNK_BUDGET_MS = 4.0;
         const __LIVE_POLL_INTERVAL_MS = 200;
+
+        const __isNativeFunction = function(v) {
+          if (typeof v !== 'function') return false;
+          try {
+            return Function.prototype.toString.call(v).indexOf('[native code]') !== -1;
+          } catch (_) {
+            return true;
+          }
+        };
+
+        const __isNativeHostObject = function(k, v) {
+          if (!v || typeof v !== 'object') return false;
+          if (__KNOWN_ENGINE_GLOBALS.has(k)) return false;
+          if (Array.isArray(v) || ArrayBuffer.isView(v)) return false;
+          if (v instanceof Map || v instanceof Set) return false;
+          try {
+            const proto = Object.getPrototypeOf(v);
+            if (proto === null || proto === Object.prototype) return false;
+            const ctor = v.constructor;
+            if (typeof ctor === 'function' && ctor !== Object && __isNativeFunction(ctor)) {
+              return true;
+            }
+          } catch (_) {
+            return true;
+          }
+          return false;
+        };
 
         const __setStatus = function(status, detail) {
           try {
@@ -160,15 +189,51 @@ object DiagnosticsScripts {
           }
         };
 
+        const __isCustomGlobalCandidate = function(k, val) {
+          if (val === undefined || val === null) return false;
+          if (/^\d+$/.test(k)) return false;
+          if (!__KNOWN_ENGINE_GLOBALS.has(k) && __BUILTIN_BLACKLIST_RE.test(k)) return false;
+
+          const t = typeof val;
+          if (t === 'function') {
+            if (__isNativeFunction(val)) return false;
+            if (__KNOWN_ENGINE_GLOBALS.has(k)) return true;
+            try {
+              return Object.keys(val).length > 0;
+            } catch (_) {
+              return false;
+            }
+          }
+
+          if (t !== 'object') return false;
+          if (__isSpecialHostObject(val)) return false;
+          if (__isNativeHostObject(k, val)) return false;
+
+          if (__KNOWN_ENGINE_GLOBALS.has(k)) return true;
+          if (ArrayBuffer.isView(val)) return true;
+          if (val instanceof Map || val instanceof Set) return val.size > 0;
+
+          try {
+            if (Object.keys(val).length > 0) return true;
+            const ctor = val.constructor;
+            if (typeof ctor === 'function' && ctor !== Object && !__isNativeFunction(ctor)) {
+              return true;
+            }
+          } catch (_) {}
+          return false;
+        };
+
         const __filterCustomWindowKeys = function() {
           const rawKeys = Object.getOwnPropertyNames(window);
           const filtered = [];
           for (let i = 0; i < rawKeys.length; i++) {
             const k = rawKeys[i];
+            if (/^\d+$/.test(k)) continue;
             if (__KNOWN_ENGINE_GLOBALS.has(k)) {
               filtered.push(k);
               continue;
             }
+            if (__BUILTIN_BLACKLIST_RE.test(k)) continue;
             if (__STANDARD_EXACT.has(k)) continue;
             if (__WEB_API_PREFIX_RE.test(k)) continue;
             if (__WEB_API_SUFFIX_RE.test(k)) continue;
@@ -246,25 +311,45 @@ object DiagnosticsScripts {
         };
 
         /**
-         * Reads live coordinates directly from the stored object reference (`liveRef.targetObject`)
-         * and exact property keys (`xKey`, `yKey`, `zKey`), automatically refreshing the object
-         * reference from `liveRef.path` if the game engine swaps vector instances.
+         * Reads live coordinates directly from the stored object reference (`liveRef.parentObject[propName]`
+         * and `liveRef.refObject[xKey/yKey/zKey]`) rather than a primitive copy, automatically following
+         * both in-place property mutations and nested vector object replacements.
          */
         const __readLiveRefVec = function() {
           const ref = __state.liveRef;
           if (!ref) return null;
           try {
-            let target = ref.targetObject;
-            // Verify live object reference; fall back to path resolution if engine replaced the object
-            const fresh = __resolvePath(ref.path);
-            if (fresh && typeof fresh === 'object' && fresh !== target) {
-              target = fresh;
-              ref.targetObject = fresh;
+            let liveTarget = ref.refObject || ref.targetObject;
+
+            // Follow direct nested property reference `parentObject[propName]` when parent is a named container
+            if (ref.parentObject && ref.propName !== null && ref.propName !== undefined && !Array.isArray(ref.parentObject)) {
+              const nested = ref.parentObject[ref.propName];
+              if (typeof nested === 'number' && Number.isFinite(nested) && ref.refObject === ref.parentObject) {
+                return { x: nested, y: 0, z: 0 };
+              }
+              if (nested && typeof nested === 'object' && !__isSpecialHostObject(nested)) {
+                liveTarget = nested;
+                ref.refObject = nested;
+                ref.targetObject = nested;
+              }
             }
-            if (target && typeof target === 'object') {
-              const rx = ref.xKey !== null && ref.xKey !== undefined ? target[ref.xKey] : undefined;
-              const ry = ref.yKey !== null && ref.yKey !== undefined ? target[ref.yKey] : undefined;
-              const rz = ref.zKey !== null && ref.zKey !== undefined ? target[ref.zKey] : undefined;
+
+            // Fallback path re-resolution only if direct object reference is missing
+            if (!liveTarget || typeof liveTarget !== 'object') {
+              const fresh = __resolvePath(ref.path);
+              if (fresh && typeof fresh === 'object' && !__isSpecialHostObject(fresh)) {
+                liveTarget = fresh;
+                ref.refObject = fresh;
+                ref.targetObject = fresh;
+              } else if (typeof fresh === 'number' && Number.isFinite(fresh)) {
+                return { x: fresh, y: 0, z: 0 };
+              }
+            }
+
+            if (liveTarget && typeof liveTarget === 'object') {
+              const rx = ref.xKey !== null && ref.xKey !== undefined ? liveTarget[ref.xKey] : undefined;
+              const ry = ref.yKey !== null && ref.yKey !== undefined ? liveTarget[ref.yKey] : undefined;
+              const rz = ref.zKey !== null && ref.zKey !== undefined ? liveTarget[ref.zKey] : undefined;
               if ((typeof rx === 'number' && Number.isFinite(rx)) ||
                   (typeof ry === 'number' && Number.isFinite(ry)) ||
                   (typeof rz === 'number' && Number.isFinite(rz))) {
@@ -274,12 +359,8 @@ object DiagnosticsScripts {
                   z: (typeof rz === 'number' && Number.isFinite(rz)) ? rz : 0
                 };
               }
-              const vec = __extractVec3(target);
+              const vec = __extractVec3(liveTarget);
               if (vec) return vec;
-            }
-            // Handle single scalar property target (e.g., pinned numeric leaf)
-            if (typeof fresh === 'number' && Number.isFinite(fresh)) {
-              return { x: fresh, y: 0, z: 0 };
             }
           } catch (_) {}
           return null;
@@ -316,7 +397,25 @@ object DiagnosticsScripts {
         };
 
         /**
-         * Binds a direct JS object reference + property keys (xKey, yKey, zKey) for live 200ms polling.
+         * Resolves a path into `{ parentObject, propName }` so we always hold a direct JS reference
+         * to the nested property (`parentObject[propName]`) rather than a primitive copy.
+         */
+        const __resolveParentRef = function(path) {
+          const tokens = __parsePathTokens(path);
+          if (tokens.length === 0) return { parentObject: null, propName: null };
+          if (tokens.length === 1) return { parentObject: window, propName: tokens[0] };
+          const parentPath = __buildPathFromTokens(tokens.slice(0, tokens.length - 1));
+          const parentObj = __resolvePath(parentPath);
+          const propName = tokens[tokens.length - 1];
+          return {
+            parentObject: (parentObj && typeof parentObj === 'object') ? parentObj : null,
+            propName: propName
+          };
+        };
+
+        /**
+         * Binds a direct JS object reference (`refObject`, `parentObject[propName]`) + exact
+         * property keys (`xKey`, `yKey`, `zKey`) for continuous live 200ms polling.
          */
         const __bindLiveTargetRef = function(containerPath, explicitKeys) {
           const obj = __resolvePath(containerPath);
@@ -335,9 +434,13 @@ object DiagnosticsScripts {
                 zKey = obj.length >= 3 ? 2 : null;
               }
             }
+            const parentInfo = __resolveParentRef(containerPath);
             __state.discoveredPlayerPath = containerPath;
             __state.liveRef = {
               path: containerPath,
+              parentObject: parentInfo.parentObject,
+              propName: parentInfo.propName,
+              refObject: obj,
               targetObject: obj,
               xKey: xKey,
               yKey: yKey,
@@ -347,7 +450,7 @@ object DiagnosticsScripts {
             return __state.liveRef;
           }
 
-          // If user pinned a numeric leaf path (e.g. window.game.player.pos.x), bind to its parent object + key
+          // If user pinned a numeric leaf path (e.g. window.game.player.pos.x), bind directly to parentObject[leafKey]
           const tokens = __parsePathTokens(containerPath);
           if (tokens.length >= 2) {
             const leafKey = tokens[tokens.length - 1];
@@ -357,9 +460,13 @@ object DiagnosticsScripts {
               const xKey = typeof parentObj.x === 'number' ? 'x' : leafKey;
               const yKey = typeof parentObj.y === 'number' ? 'y' : null;
               const zKey = typeof parentObj.z === 'number' ? 'z' : null;
+              const grandParentInfo = __resolveParentRef(parentPath);
               __state.discoveredPlayerPath = parentPath;
               __state.liveRef = {
                 path: parentPath,
+                parentObject: grandParentInfo.parentObject || parentObj,
+                propName: grandParentInfo.parentObject ? grandParentInfo.propName : leafKey,
+                refObject: parentObj,
                 targetObject: parentObj,
                 xKey: xKey,
                 yKey: yKey,
@@ -389,34 +496,55 @@ object DiagnosticsScripts {
             const customObjects = [];
             const globalContexts = [];
 
-            const limit = Math.min(customKeys.length, 60);
+            const limit = Math.min(customKeys.length, 120);
             for (let i = 0; i < limit; i++) {
               const k = customKeys[i];
               let val;
               try { val = window[k]; } catch (_) { continue; }
               if (val === undefined || val === null) continue;
               const t = typeof val;
-              if (t === 'object' || t === 'function') {
-                if (__isSpecialHostObject(val)) {
-                  const desc = __describeSkippedObject(val);
-                  if (desc.startsWith('[Context:')) {
-                    globalContexts.push({ source: 'window.' + k, kind: desc });
-                  }
-                  continue;
+              if (t === 'object' && __isSpecialHostObject(val)) {
+                const desc = __describeSkippedObject(val);
+                if (desc.startsWith('[Context:')) {
+                  globalContexts.push({ source: 'window.' + k, kind: desc });
                 }
-                let ctor = t;
-                let keyCount = 0;
-                try { ctor = val.constructor && val.constructor.name ? val.constructor.name : t; } catch (_) {}
-                try { if (t === 'object') keyCount = Object.keys(val).length; } catch (_) {}
-                customObjects.push({
-                  key: k,
-                  path: 'window.' + k,
-                  type: t,
-                  constructor: ctor,
-                  keyCount: keyCount
-                });
+                continue;
               }
+              if (!__isCustomGlobalCandidate(k, val)) continue;
+
+              let ctor = t;
+              let keyCount = 0;
+              let previewKeys = [];
+              let heuristicBoost = __KNOWN_ENGINE_GLOBALS.has(k) ? 100 : 0;
+              try { ctor = val.constructor && val.constructor.name ? val.constructor.name : t; } catch (_) {}
+              try {
+                if (val instanceof Map || val instanceof Set) {
+                  keyCount = val.size;
+                } else {
+                  const ownKeys = Object.keys(val);
+                  keyCount = ownKeys.length;
+                  previewKeys = ownKeys.slice(0, 5);
+                  for (let pk = 0; pk < ownKeys.length && pk < 32; pk++) {
+                    if (__HEURISTIC_KEY_RE.test(ownKeys[pk])) {
+                      heuristicBoost += 20;
+                    }
+                  }
+                }
+              } catch (_) {}
+              if (__HEURISTIC_KEY_RE.test(k)) heuristicBoost += 50;
+
+              customObjects.push({
+                key: k,
+                path: 'window.' + k,
+                type: t,
+                constructor: ctor,
+                keyCount: keyCount,
+                previewKeys: previewKeys,
+                score: heuristicBoost + Math.min(keyCount, 30)
+              });
             }
+
+            customObjects.sort(function(a, b) { return b.score - a.score; });
 
             const canvases = [];
             const domCanvases = document.querySelectorAll('canvas');
@@ -500,7 +628,7 @@ object DiagnosticsScripts {
               const k = rootKeys[i];
               let v;
               try { v = window[k]; } catch (_) { continue; }
-              if (v && typeof v === 'object' && !__isSpecialHostObject(v)) {
+              if (__isCustomGlobalCandidate(k, v)) {
                 queue.push({ obj: v, path: 'window.' + k, depth: 1 });
               }
             }
@@ -739,12 +867,17 @@ object DiagnosticsScripts {
                   if (axisKeys.y === null && best.items[1]) axisKeys.y = best.items[1].leaf;
                   if (axisKeys.z === null && best.items[2]) axisKeys.z = best.items[2].leaf;
 
-                  // Also bind static third axis (e.g., y/z when walking on flat ground) from the live object
+                  // Also bind static third axis (e.g., y/z or [2] when walking on flat ground) from the live object
                   const containerObj = __resolvePath(discoveredPlayerPath);
                   if (containerObj && typeof containerObj === 'object') {
                     if (axisKeys.x === null && typeof containerObj.x === 'number') axisKeys.x = 'x';
                     if (axisKeys.y === null && typeof containerObj.y === 'number') axisKeys.y = 'y';
                     if (axisKeys.z === null && typeof containerObj.z === 'number') axisKeys.z = 'z';
+                    if (__isShortNumericVector(containerObj)) {
+                      if (axisKeys.x === null) axisKeys.x = 0;
+                      if (axisKeys.y === null) axisKeys.y = 1;
+                      if (axisKeys.z === null && containerObj.length >= 3) axisKeys.z = 2;
+                    }
                   }
 
                   const bound = __bindLiveTargetRef(discoveredPlayerPath, axisKeys);

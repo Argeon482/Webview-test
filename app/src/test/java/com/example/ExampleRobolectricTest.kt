@@ -123,13 +123,29 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `diagnostic scripts store direct liveRef with 200ms polling and anchor step 3 to parent`() {
+    fun `diagnostic scripts filter browser builtins and native code while storing direct liveRef`() {
+        val step1 = DiagnosticsScripts.buildInspectGlobalScopeScript()
         val step2b = DiagnosticsScripts.buildComputeDeltaScript()
         val step3 = DiagnosticsScripts.buildScanEntitiesScript("window.game.player.position")
 
-        assertTrue(step2b.contains("targetObject:"))
+        // Step 1 strict built-in blacklist, numeric index filter, and [native code] check
+        assertTrue(step1.contains("WebSocket"))
+        assertTrue(step1.contains("Iterator"))
+        assertTrue(step1.contains("DataTransfer"))
+        assertTrue(step1.contains("DelegatedInkTrailPresenter"))
+        assertTrue(step1.contains("\\d+"))
+        assertTrue(step1.contains("[native code]"))
+        assertTrue(step1.contains("__isCustomGlobalCandidate"))
+
+        // Step 2B direct nested reference (`parentObject[propName]` + `refObject`) and 200ms polling
+        assertTrue(step2b.contains("parentObject:"))
+        assertTrue(step2b.contains("propName:"))
+        assertTrue(step2b.contains("refObject:"))
+        assertTrue(step2b.contains("ref.parentObject[ref.propName]"))
         assertTrue(step2b.contains("__LIVE_POLL_INTERVAL_MS = 200"))
         assertTrue(step2b.contains("setInterval(pushNow, __LIVE_POLL_INTERVAL_MS)"))
+
+        // Step 3 parent-climbing visual entity discovery
         assertTrue(step3.contains("window.game.player.position"))
         assertTrue(step3.contains("for (let climb = 1; climb <= 3; climb++)"))
     }

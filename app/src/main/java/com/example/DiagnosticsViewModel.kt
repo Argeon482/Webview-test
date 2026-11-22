@@ -467,7 +467,17 @@ class DiagnosticsViewModel : ViewModel() {
                     val path = obj.optString("path", "window.$key")
                     val ctor = obj.optString("constructor", obj.optString("type", "Object"))
                     val keyCount = obj.optInt("keyCount", 0)
-                    stagingPairs.add(path to "$ctor ($keyCount keys)")
+                    val previewArr = obj.optJSONArray("previewKeys")
+                    val previewList = buildList {
+                        if (previewArr != null) {
+                            for (pi in 0 until minOf(previewArr.length(), 4)) {
+                                val pk = previewArr.optString(pi, "").trim()
+                                if (pk.isNotEmpty()) add(pk)
+                            }
+                        }
+                    }
+                    val previewSuffix = if (previewList.isNotEmpty()) " • ${previewList.joinToString(", ")}" else ""
+                    stagingPairs.add(path to "$ctor ($keyCount keys$previewSuffix)")
                 }
 
                 _uiState.update { state ->

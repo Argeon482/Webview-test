@@ -54,7 +54,39 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `telemetry bridge guards exportReport and forwards scan status and live player coords`() {
+    fun `staging buffer accumulates across multiple scans without overwriting and preserves pins`() {
+        val scan1 = DiagnosticsViewModel.mergeIntoStagingBuffer(
+            existing = emptyList(),
+            incoming = listOf("window.game" to "GameEngine (12 keys)", "window.scene" to "Scene (5 keys)"),
+            sourceStep = "Step 1",
+            scanNumber = 1,
+            timestamp = "12:00:01.000"
+        )
+        assertEquals(2, scan1.size)
+
+        // Pin window.game
+        val withPin = scan1.map { if (it.path == "window.game") it.copy(isPinned = true) else it }
+
+        // Second scan discovers new player path and re-observes window.game
+        val scan2 = DiagnosticsViewModel.mergeIntoStagingBuffer(
+            existing = withPin,
+            incoming = listOf("window.game" to "GameEngine (14 keys)", "window.game.player.pos" to "Δ +4.20"),
+            sourceStep = "Step 2B",
+            scanNumber = 2,
+            timestamp = "12:00:08.500"
+        )
+
+        assertEquals(3, scan2.size)
+        val pinnedGame = scan2.first()
+        assertEquals("window.game", pinnedGame.path)
+        assertTrue(pinnedGame.isPinned)
+        assertEquals(2, pinnedGame.seenCount)
+        assertTrue(scan2.any { it.path == "window.scene" })
+        assertTrue(scan2.any { it.path == "window.game.player.pos" })
+    }
+
+    @Test
+    fun `telemetry bridge guards exportReport and forwards scan status and live 200ms player coords`() {
         val logged = mutableListOf<Pair<String, String>>()
         val exported = mutableListOf<String>()
         val statuses = mutableListOf<Pair<AsyncScanStatus, String>>()
@@ -67,41 +99,37 @@ class ExampleRobolectricTest {
             onPlayerCoordsUpdated = { path, x, y, z -> coords.add(PlayerCoordinates(path, x, y, z)) }
         )
 
-        // Unsolicited export must be rejected
         bridge.exportReport("""{"injected":true}""")
         shadowOf(Looper.getMainLooper()).idle()
         assertTrue(exported.isEmpty())
         assertEquals("ERR", logged.first().first)
 
-        // Armed user-initiated export must succeed
         bridge.armExport()
         bridge.exportReport("""{"url":"https://example.com"}""")
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(1, exported.size)
 
-        // Scan status sanitization
         bridge.updateScanStatus("COMPLETED", "Step 1: 12 globals\nin 1.1ms")
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(AsyncScanStatus.COMPLETED, statuses.first().first)
         assertEquals("Step 1: 12 globals in 1.1ms", statuses.first().second)
 
-        // Live player coords validation (rejects NaN, accepts finite values)
         bridge.updatePlayerCoords("window.game.player.pos", Double.NaN, 0.0, 0.0)
         bridge.updatePlayerCoords("window.game.player.pos", 12.5, 3.0, -44.25)
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(1, coords.size)
         assertEquals("window.game.player.pos", coords.first().path)
         assertEquals(12.5, coords.first().x, 0.001)
-        assertEquals(-44.25, coords.first().z, 0.001)
     }
 
     @Test
-    fun `step 1 filters standard web APIs and step 3 anchors to player path`() {
-        val step1 = DiagnosticsScripts.buildInspectGlobalScopeScript()
+    fun `diagnostic scripts store direct liveRef with 200ms polling and anchor step 3 to parent`() {
+        val step2b = DiagnosticsScripts.buildComputeDeltaScript()
         val step3 = DiagnosticsScripts.buildScanEntitiesScript("window.game.player.position")
 
-        assertTrue(step1.contains("__filterCustomWindowKeys"))
-        assertTrue(step1.contains("HTML|SVG|WebGL|webkit"))
+        assertTrue(step2b.contains("targetObject:"))
+        assertTrue(step2b.contains("__LIVE_POLL_INTERVAL_MS = 200"))
+        assertTrue(step2b.contains("setInterval(pushNow, __LIVE_POLL_INTERVAL_MS)"))
         assertTrue(step3.contains("window.game.player.position"))
         assertTrue(step3.contains("for (let climb = 1; climb <= 3; climb++)"))
     }

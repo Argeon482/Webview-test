@@ -3,21 +3,8 @@ package com.example
 import org.json.JSONObject
 
 /**
- * Zero-freeze, filtered & player-anchored JavaScript diagnostic routines.
- *
- * Key optimizations:
- * 1. Zero-Freeze Step 1: Filters `Object.getOwnPropertyNames(window)` strictly by key name
- *    against standard DOM/Web API prefixes (`HTML*`, `SVG*`, `WebGL*`, `webkit*`, `on*`, `CSS*`,
- *    etc.) BEFORE touching any getter—narrowing 12,000+ browser keys to ~10–30 custom app globals
- *    in under 2 ms with zero frame drops.
- * 2. Player-Locked Step 2A / 2B + Live XYZ Polling: Captures a non-blocking chunked baseline
- *    over custom globals, isolates the exact moving player coordinate container path
- *    (`discoveredPlayerPath`), and streams live `X, Y, Z` updates to Kotlin every 250 ms.
- * 3. Anchored Step 3 Entity Discovery: Resolves `discoveredPlayerPath`, climbs 1–3 parent levels
- *    up the object tree, inspects sibling Arrays/Maps/Sets/dictionaries for nearby coordinate-bearing
- *    entities, and tests 3D->2D canvas projection (`screenX`, `screenY`).
- * 4. Circular/DOM/WebGL-Safe Serialization: Skips `window`, DOM nodes, functions, WebGL contexts,
- *    and circular references across all bridge calls.
+ * Zero-freeze, filtered & player-anchored JavaScript diagnostic routines with direct
+ * live object-reference polling (200 ms) and multi-scan candidate discovery.
  */
 object DiagnosticsScripts {
 
@@ -31,7 +18,7 @@ object DiagnosticsScripts {
           baselineTimeMs: 0,
           isolatedPaths: [],
           discoveredPlayerPath: null,
-          playerAxes: null,
+          liveRef: null,
           discoveredEntityArrayPath: null,
           entityProjectionMode: '',
           discoveredEntities: [],
@@ -45,7 +32,6 @@ object DiagnosticsScripts {
           'Hero', 'hero', 'Actor', 'actor', 'Main', 'main', 'Core', 'core', 'State', 'state'
         ]);
 
-        // Fast string-only filter eliminating 99%+ of WebIDL/DOM/Web API keys with ZERO getter reads
         const __WEB_API_PREFIX_RE = /^(HTML|SVG|WebGL|webkit|WebKit|on[a-z]|CSS|DOM|Audio|MIDI|RTC|IDB|XR|GPU|USB|HID|Bluetooth|Media|Speech|Presentation|Payment|Credential|Performance|Navigation|Animation|Font|Style|Event|Pointer|Touch|Mouse|Keyboard|Input|Wheel|Focus|UI|Text|Range|Selection|Node|Element|Attr|CharacterData|Document|Window|Screen|History|Location|Navigator|Storage|Crypto|Subtle|Canvas|Offscreen|Image|Path2D|Video|File|Blob|URL|FormData|Headers|Request|Response|Readable|Writable|Transform|Compression|Decompression|Abort|Custom|Shadow|Mutation|Resize|Intersection|Reporting|Broadcast|Message|Worker|Shared|Service|Cache|Cookie|Lock|WakeLock|Permissions|Geolocation|Sensor|Clipboard|Notification|Push|Sync|Background|VisualViewport|VirtualKeyboard|Launch|Scheduler|Trusted|Task|Atomics|Reflect|Intl|Proxy|BigInt|Float|Int|Uint|Array|DataView|Map|Set|Weak|Promise|Symbol|RegExp|Error|Eval|Reference|Syntax|Type|URI|Aggregate|Finalization|WebAssembly|XML|XPath|XSLT|VTTCue|Track|TimeRanges|Validity|BarProp|CryptoKey|External|Gamepad|Idle|Ink|Layout|MathML|NDEF|NFC|OTPCredential|Periodic|PictureInPicture|PublicKey|Sanitizer|Serial|SourceBuffer|Toggle|ViewTransition|Worklet)/;
         const __WEB_API_SUFFIX_RE = /^[A-Z][A-Za-z0-9]*(Event|Element|Error|List|Map|Set|Array|Stream|Controller|Reader|Writer|Observer|Entry|Info|Config|Options|Init|Prototype|Interface|Provider|Registry|Target|Source|Buffer|Context|Encoder|Decoder|Track|Recorder|Capabilities|Settings|Metrics|Rect|Point|Matrix|Quad|Filter|Node|Param|Collection|Declaration|Rule|Sheet|Style|Channel|Port|Store|Transaction|Cursor|Request|Response|Key|Handle|Device|Adapter|Queue|Pipeline|Shader|Texture|Sampler|BindGroup|Command)$/;
 
@@ -77,6 +63,7 @@ object DiagnosticsScripts {
         const __TIME_KEY_RE = /(time|timestamp|elapsed|clock|frame|tick|now|date|epoch|ms|fps|ping|latency|delta|dt)/i;
         const __COORD_AXIS_RE = /(\.(x|y|z|w|vx|vy|vz|px|py|pz|lat|lng|lon|left|top|tx|ty|tz)|\[[0-2]\]$)/i;
         const __CHUNK_BUDGET_MS = 4.0;
+        const __LIVE_POLL_INTERVAL_MS = 200;
 
         const __setStatus = function(status, detail) {
           try {
@@ -110,18 +97,10 @@ object DiagnosticsScripts {
           try {
             if (v === window || v === globalThis) return '[Window]';
             if (v === document) return '[Document]';
-            if (typeof Node !== 'undefined' && v instanceof Node) {
-              return '[DOM:' + (v.nodeName || 'Node') + ']';
-            }
-            if (typeof WebGL2RenderingContext !== 'undefined' && v instanceof WebGL2RenderingContext) {
-              return '[Context:WebGL2]';
-            }
-            if (typeof WebGLRenderingContext !== 'undefined' && v instanceof WebGLRenderingContext) {
-              return '[Context:WebGL1]';
-            }
-            if (typeof CanvasRenderingContext2D !== 'undefined' && v instanceof CanvasRenderingContext2D) {
-              return '[Context:Canvas2D]';
-            }
+            if (typeof Node !== 'undefined' && v instanceof Node) return '[DOM:' + (v.nodeName || 'Node') + ']';
+            if (typeof WebGL2RenderingContext !== 'undefined' && v instanceof WebGL2RenderingContext) return '[Context:WebGL2]';
+            if (typeof WebGLRenderingContext !== 'undefined' && v instanceof WebGLRenderingContext) return '[Context:WebGL1]';
+            if (typeof CanvasRenderingContext2D !== 'undefined' && v instanceof CanvasRenderingContext2D) return '[Context:Canvas2D]';
             const ctor = v && v.constructor && v.constructor.name ? v.constructor.name : 'HostObject';
             return '[' + ctor + ']';
           } catch (_) {
@@ -148,9 +127,7 @@ object DiagnosticsScripts {
               }
               return val;
             }, indent || 0);
-            if (json && json.length > 14000) {
-              return json.slice(0, 14000) + '… [truncated]';
-            }
+            if (json && json.length > 14000) return json.slice(0, 14000) + '… [truncated]';
             return json || '{}';
           } catch (e) {
             return JSON.stringify({ serializationError: String(e) });
@@ -183,10 +160,6 @@ object DiagnosticsScripts {
           }
         };
 
-        /**
-         * Instant (<2 ms) custom global filter: narrows window's own properties strictly by
-         * key string without invoking getters on standard Web APIs.
-         */
         const __filterCustomWindowKeys = function() {
           const rawKeys = Object.getOwnPropertyNames(window);
           const filtered = [];
@@ -272,52 +245,136 @@ object DiagnosticsScripts {
           return null;
         };
 
-        const __readLivePlayerVec = function() {
-          const pPath = __state.discoveredPlayerPath;
-          if (!pPath) return null;
-          const target = __resolvePath(pPath);
-          const vec = __extractVec3(target);
-          if (vec) return vec;
-          const axes = __state.playerAxes;
-          if (axes) {
-            const rx = axes.x ? __resolvePath(axes.x) : 0;
-            const ry = axes.y ? __resolvePath(axes.y) : 0;
-            const rz = axes.z ? __resolvePath(axes.z) : 0;
-            if (typeof rx === 'number' || typeof ry === 'number' || typeof rz === 'number') {
-              return {
-                x: typeof rx === 'number' && Number.isFinite(rx) ? rx : 0,
-                y: typeof ry === 'number' && Number.isFinite(ry) ? ry : 0,
-                z: typeof rz === 'number' && Number.isFinite(rz) ? rz : 0
-              };
+        /**
+         * Reads live coordinates directly from the stored object reference (`liveRef.targetObject`)
+         * and exact property keys (`xKey`, `yKey`, `zKey`), automatically refreshing the object
+         * reference from `liveRef.path` if the game engine swaps vector instances.
+         */
+        const __readLiveRefVec = function() {
+          const ref = __state.liveRef;
+          if (!ref) return null;
+          try {
+            let target = ref.targetObject;
+            // Verify live object reference; fall back to path resolution if engine replaced the object
+            const fresh = __resolvePath(ref.path);
+            if (fresh && typeof fresh === 'object' && fresh !== target) {
+              target = fresh;
+              ref.targetObject = fresh;
             }
-          }
+            if (target && typeof target === 'object') {
+              const rx = ref.xKey !== null && ref.xKey !== undefined ? target[ref.xKey] : undefined;
+              const ry = ref.yKey !== null && ref.yKey !== undefined ? target[ref.yKey] : undefined;
+              const rz = ref.zKey !== null && ref.zKey !== undefined ? target[ref.zKey] : undefined;
+              if ((typeof rx === 'number' && Number.isFinite(rx)) ||
+                  (typeof ry === 'number' && Number.isFinite(ry)) ||
+                  (typeof rz === 'number' && Number.isFinite(rz))) {
+                return {
+                  x: (typeof rx === 'number' && Number.isFinite(rx)) ? rx : 0,
+                  y: (typeof ry === 'number' && Number.isFinite(ry)) ? ry : 0,
+                  z: (typeof rz === 'number' && Number.isFinite(rz)) ? rz : 0
+                };
+              }
+              const vec = __extractVec3(target);
+              if (vec) return vec;
+            }
+            // Handle single scalar property target (e.g., pinned numeric leaf)
+            if (typeof fresh === 'number' && Number.isFinite(fresh)) {
+              return { x: fresh, y: 0, z: 0 };
+            }
+          } catch (_) {}
           return null;
         };
 
-        const __startLivePlayerPoll = function() {
+        const __stopLivePlayerPoll = function() {
           try {
             if (__state.livePollId !== null) {
               clearInterval(__state.livePollId);
               __state.livePollId = null;
             }
+          } catch (_) {}
+        };
+
+        /**
+         * Starts continuous 200ms background polling over the direct JS object reference,
+         * pushing live X/Y/Z updates through TelemetryBridge.updatePlayerCoords().
+         */
+        const __startLivePlayerPoll = function() {
+          __stopLivePlayerPoll();
+          try {
             const pushNow = function() {
               try {
-                const v = __readLivePlayerVec();
-                if (v && __bridge && typeof __bridge.updatePlayerCoords === 'function') {
-                  __bridge.updatePlayerCoords(__state.discoveredPlayerPath, v.x, v.y, v.z);
+                const v = __readLiveRefVec();
+                const activePath = (__state.liveRef && __state.liveRef.path) || __state.discoveredPlayerPath;
+                if (v && activePath && __bridge && typeof __bridge.updatePlayerCoords === 'function') {
+                  __bridge.updatePlayerCoords(activePath, v.x, v.y, v.z);
                 }
               } catch (_) {}
             };
             pushNow();
-            __state.livePollId = setInterval(pushNow, 250);
+            __state.livePollId = setInterval(pushNow, __LIVE_POLL_INTERVAL_MS);
           } catch (_) {}
+        };
+
+        /**
+         * Binds a direct JS object reference + property keys (xKey, yKey, zKey) for live 200ms polling.
+         */
+        const __bindLiveTargetRef = function(containerPath, explicitKeys) {
+          const obj = __resolvePath(containerPath);
+          if (obj && typeof obj === 'object' && !__isSpecialHostObject(obj)) {
+            let xKey = explicitKeys && explicitKeys.x !== undefined ? explicitKeys.x : null;
+            let yKey = explicitKeys && explicitKeys.y !== undefined ? explicitKeys.y : null;
+            let zKey = explicitKeys && explicitKeys.z !== undefined ? explicitKeys.z : null;
+
+            if (xKey === null && yKey === null && zKey === null) {
+              if (typeof obj.x === 'number') xKey = 'x';
+              if (typeof obj.y === 'number') yKey = 'y';
+              if (typeof obj.z === 'number') zKey = 'z';
+              if (xKey === null && __isShortNumericVector(obj)) {
+                xKey = 0;
+                yKey = 1;
+                zKey = obj.length >= 3 ? 2 : null;
+              }
+            }
+            __state.discoveredPlayerPath = containerPath;
+            __state.liveRef = {
+              path: containerPath,
+              targetObject: obj,
+              xKey: xKey,
+              yKey: yKey,
+              zKey: zKey
+            };
+            __startLivePlayerPoll();
+            return __state.liveRef;
+          }
+
+          // If user pinned a numeric leaf path (e.g. window.game.player.pos.x), bind to its parent object + key
+          const tokens = __parsePathTokens(containerPath);
+          if (tokens.length >= 2) {
+            const leafKey = tokens[tokens.length - 1];
+            const parentPath = __buildPathFromTokens(tokens.slice(0, tokens.length - 1));
+            const parentObj = __resolvePath(parentPath);
+            if (parentObj && typeof parentObj === 'object' && !__isSpecialHostObject(parentObj)) {
+              const xKey = typeof parentObj.x === 'number' ? 'x' : leafKey;
+              const yKey = typeof parentObj.y === 'number' ? 'y' : null;
+              const zKey = typeof parentObj.z === 'number' ? 'z' : null;
+              __state.discoveredPlayerPath = parentPath;
+              __state.liveRef = {
+                path: parentPath,
+                targetObject: parentObj,
+                xKey: xKey,
+                yKey: yKey,
+                zKey: zKey
+              };
+              __startLivePlayerPoll();
+              return __state.liveRef;
+            }
+          }
+          return null;
         };
     """
 
     /**
      * Step 1: Zero-Freeze Filtered Scope Check (<2 ms).
-     * Filters window keys by string name BEFORE touching any getters, leaving only the ~10-30
-     * custom game/app globals plus active <canvas> / WebGL contexts.
      */
     fun buildInspectGlobalScopeScript(): String = """
         (function() {
@@ -420,8 +477,7 @@ object DiagnosticsScripts {
     """.trimIndent()
 
     /**
-     * Step 2A: Non-blocking, chunked shallow baseline capture over the filtered custom
-     * globals (depth 1-3 on heuristic game/player containers, strictly capped & yielding every ~4 ms).
+     * Step 2A: Non-blocking, chunked shallow baseline capture across filtered custom globals.
      */
     fun buildCaptureBaselineScript(): String = """
         (function() {
@@ -430,13 +486,16 @@ object DiagnosticsScripts {
             const mySeq = ++__state.scanSeq;
             __setStatus('RUNNING', 'Step 2A: Capturing standing baseline…');
 
-            let rootKeys = Array.isArray(__state.customGlobals) && __state.customGlobals.length > 0
+            const rootKeys = Array.isArray(__state.customGlobals) && __state.customGlobals.length > 0
               ? __state.customGlobals.slice(0, 40)
               : __filterCustomWindowKeys().customKeys.slice(0, 40);
 
             const baseline = Object.create(null);
+            const candidateContainers = [];
+            const seenContainers = new Set();
             const visited = new WeakSet();
             const queue = [];
+
             for (let i = 0; i < rootKeys.length; i++) {
               const k = rootKeys[i];
               let v;
@@ -472,6 +531,15 @@ object DiagnosticsScripts {
                 if (!obj || typeof obj !== 'object' || __isSpecialHostObject(obj) || visited.has(obj)) continue;
                 visited.add(obj);
                 objectsScanned++;
+
+                if (__extractVec3(obj) && !seenContainers.has(item.path) && candidateContainers.length < 25) {
+                  seenContainers.add(item.path);
+                  const v = __extractVec3(obj);
+                  candidateContainers.push({
+                    path: item.path,
+                    detail: 'Vec3(' + v.x.toFixed(1) + ', ' + v.y.toFixed(1) + ', ' + v.z.toFixed(1) + ')'
+                  });
+                }
 
                 if (__isShortNumericVector(obj)) {
                   for (let vi = 0; vi < obj.length; vi++) {
@@ -509,8 +577,7 @@ object DiagnosticsScripts {
                       recordNum(nextPath + '[' + vi + ']', v[vi]);
                     }
                   } else if (v && typeof v === 'object' && !__isSpecialHostObject(v) && item.depth < MAX_DEPTH) {
-                    const isLikelyCoordContainer = __HEURISTIC_KEY_RE.test(k) || item.depth === 1;
-                    if (isLikelyCoordContainer) {
+                    if (__HEURISTIC_KEY_RE.test(k) || item.depth === 1) {
                       queue.push({ obj: v, path: nextPath, depth: item.depth + 1 });
                     }
                   }
@@ -529,7 +596,8 @@ object DiagnosticsScripts {
                   chunksExecuted: chunksExecuted,
                   rootObjectCount: rootKeys.length,
                   objectsScanned: objectsScanned,
-                  metricCount: metricCount
+                  metricCount: metricCount,
+                  candidateContainers: candidateContainers
                 });
               }
             };
@@ -547,9 +615,9 @@ object DiagnosticsScripts {
     """.trimIndent()
 
     /**
-     * Step 2B: Isolates the exact player coordinate container (`discoveredPlayerPath`) by
-     * comparing standing baseline against post-movement values, grouping co-moving X/Y/Z axes
-     * on the same parent object, and starting live 250ms X/Y/Z telemetry updates.
+     * Step 2B: Isolates the moving player coordinate container, stores the direct JS object
+     * reference (`targetObject`) + exact property keys (`xKey`, `yKey`, `zKey`), and launches
+     * a continuous 200 ms `setInterval` live polling loop feeding Kotlin UI state.
      */
     fun buildComputeDeltaScript(): String = """
         (function() {
@@ -565,7 +633,7 @@ object DiagnosticsScripts {
               return;
             }
 
-            __setStatus('RUNNING', 'Step 2B: Isolating player coords…');
+            __setStatus('RUNNING', 'Step 2B: Isolating live reference…');
             const baseline = __state.baseline;
             const keys = Object.keys(baseline);
             const changed = [];
@@ -615,7 +683,6 @@ object DiagnosticsScripts {
                 __setStatus('RUNNING', 'Step 2B: ' + cursor + '/' + keys.length + ' checked…');
                 __yieldFrame(processChunk);
               } else {
-                // Group changed numeric properties by parent container to find co-moving X/Y/Z vectors
                 const groups = Object.create(null);
                 for (let i = 0; i < changed.length; i++) {
                   const c = changed[i];
@@ -629,7 +696,6 @@ object DiagnosticsScripts {
 
                 const rankedGroups = Object.keys(groups).map(function(gp) {
                   const g = groups[gp];
-                  // Bonus when 2 or 3 coordinate axes moved together on the same container
                   const multiAxisBonus = g.items.length >= 2 && g.items.length <= 4 ? 180 : 0;
                   const playerHintBonus = /(player|hero|avatar|self|local|char|pos|position|coord)/i.test(gp) ? 100 : 0;
                   return {
@@ -655,33 +721,45 @@ object DiagnosticsScripts {
                 });
 
                 let discoveredPlayerPath = null;
+                let propertyKeysLabel = '';
                 let liveSample = null;
+
                 if (rankedGroups.length > 0) {
                   const best = rankedGroups[0];
                   discoveredPlayerPath = best.parentPath;
-                  const axes = { x: null, y: null, z: null };
+                  const axisKeys = { x: null, y: null, z: null };
                   for (let i = 0; i < best.items.length; i++) {
                     const it = best.items[i];
                     const lf = it.leaf.toLowerCase();
-                    if (lf === 'x' || lf === '0' || lf === 'px' || lf === 'left') axes.x = it.path;
-                    else if (lf === 'y' || lf === '1' || lf === 'py' || lf === 'top') axes.y = it.path;
-                    else if (lf === 'z' || lf === '2' || lf === 'pz') axes.z = it.path;
+                    if (lf === 'x' || lf === '0' || lf === 'px' || lf === 'left') axisKeys.x = it.leaf;
+                    else if (lf === 'y' || lf === '1' || lf === 'py' || lf === 'top') axisKeys.y = it.leaf;
+                    else if (lf === 'z' || lf === '2' || lf === 'pz') axisKeys.z = it.leaf;
                   }
-                  if (!axes.x && best.items[0]) axes.x = best.items[0].path;
-                  if (!axes.y && best.items[1]) axes.y = best.items[1].path;
-                  if (!axes.z && best.items[2]) axes.z = best.items[2].path;
+                  if (axisKeys.x === null && best.items[0]) axisKeys.x = best.items[0].leaf;
+                  if (axisKeys.y === null && best.items[1]) axisKeys.y = best.items[1].leaf;
+                  if (axisKeys.z === null && best.items[2]) axisKeys.z = best.items[2].leaf;
 
-                  __state.discoveredPlayerPath = discoveredPlayerPath;
-                  __state.playerAxes = axes;
-                  liveSample = __readLivePlayerVec();
-                  __startLivePlayerPoll();
+                  // Also bind static third axis (e.g., y/z when walking on flat ground) from the live object
+                  const containerObj = __resolvePath(discoveredPlayerPath);
+                  if (containerObj && typeof containerObj === 'object') {
+                    if (axisKeys.x === null && typeof containerObj.x === 'number') axisKeys.x = 'x';
+                    if (axisKeys.y === null && typeof containerObj.y === 'number') axisKeys.y = 'y';
+                    if (axisKeys.z === null && typeof containerObj.z === 'number') axisKeys.z = 'z';
+                  }
+
+                  const bound = __bindLiveTargetRef(discoveredPlayerPath, axisKeys);
+                  if (bound) {
+                    const kList = [bound.xKey, bound.yKey, bound.zKey].filter(function(k) { return k !== null && k !== undefined; });
+                    propertyKeysLabel = kList.join(', ');
+                    liveSample = __readLiveRefVec();
+                  }
                 }
 
                 __state.isolatedPaths = topDeltas;
                 const elapsedMs = Math.round(performance.now() - (__state.baselineTimeMs || performance.now()));
                 __setStatus(
                   discoveredPlayerPath ? 'COMPLETED' : 'IDLE',
-                  discoveredPlayerPath ? ('Locked: ' + discoveredPlayerPath) : 'No movement detected'
+                  discoveredPlayerPath ? ('Live 200ms: ' + discoveredPlayerPath) : 'No movement detected'
                 );
 
                 __emit('DELTA', {
@@ -691,6 +769,8 @@ object DiagnosticsScripts {
                   comparedMetrics: keys.length,
                   totalChanged: changed.length,
                   discoveredPlayerPath: discoveredPlayerPath,
+                  propertyKeys: propertyKeysLabel,
+                  pollingIntervalMs: __LIVE_POLL_INTERVAL_MS,
                   liveSample: liveSample,
                   deltas: topDeltas
                 });
@@ -710,10 +790,52 @@ object DiagnosticsScripts {
     """.trimIndent()
 
     /**
+     * Binds a user-selected candidate path from the Staging Buffer directly as the live 200ms
+     * coordinate reference so developers can test alternate pinned targets on the fly.
+     */
+    fun buildLockCandidateRefScript(candidatePath: String): String {
+        val pathLiteral = JSONObject.quote(candidatePath)
+        return """
+        (function() {
+          try {
+            $SHARED_RUNTIME
+            const targetPath = $pathLiteral;
+            const bound = __bindLiveTargetRef(targetPath, null);
+            if (!bound) {
+              __setStatus('ERROR', 'Cannot bind live reference');
+              __emit('DELTA', {
+                stage: 'LIVE_REF_FAILED',
+                path: targetPath,
+                message: 'Target path could not be resolved to an active object reference.'
+              });
+              return;
+            }
+            const sample = __readLiveRefVec();
+            const kList = [bound.xKey, bound.yKey, bound.zKey].filter(function(k) { return k !== null && k !== undefined; });
+            __setStatus('COMPLETED', 'Live 200ms: ' + bound.path);
+            __emit('DELTA', {
+              stage: 'LIVE_REF_LOCKED',
+              discoveredPlayerPath: bound.path,
+              propertyKeys: kList.join(', '),
+              pollingIntervalMs: __LIVE_POLL_INTERVAL_MS,
+              liveSample: sample
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.logTelemetry('ERR', 'Live ref bind error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+        """.trimIndent()
+    }
+
+    /**
      * Step 3: Player-Anchored Entity Discovery.
-     * Resolves `discoveredPlayerPath`, climbs 1-3 parent levels up the object tree, inspects all
-     * sibling Arrays / Maps / Sets / plain-object collections for objects sharing coordinate fields
-     * near the player's current coordinates, and projects them into 2D canvas screen pixels.
+     * Resolves `discoveredPlayerPath` (or active `liveRef`), climbs 1-3 parent levels up,
+     * scans sibling Arrays/Maps/Sets/dictionaries for nearby coordinate-bearing entities,
+     * and calculates 2D canvas projections (`screenX`, `screenY`).
      */
     fun buildScanEntitiesScript(anchorPlayerPath: String?): String {
         val anchorLiteral = if (anchorPlayerPath.isNullOrBlank()) "null" else JSONObject.quote(anchorPlayerPath)
@@ -722,7 +844,7 @@ object DiagnosticsScripts {
           try {
             $SHARED_RUNTIME
             const mySeq = ++__state.scanSeq;
-            const anchorPath = $anchorLiteral || __state.discoveredPlayerPath;
+            const anchorPath = $anchorLiteral || (__state.liveRef && __state.liveRef.path) || __state.discoveredPlayerPath;
 
             if (!anchorPath) {
               __setStatus('IDLE', 'Complete Step 2B first');
@@ -736,11 +858,10 @@ object DiagnosticsScripts {
             __state.discoveredPlayerPath = anchorPath;
             __setStatus('RUNNING', 'Step 3: Climbing parent tree from player…');
 
-            const playerObj = __resolvePath(anchorPath);
-            const playerVec = __readLivePlayerVec() || { x: 0, y: 0, z: 0 };
+            const playerObj = (__state.liveRef && __state.liveRef.targetObject) || __resolvePath(anchorPath);
+            const playerVec = __readLiveRefVec() || __extractVec3(playerObj) || { x: 0, y: 0, z: 0 };
             const anchorTokens = __parsePathTokens(anchorPath);
 
-            // Build ancestor containers climbing 1, 2, and 3 parent levels up from discoveredPlayerPath
             const ancestors = [];
             for (let climb = 1; climb <= 3; climb++) {
               if (anchorTokens.length - climb < 1) break;
@@ -752,7 +873,6 @@ object DiagnosticsScripts {
               }
             }
 
-            // Locate primary canvas viewport
             const canvases = document.querySelectorAll('canvas');
             let primaryCanvas = null;
             let bestArea = -1;
@@ -812,8 +932,8 @@ object DiagnosticsScripts {
               const found = [];
 
               if (Array.isArray(coll)) {
-                const len = Math.min(coll.length, 80);
-                for (let i = 0; i < len && found.length < 30; i++) {
+                const len = Math.min(coll.length, 100);
+                for (let i = 0; i < len && found.length < 40; i++) {
                   let el;
                   try { el = coll[i]; } catch (_) { continue; }
                   const rec = extractEntityRecord(el, collPath + '[' + i + ']');
@@ -822,25 +942,24 @@ object DiagnosticsScripts {
               } else if (typeof Map !== 'undefined' && coll instanceof Map) {
                 let count = 0;
                 coll.forEach(function(val, mk) {
-                  if (count++ >= 80 || found.length >= 30) return;
+                  if (count++ >= 100 || found.length >= 40) return;
                   const rec = extractEntityRecord(val, collPath + '.get(' + JSON.stringify(String(mk)) + ')');
                   if (rec) found.push(rec);
                 });
               } else if (typeof Set !== 'undefined' && coll instanceof Set) {
                 let idx = 0;
                 coll.forEach(function(val) {
-                  if (idx >= 80 || found.length >= 30) { idx++; return; }
+                  if (idx >= 100 || found.length >= 40) { idx++; return; }
                   const rec = extractEntityRecord(val, collPath + '[set#' + idx + ']');
                   if (rec) found.push(rec);
                   idx++;
                 });
               } else {
-                // Plain object dictionary keyed by entity ID
                 let keys;
                 try { keys = Object.keys(coll); } catch (_) { return null; }
                 if (keys.length < 2 || keys.length > 400) return null;
-                const lim = Math.min(keys.length, 60);
-                for (let i = 0; i < lim && found.length < 30; i++) {
+                const lim = Math.min(keys.length, 80);
+                for (let i = 0; i < lim && found.length < 40; i++) {
                   const ek = keys[i];
                   let el;
                   try { el = coll[ek]; } catch (_) { continue; }
@@ -860,7 +979,6 @@ object DiagnosticsScripts {
               };
             };
 
-            // Queue sibling properties across ancestors (1-3 levels up)
             const inspectionTasks = [];
             const seenObjs = new WeakSet();
             for (let a = 0; a < ancestors.length; a++) {
@@ -894,20 +1012,15 @@ object DiagnosticsScripts {
                 try { val = task.parent[task.key]; } catch (_) { continue; }
                 if (!val || typeof val !== 'object' || __isSpecialHostObject(val)) continue;
 
-                // Check for active camera/projection matrix in the same manager tree
                 if (!vpMatrix && /(viewProjection|projectionMatrix|mvp|vpMatrix)/i.test(task.key) && isMat4(val)) {
                   const raw = Array.isArray(val.elements) || ArrayBuffer.isView(val.elements) ? val.elements : val;
                   vpMatrix = Array.from(raw);
                   matrixSource = task.path;
                 }
 
-                // Evaluate if this sibling is itself an entity collection
                 const evalRes = evaluateCollection(val, task.path);
-                if (evalRes) {
-                  candidateCollections.push(evalRes);
-                }
+                if (evalRes) candidateCollections.push(evalRes);
 
-                // If depth 1 sibling looks like a scene/manager/camera object, inspect its direct properties (1 level)
                 if (task.depth === 1 && !Array.isArray(val) && !seenObjs.has(val) &&
                     /(scene|world|manager|entity|entities|mob|monster|npc|actor|room|level|stage|camera|cam|render|net|state|players)/i.test(task.key)) {
                   seenObjs.add(val);
@@ -926,7 +1039,7 @@ object DiagnosticsScripts {
               } else {
                 candidateCollections.sort(function(a, b) { return b.score - a.score; });
                 const bestColl = candidateCollections.length > 0 ? candidateCollections[0] : null;
-                const rawEntities = bestColl ? bestColl.entities.slice(0, 20) : [];
+                const rawEntities = bestColl ? bestColl.entities.slice(0, 30) : [];
 
                 const projectToScreen = function(w) {
                   if (vpMatrix) {
@@ -980,7 +1093,7 @@ object DiagnosticsScripts {
                 __setStatus(
                   projected.length > 0 ? 'COMPLETED' : 'IDLE',
                   projected.length > 0
-                    ? ('Step 3: ' + projected.length + ' entities in ' + entityArrayPath)
+                    ? ('Step 3: ' + projected.length + ' entities found')
                     : 'Step 3: 0 sibling entities found'
                 );
 
@@ -1015,8 +1128,8 @@ object DiagnosticsScripts {
     }
 
     /**
-     * Step 4 Export Collector: Safely serializes live viewport dimensions, confirmed player path +
-     * live coordinates, confirmed entity array path + samples, and passes JSON to exportReport().
+     * Step 5 Export Collector: Collects live viewport metrics, live player reference sample,
+     * and confirmed paths via circular-safe serialization.
      */
     fun buildCollectViewportMetricsScript(): String = """
         (function() {
@@ -1034,7 +1147,13 @@ object DiagnosticsScripts {
               };
             });
 
-            const livePlayer = __readLivePlayerVec();
+            const livePlayer = __readLiveRefVec();
+            const refKeys = __state.liveRef ? {
+              x: __state.liveRef.xKey,
+              y: __state.liveRef.yKey,
+              z: __state.liveRef.zKey
+            } : null;
+
             const payload = {
               url: location.href,
               title: document.title || '',
@@ -1048,11 +1167,11 @@ object DiagnosticsScripts {
                 scrollY: window.scrollY
               },
               canvases: canvases,
-              discoveredPlayerPath: __state.discoveredPlayerPath || null,
+              discoveredPlayerPath: (__state.liveRef && __state.liveRef.path) || __state.discoveredPlayerPath || null,
+              liveRefPropertyKeys: refKeys,
               livePlayerSample: livePlayer,
               discoveredEntityArrayPath: __state.discoveredEntityArrayPath || null,
-              entityProjectionMode: __state.entityProjectionMode || '',
-              discoveredShallowPaths: Array.isArray(__state.shallowPaths) ? __state.shallowPaths.slice(0, 120) : []
+              entityProjectionMode: __state.entityProjectionMode || ''
             };
             if (__bridge && typeof __bridge.exportReport === 'function') {
               __bridge.exportReport(__safeSerialize(payload, 0));

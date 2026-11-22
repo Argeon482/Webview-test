@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicLong
  * - Export writes are gated behind an explicit user-triggered arming flag ([armExport]) so an
  *   arbitrary page cannot write files to device storage unsolicited.
  * - Async scan status updates are validated against a strict allowlist ([AsyncScanStatus]).
- * - Live player coordinate telemetry validates finite numeric coordinates and throttles updates.
+ * - Live 200ms player coordinate telemetry validates finite numeric values and throttles bursts.
  * - All UI state mutations are marshaled safely onto the Android main thread.
  */
 class TelemetryBridge(
@@ -154,6 +154,6 @@ class TelemetryBridge(
         private const val MAX_EXPORT_PAYLOAD_CHARS = 1_500_000
         private const val RATE_LIMIT_WINDOW_MS = 1_000L
         private const val MAX_LOGS_PER_WINDOW = 60L
-        private const val MIN_COORD_INTERVAL_MS = 150L
+        private const val MIN_COORD_INTERVAL_MS = 120L
     }
 }

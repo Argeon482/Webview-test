@@ -29,6 +29,8 @@ enum class WizardStepBadge(val displayText: String) {
 
 enum class ConsoleTab {
     WIZARD,
+    STAGING,
+    ENTITIES,
     LOGS
 }
 
@@ -60,6 +62,17 @@ data class TelemetryLogEntry(
     val category: LogCategory,
     val summary: String,
     val payload: String
+)
+
+@Immutable
+data class CandidateStagingItem(
+    val path: String,
+    val sourceStep: String,
+    val detail: String,
+    val scanNumber: Int,
+    val seenCount: Int = 1,
+    val isPinned: Boolean = false,
+    val lastSeenTimestamp: String
 )
 
 @Immutable
@@ -123,23 +136,31 @@ data class DiagnosticsUiState(
     val scanStatus: AsyncScanStatus = AsyncScanStatus.IDLE,
     val scanStatusDetail: String = "",
     val activeConsoleTab: ConsoleTab = ConsoleTab.WIZARD,
+    // Multi-Scan Candidate Staging Buffer
+    val scanCounter: Int = 0,
+    val stagingBuffer: List<CandidateStagingItem> = emptyList(),
+    val showPinnedOnly: Boolean = false,
     // Step 1 state
     val step1Completed: Boolean = false,
     val customGlobals: List<String> = emptyList(),
     val step1DurationMs: Double? = null,
-    // Step 2 state
-    val discoveredShallowPaths: List<String> = emptyList(),
+    // Step 2 state + Live 200ms Reference Polling
     val baselineCaptured: Boolean = false,
     val baselineMetricCount: Int = 0,
     val isolatedPaths: List<IsolatedCoordinatePath> = emptyList(),
     val discoveredPlayerPath: String? = null,
+    val playerPropertyKeys: String = "",
     val livePlayerCoords: PlayerCoordinates? = null,
-    // Step 3 state
+    val livePollActive: Boolean = false,
+    val livePollTickCount: Int = 0,
+    // Step 3 state (Visual Entity Inspection Console)
     val discoveredEntityArrayPath: String? = null,
     val entityProjectionMode: String = "",
+    val entityViewportWidth: Int = 0,
+    val entityViewportHeight: Int = 0,
     val discoveredEntities: List<DiscoveredEntitySample> = emptyList(),
     val lastEntityCount: Int = 0,
-    // Step 4 / Passive asset & console state
+    // Step 4/5 Passive asset & console state
     val interceptedAssets: List<InterceptedAsset> = emptyList(),
     val logs: List<TelemetryLogEntry> = emptyList(),
     val selectedFilter: LogCategory = LogCategory.ALL,
@@ -151,6 +172,9 @@ data class DiagnosticsUiState(
     val estimatedFps: Int? = null,
     val canvasCount: Int = 0
 ) {
+    val pinnedCandidateCount: Int
+        get() = stagingBuffer.count { it.isPinned }
+
     val step1Badge: WizardStepBadge
         get() = if (step1Completed && (customGlobals.isNotEmpty() || canvasCount > 0)) {
             WizardStepBadge.CAPTURED

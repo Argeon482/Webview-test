@@ -65,14 +65,18 @@ class DiagnosticsViewModel : ViewModel() {
                         step1Completed = false,
                         customGlobals = emptyList(),
                         step1DurationMs = null,
-                        discoveredShallowPaths = emptyList(),
                         baselineCaptured = false,
                         baselineMetricCount = 0,
                         isolatedPaths = emptyList(),
                         discoveredPlayerPath = null,
+                        playerPropertyKeys = "",
                         livePlayerCoords = null,
+                        livePollActive = false,
+                        livePollTickCount = 0,
                         discoveredEntityArrayPath = null,
                         entityProjectionMode = "",
+                        entityViewportWidth = 0,
+                        entityViewportHeight = 0,
                         discoveredEntities = emptyList(),
                         lastEntityCount = 0,
                         interceptedAssets = emptyList(),
@@ -92,6 +96,7 @@ class DiagnosticsViewModel : ViewModel() {
 
     fun onReloadRequested() {
         val current = _uiState.value.activeUrl
+        _uiState.update { it.copy(livePollActive = false) }
         appendLog(LogCategory.SYSTEM, "Reloading $current", current)
         _effects.tryEmit(DiagnosticsEffect.ReloadWebView)
     }
@@ -119,7 +124,8 @@ class DiagnosticsViewModel : ViewModel() {
                 activeUrl = url,
                 urlInput = if (url == "about:blank") it.urlInput else url,
                 isLoading = true,
-                loadProgress = 10
+                loadProgress = 10,
+                livePollActive = false
             )
         }
     }
@@ -176,6 +182,8 @@ class DiagnosticsViewModel : ViewModel() {
         _uiState.update { state ->
             state.copy(
                 discoveredPlayerPath = state.discoveredPlayerPath ?: path,
+                livePollActive = true,
+                livePollTickCount = state.livePollTickCount + 1,
                 livePlayerCoords = PlayerCoordinates(
                     path = path,
                     x = x,
@@ -187,12 +195,59 @@ class DiagnosticsViewModel : ViewModel() {
         }
     }
 
+    // Multi-Scan Candidate Staging Buffer Actions
+    fun onTogglePinCandidate(path: String) {
+        _uiState.update { state ->
+            val updated = state.stagingBuffer.map { item ->
+                if (item.path == path) item.copy(isPinned = !item.isPinned) else item
+            }
+            state.copy(stagingBuffer = sortStagingBuffer(updated))
+        }
+    }
+
+    fun onTogglePinnedOnlyFilter() {
+        _uiState.update { it.copy(showPinnedOnly = !it.showPinnedOnly) }
+    }
+
+    fun onClearUnpinnedCandidates() {
+        _uiState.update { state ->
+            state.copy(stagingBuffer = state.stagingBuffer.filter { it.isPinned })
+        }
+    }
+
+    fun onPinExternalPath(path: String, sourceStep: String, detail: String) {
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        _uiState.update { state ->
+            val nextScan = state.scanCounter.coerceAtLeast(1)
+            val merged = mergeIntoStagingBuffer(
+                existing = state.stagingBuffer,
+                incoming = listOf(path to detail),
+                sourceStep = sourceStep,
+                scanNumber = nextScan,
+                timestamp = nowTs,
+                forcePin = true
+            )
+            state.copy(stagingBuffer = merged)
+        }
+        _effects.tryEmit(DiagnosticsEffect.ShowToast("Pinned to Staging: $path"))
+    }
+
+    fun onLockCandidateForLivePolling(candidatePath: String) {
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Binding live 200ms ref: $candidatePath")
+        appendLog(
+            LogCategory.DELTA,
+            "Binding live 200ms reference to $candidatePath…",
+            candidatePath
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildLockCandidateRefScript(candidatePath)))
+    }
+
     // Step 1: Zero-Freeze Filtered Custom Global Check (<2 ms)
     fun runStep1InspectScope() {
         onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 1: Filtering custom globals…")
         appendLog(
             LogCategory.SCOPE,
-            "Step 1: Scanning custom globals (zero-freeze filter)…",
+            "Step 1: Scanning custom globals (appending to Staging)…",
             "Filtering standard DOM/Web APIs out of window keys and checking active Canvas/WebGL contexts"
         )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildInspectGlobalScopeScript()))
@@ -209,22 +264,22 @@ class DiagnosticsViewModel : ViewModel() {
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildCaptureBaselineScript()))
     }
 
-    // Step 2B: Isolate Player Coords + start live X/Y/Z tracker
+    // Step 2B: Isolate Player Coords + start 200ms direct object-reference polling
     fun runStep2BComputeDelta() {
-        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2B: Isolating player coords…")
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2B: Isolating live reference…")
         appendLog(
             LogCategory.DELTA,
-            "Step 2B: Isolating player coordinates…",
-            "Comparing live runtime state against standing baseline to lock on to moving X/Y/Z object"
+            "Step 2B: Isolating live player object reference…",
+            "Comparing live runtime state against standing baseline and starting 200ms direct-reference polling"
         )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildComputeDeltaScript()))
     }
 
-    // Step 3: Player-Anchored Nearby Entity Discovery
+    // Step 3: Player-Anchored Visual Entity Discovery
     fun runStep3ScanEntities() {
         val anchor = _uiState.value.discoveredPlayerPath
         if (anchor.isNullOrBlank()) {
-            val msg = "Complete Step 2B first so Step 3 can anchor to your player coordinates."
+            val msg = "Complete Step 2B first (or lock a Staging candidate) so Step 3 can anchor to your player coordinates."
             appendLog(LogCategory.ENTITY, msg, msg)
             _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
             return
@@ -272,7 +327,7 @@ class DiagnosticsViewModel : ViewModel() {
         }
     }
 
-    // Step 4: Export Complete Telemetry Handoff JSON Report
+    // Step 4 / 5: Export Complete Telemetry Handoff JSON Report
     fun requestExportReport(context: Context, armBridge: () -> Unit, disarmBridge: () -> Boolean) {
         if (_uiState.value.isExporting) return
         val appContext = context.applicationContext
@@ -281,7 +336,7 @@ class DiagnosticsViewModel : ViewModel() {
         armBridge()
         appendLog(
             LogCategory.SYSTEM,
-            "Step 4: Collecting viewport & telemetry map for JSON export…",
+            "Exporting full telemetry report (pinned candidates, live coords, entities, logs)…",
             "Invoking TelemetryBridge.exportReport()"
         )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildCollectViewportMetricsScript()))
@@ -392,47 +447,87 @@ class DiagnosticsViewModel : ViewModel() {
             return payload.lineSequence().firstOrNull()?.take(110) ?: category.label
         }
 
+        val nowTs = formatTimestamp(System.currentTimeMillis())
         val stage = json.optString("stage", "")
+
         return when (stage) {
             "GLOBAL_SCOPE_INSPECTED" -> {
                 val canvases = json.optInt("canvasCount", 0)
                 val durationMs = json.optDouble("durationMs", 0.0)
                 val totalFiltered = json.optInt("totalWindowKeysFiltered", 0)
                 val customArray = json.optJSONArray("customGlobals") ?: JSONArray()
-                val globalKeys = buildList {
-                    for (i in 0 until customArray.length()) {
-                        val key = customArray.optJSONObject(i)?.optString("key", "")?.trim().orEmpty()
-                        if (key.isNotEmpty()) add(key)
-                    }
+                val globalKeys = mutableListOf<String>()
+                val stagingPairs = mutableListOf<Pair<String, String>>()
+
+                for (i in 0 until customArray.length()) {
+                    val obj = customArray.optJSONObject(i) ?: continue
+                    val key = obj.optString("key", "").trim()
+                    if (key.isEmpty()) continue
+                    globalKeys.add(key)
+                    val path = obj.optString("path", "window.$key")
+                    val ctor = obj.optString("constructor", obj.optString("type", "Object"))
+                    val keyCount = obj.optInt("keyCount", 0)
+                    stagingPairs.add(path to "$ctor ($keyCount keys)")
                 }
-                val shallow = globalKeys.map { "window.$it" }
-                _uiState.update {
-                    it.copy(
+
+                _uiState.update { state ->
+                    val nextScan = state.scanCounter + 1
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Step 1",
+                        scanNumber = nextScan,
+                        timestamp = nowTs
+                    )
+                    state.copy(
+                        scanCounter = nextScan,
                         step1Completed = true,
-                        customGlobals = globalKeys,
+                        customGlobals = (state.customGlobals + globalKeys).distinct(),
                         step1DurationMs = durationMs,
                         canvasCount = canvases,
-                        discoveredShallowPaths = mergeShallowPaths(it.discoveredShallowPaths, shallow),
+                        stagingBuffer = mergedStaging,
                         scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "${globalKeys.size} globals in ${durationMs}ms"
+                        scanStatusDetail = "Scan #$nextScan: ${globalKeys.size} globals (${durationMs}ms)"
                     )
                 }
-                "Step 1 (${durationMs}ms): Found ${globalKeys.size} custom globals (filtered $totalFiltered window keys) • $canvases canvas(es)"
+                "Step 1 (${durationMs}ms): Found ${globalKeys.size} custom globals (filtered $totalFiltered keys) • Accumulated in Staging"
             }
+
             "BASELINE_CAPTURED" -> {
                 val metrics = json.optInt("metricCount", 0)
                 val roots = json.optInt("rootObjectCount", 0)
                 val chunks = json.optInt("chunksExecuted", 1)
-                _uiState.update {
-                    it.copy(
+                val containersArr = json.optJSONArray("candidateContainers") ?: JSONArray()
+                val stagingPairs = buildList {
+                    for (i in 0 until containersArr.length()) {
+                        val obj = containersArr.optJSONObject(i) ?: continue
+                        val p = obj.optString("path", "").trim()
+                        val d = obj.optString("detail", "Coordinate container")
+                        if (p.isNotEmpty()) add(p to d)
+                    }
+                }
+
+                _uiState.update { state ->
+                    val nextScan = state.scanCounter + 1
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Step 2A",
+                        scanNumber = nextScan,
+                        timestamp = nowTs
+                    )
+                    state.copy(
+                        scanCounter = nextScan,
                         baselineCaptured = true,
                         baselineMetricCount = metrics,
+                        stagingBuffer = mergedStaging,
                         scanStatus = AsyncScanStatus.COMPLETED,
                         scanStatusDetail = "2A Captured ($metrics values)"
                     )
                 }
                 "Step 2A (${chunks} chunks): Captured $metrics standing values across $roots custom globals"
             }
+
             "BASELINE_MISSING" -> {
                 _uiState.update {
                     it.copy(
@@ -442,6 +537,7 @@ class DiagnosticsViewModel : ViewModel() {
                 }
                 json.optString("message", "Stand still and capture 2A baseline first.")
             }
+
             "DELTA_COMPUTED" -> {
                 val deltasArray = json.optJSONArray("deltas") ?: JSONArray()
                 val isolatedList = buildList {
@@ -458,6 +554,7 @@ class DiagnosticsViewModel : ViewModel() {
                     }
                 }
                 val playerPath = json.optString("discoveredPlayerPath", "").takeIf { it.isNotBlank() && it != "null" }
+                val propKeys = json.optString("propertyKeys", "")
                 val liveObj = json.optJSONObject("liveSample")
                 val liveCoords = if (playerPath != null && liveObj != null) {
                     PlayerCoordinates(
@@ -468,27 +565,79 @@ class DiagnosticsViewModel : ViewModel() {
                     )
                 } else null
 
-                val newPaths = buildList {
-                    if (playerPath != null) add(playerPath)
-                    isolatedList.forEach { if (it.path.isNotBlank()) add(it.path) }
+                val stagingPairs = buildList {
+                    if (playerPath != null) {
+                        val keySummary = if (propKeys.isNotBlank()) "Live ref [$propKeys]" else "Live player container"
+                        add(playerPath to keySummary)
+                    }
+                    isolatedList.take(15).forEach { item ->
+                        if (item.path.isNotBlank()) {
+                            val sign = if (item.delta >= 0) "+" else ""
+                            add(item.path to "Δ $sign${String.format(Locale.US, "%.2f", item.delta)} (cur: ${String.format(Locale.US, "%.2f", item.currentValue)})")
+                        }
+                    }
                 }
+
                 _uiState.update { state ->
+                    val nextScan = state.scanCounter + 1
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Step 2B",
+                        scanNumber = nextScan,
+                        timestamp = nowTs
+                    )
                     state.copy(
+                        scanCounter = nextScan,
                         isolatedPaths = isolatedList,
                         discoveredPlayerPath = playerPath ?: state.discoveredPlayerPath,
+                        playerPropertyKeys = if (propKeys.isNotBlank()) propKeys else state.playerPropertyKeys,
                         livePlayerCoords = liveCoords ?: state.livePlayerCoords,
-                        discoveredShallowPaths = mergeShallowPaths(state.discoveredShallowPaths, newPaths),
+                        livePollActive = playerPath != null || state.livePollActive,
+                        stagingBuffer = mergedStaging,
                         scanStatus = if (playerPath != null) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
-                        scanStatusDetail = playerPath?.let { "Locked: $it" } ?: "No movement detected"
+                        scanStatusDetail = playerPath?.let { "Live 200ms: $it" } ?: "No movement detected"
                     )
                 }
                 val elapsedMs = json.optInt("elapsedMs", 0)
                 if (playerPath == null) {
                     "Step 2B (${elapsedMs}ms): No player movement detected — walk 5–10 steps and retry."
                 } else {
-                    "Step 2B (${elapsedMs}ms): Locked on to $playerPath (${isolatedList.size} deltas)"
+                    "Step 2B (${elapsedMs}ms): Live 200ms lock on $playerPath [$propKeys] (${isolatedList.size} deltas staged)"
                 }
             }
+
+            "LIVE_REF_LOCKED" -> {
+                val playerPath = json.optString("discoveredPlayerPath", "").takeIf { it.isNotBlank() && it != "null" }
+                val propKeys = json.optString("propertyKeys", "")
+                val liveObj = json.optJSONObject("liveSample")
+                val liveCoords = if (playerPath != null && liveObj != null) {
+                    PlayerCoordinates(
+                        path = playerPath,
+                        x = liveObj.optDouble("x", 0.0),
+                        y = liveObj.optDouble("y", 0.0),
+                        z = liveObj.optDouble("z", 0.0)
+                    )
+                } else null
+                _uiState.update { state ->
+                    state.copy(
+                        discoveredPlayerPath = playerPath ?: state.discoveredPlayerPath,
+                        playerPropertyKeys = propKeys,
+                        livePlayerCoords = liveCoords ?: state.livePlayerCoords,
+                        livePollActive = playerPath != null,
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = playerPath?.let { "Live 200ms: $it" } ?: state.scanStatusDetail
+                    )
+                }
+                "Locked live 200ms reference on ${playerPath ?: "candidate"} [$propKeys]"
+            }
+
+            "LIVE_REF_FAILED" -> {
+                val msg = json.optString("message", "Could not bind candidate reference.")
+                _uiState.update { it.copy(scanStatus = AsyncScanStatus.ERROR, scanStatusDetail = "Live bind failed") }
+                msg
+            }
+
             "ANCHOR_MISSING" -> {
                 _uiState.update {
                     it.copy(
@@ -498,10 +647,14 @@ class DiagnosticsViewModel : ViewModel() {
                 }
                 json.optString("message", "Complete Step 2B first.")
             }
+
             "ENTITIES_SCANNED" -> {
                 val count = json.optInt("entityCount", 0)
                 val arrayPath = json.optString("entityArrayPath", "").takeIf { it.isNotBlank() && it != "null" }
                 val mode = json.optString("projectionMode", "pinhole_viewport_fallback")
+                val vpObj = json.optJSONObject("viewport")
+                val vpW = vpObj?.optInt("width", 0) ?: 0
+                val vpH = vpObj?.optInt("height", 0) ?: 0
                 val entitiesArr = json.optJSONArray("entities") ?: JSONArray()
                 val parsedEntities = buildList {
                     for (i in 0 until entitiesArr.length()) {
@@ -524,12 +677,26 @@ class DiagnosticsViewModel : ViewModel() {
                         )
                     }
                 }
-                _uiState.update {
-                    it.copy(
+                _uiState.update { state ->
+                    val mergedStaging = if (arrayPath != null) {
+                        mergeIntoStagingBuffer(
+                            existing = state.stagingBuffer,
+                            incoming = listOf(arrayPath to "Entity collection ($count detected)"),
+                            sourceStep = "Step 3",
+                            scanNumber = state.scanCounter + 1,
+                            timestamp = nowTs
+                        )
+                    } else state.stagingBuffer
+
+                    state.copy(
+                        scanCounter = state.scanCounter + 1,
                         discoveredEntityArrayPath = arrayPath,
                         entityProjectionMode = mode,
+                        entityViewportWidth = vpW,
+                        entityViewportHeight = vpH,
                         discoveredEntities = parsedEntities,
                         lastEntityCount = count,
+                        stagingBuffer = mergedStaging,
                         scanStatus = if (count > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
                         scanStatusDetail = if (arrayPath != null) "$count entities in $arrayPath" else "0 sibling entities"
                     )
@@ -540,6 +707,7 @@ class DiagnosticsViewModel : ViewModel() {
                     "Step 3: 0 sibling entity collections found near ${_uiState.value.discoveredPlayerPath}"
                 }
             }
+
             "MANUAL_EVAL" -> {
                 val type = json.optString("resultType", "unknown")
                 val ms = json.optDouble("durationMs", 0.0)
@@ -552,6 +720,7 @@ class DiagnosticsViewModel : ViewModel() {
                 }
                 "Result ($type, ${ms}ms): $preview"
             }
+
             else -> payload.take(110)
         }
     }
@@ -564,14 +733,6 @@ class DiagnosticsViewModel : ViewModel() {
                 if (item.isNotEmpty()) add(item)
             }
         }
-    }
-
-    private fun mergeShallowPaths(existing: List<String>, incoming: List<String>): List<String> {
-        if (incoming.isEmpty()) return existing
-        val merged = LinkedHashSet<String>(existing.size + incoming.size)
-        merged.addAll(existing)
-        merged.addAll(incoming)
-        return merged.take(MAX_SHALLOW_PATHS)
     }
 
     private fun appendLog(category: LogCategory, summary: String, payload: String) {
@@ -601,6 +762,7 @@ class DiagnosticsViewModel : ViewModel() {
         root.put("pageTitle", state.pageTitle)
         root.put("desktopUserAgentEnabled", state.isDesktopMode)
         root.put("remoteWebContentsDebuggingEnabled", false)
+        root.put("totalScansExecuted", state.scanCounter)
 
         val bridgeObj = try {
             JSONObject(viewportMetricsJson)
@@ -608,21 +770,36 @@ class DiagnosticsViewModel : ViewModel() {
             JSONObject().put("raw", viewportMetricsJson)
         }
 
-        // 1. Viewport dimensions (width, height, devicePixelRatio + canvases)
+        // 1. Viewport dimensions
         val viewportObj = bridgeObj.optJSONObject("viewport") ?: JSONObject()
-        val viewportOut = JSONObject()
-            .put("width", viewportObj.optInt("width", viewportObj.optInt("innerWidth", 0)))
-            .put("height", viewportObj.optInt("height", viewportObj.optInt("innerHeight", 0)))
-            .put("devicePixelRatio", viewportObj.optDouble("devicePixelRatio", 1.0))
-            .put("canvases", bridgeObj.optJSONArray("canvases") ?: JSONArray())
-        root.put("viewport", viewportOut)
+        root.put(
+            "viewport",
+            JSONObject()
+                .put("width", viewportObj.optInt("width", viewportObj.optInt("innerWidth", 0)))
+                .put("height", viewportObj.optInt("height", viewportObj.optInt("innerHeight", 0)))
+                .put("devicePixelRatio", viewportObj.optDouble("devicePixelRatio", 1.0))
+                .put("canvases", bridgeObj.optJSONArray("canvases") ?: JSONArray())
+        )
 
-        // 2. Confirmed custom globals from Step 1
-        val customGlobalsArr = JSONArray()
-        state.customGlobals.forEach { customGlobalsArr.put(it) }
-        root.put("customGlobals", customGlobalsArr)
+        // 2. Pinned Candidate Staging List & Full Accumulated Buffer
+        val pinnedArr = JSONArray()
+        val fullStagingArr = JSONArray()
+        state.stagingBuffer.forEach { item ->
+            val itemJson = JSONObject()
+                .put("path", item.path)
+                .put("sourceStep", item.sourceStep)
+                .put("detail", item.detail)
+                .put("scanNumber", item.scanNumber)
+                .put("seenCount", item.seenCount)
+                .put("isPinned", item.isPinned)
+                .put("lastSeenTimestamp", item.lastSeenTimestamp)
+            fullStagingArr.put(itemJson)
+            if (item.isPinned) pinnedArr.put(itemJson)
+        }
+        root.put("pinnedCandidates", pinnedArr)
+        root.put("candidateStagingBuffer", fullStagingArr)
 
-        // 3. Confirmed JS path for player coordinates + live sample values (Step 2B)
+        // 3. Confirmed Live Player Coordinate Reference Path + Live Sample
         val confirmedPlayerPath = state.discoveredPlayerPath
             ?: bridgeObj.optString("discoveredPlayerPath", "").takeIf { it.isNotBlank() && it != "null" }
         val liveSampleJson = JSONObject().apply {
@@ -652,11 +829,13 @@ class DiagnosticsViewModel : ViewModel() {
             "playerCoordinates",
             JSONObject()
                 .put("confirmedJsPath", confirmedPlayerPath ?: JSONObject.NULL)
+                .put("propertyKeys", bridgeObj.optJSONObject("liveRefPropertyKeys") ?: state.playerPropertyKeys)
+                .put("livePollingIntervalMs", 200)
                 .put("liveSample", if (liveSampleJson.length() > 0) liveSampleJson else JSONObject.NULL)
                 .put("isolatedDeltas", deltasArr)
         )
 
-        // 4. Confirmed JS path for entity array + sample entity objects (Step 3)
+        // 4. Confirmed Entity Array + Screen Projections
         val confirmedEntityPath = state.discoveredEntityArrayPath
             ?: bridgeObj.optString("discoveredEntityArrayPath", "").takeIf { it.isNotBlank() && it != "null" }
         val entitiesArr = JSONArray()
@@ -691,11 +870,11 @@ class DiagnosticsViewModel : ViewModel() {
             JSONObject()
                 .put("confirmedJsPath", confirmedEntityPath ?: JSONObject.NULL)
                 .put("projectionMode", state.entityProjectionMode)
-                .put("entityCount", state.discoveredEntities.size)
-                .put("sampleEntities", entitiesArr)
+                .put("totalDetectedEntities", state.discoveredEntities.size)
+                .put("entities", entitiesArr)
         )
 
-        // 5. Intercepted map / chunk / asset URLs
+        // 5. Intercepted asset URLs
         val assetsArray = JSONArray()
         state.interceptedAssets.forEach { asset ->
             assetsArray.put(
@@ -745,7 +924,7 @@ class DiagnosticsViewModel : ViewModel() {
     companion object {
         private const val MAX_LOG_ENTRIES = 500
         private const val MAX_TRACKED_ASSETS = 250
-        private const val MAX_SHALLOW_PATHS = 200
+        private const val MAX_STAGING_ITEMS = 250
 
         const val DESKTOP_USER_AGENT =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -753,6 +932,53 @@ class DiagnosticsViewModel : ViewModel() {
         private val TRACKED_EXTENSIONS = listOf(
             ".wasm", ".json", ".bin", ".glb", ".gltf", ".data", ".pck", ".pak", ".ktx2", ".dds"
         )
+
+        fun mergeIntoStagingBuffer(
+            existing: List<CandidateStagingItem>,
+            incoming: List<Pair<String, String>>,
+            sourceStep: String,
+            scanNumber: Int,
+            timestamp: String,
+            forcePin: Boolean = false
+        ): List<CandidateStagingItem> {
+            val map = LinkedHashMap<String, CandidateStagingItem>(existing.size + incoming.size)
+            existing.forEach { map[it.path] = it }
+
+            incoming.forEach { (rawPath, detail) ->
+                val path = rawPath.trim()
+                if (path.isEmpty()) return@forEach
+                val prev = map[path]
+                if (prev != null) {
+                    map[path] = prev.copy(
+                        sourceStep = sourceStep,
+                        detail = detail.ifBlank { prev.detail },
+                        scanNumber = scanNumber,
+                        seenCount = prev.seenCount + 1,
+                        isPinned = prev.isPinned || forcePin,
+                        lastSeenTimestamp = timestamp
+                    )
+                } else {
+                    map[path] = CandidateStagingItem(
+                        path = path,
+                        sourceStep = sourceStep,
+                        detail = detail,
+                        scanNumber = scanNumber,
+                        seenCount = 1,
+                        isPinned = forcePin,
+                        lastSeenTimestamp = timestamp
+                    )
+                }
+            }
+            return sortStagingBuffer(map.values.toList()).take(MAX_STAGING_ITEMS)
+        }
+
+        private fun sortStagingBuffer(items: List<CandidateStagingItem>): List<CandidateStagingItem> {
+            return items.sortedWith(
+                compareByDescending<CandidateStagingItem> { it.isPinned }
+                    .thenByDescending { it.scanNumber }
+                    .thenByDescending { it.seenCount }
+            )
+        }
 
         fun normalizeAndValidateUrl(rawInput: String): UrlValidationResult {
             val trimmed = rawInput.trim()

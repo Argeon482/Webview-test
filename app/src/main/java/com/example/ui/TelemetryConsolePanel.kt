@@ -23,9 +23,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -33,9 +30,9 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ExpandLess
@@ -61,11 +58,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -84,7 +77,6 @@ import com.example.DiagnosticsUiState
 import com.example.LogCategory
 import com.example.PlayerCoordinates
 import com.example.R
-import com.example.TelemetryLogEntry
 import com.example.WizardStepBadge
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
@@ -110,6 +102,11 @@ fun TelemetryConsolePanel(
     onShareReport: () -> Unit,
     onSelectConsoleTab: (ConsoleTab) -> Unit,
     onSelectFilter: (LogCategory) -> Unit,
+    onTogglePinCandidate: (String) -> Unit,
+    onTogglePinnedOnly: () -> Unit,
+    onClearUnpinnedCandidates: () -> Unit,
+    onLockCandidateForLivePolling: (String) -> Unit,
+    onPinExternalPath: (path: String, sourceStep: String, detail: String) -> Unit,
     onToggleJsDrawer: () -> Unit,
     onManualJsChanged: (String) -> Unit,
     onExecuteManualJs: () -> Unit,
@@ -127,7 +124,6 @@ fun TelemetryConsolePanel(
         color = ObsidianSurface
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Top Header: Wizard / Logs Tab Switcher + Live Async Scan Status + JS Console + Expand
             ConsoleHeaderBar(
                 state = state,
                 onSelectTab = onSelectConsoleTab,
@@ -138,7 +134,6 @@ fun TelemetryConsolePanel(
 
             HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
-            // Manual JavaScript Execution Drawer (available over either tab)
             AnimatedVisibility(
                 visible = state.isJsDrawerOpen,
                 enter = expandVertically() + fadeIn(),
@@ -162,12 +157,41 @@ fun TelemetryConsolePanel(
                         onRunStep3 = onRunStep3,
                         onExportReport = onExportReport,
                         onShareReport = onShareReport,
+                        onOpenStaging = { onSelectConsoleTab(ConsoleTab.STAGING) },
+                        onOpenEntities = { onSelectConsoleTab(ConsoleTab.ENTITIES) },
                         onOpenLogs = { onSelectConsoleTab(ConsoleTab.LOGS) },
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxWidth()
                     )
                 }
+
+                ConsoleTab.STAGING -> {
+                    StagingBufferView(
+                        state = state,
+                        onTogglePin = onTogglePinCandidate,
+                        onTogglePinnedOnly = onTogglePinnedOnly,
+                        onClearUnpinned = onClearUnpinnedCandidates,
+                        onTrackLive = onLockCandidateForLivePolling,
+                        onCopyPath = onCopyPayload,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                    )
+                }
+
+                ConsoleTab.ENTITIES -> {
+                    EntityInspectionConsoleView(
+                        state = state,
+                        onRescanEntities = onRunStep3,
+                        onPinPath = { path, detail -> onPinExternalPath(path, "Step 3", detail) },
+                        onCopyPayload = onCopyPayload,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                    )
+                }
+
                 ConsoleTab.LOGS -> {
                     LiveLogConsoleView(
                         state = state,
@@ -191,106 +215,177 @@ private fun ConsoleHeaderBar(
     onClearLogs: () -> Unit,
     onToggleExpanded: () -> Unit
 ) {
-    Row(
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(ObsidianSurfaceElevated)
-            .padding(horizontal = 8.dp, vertical = 5.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        // Segmented Wizard / Logs Switcher
         Row(
             modifier = Modifier
-                .clip(RoundedCornerShape(8.dp))
-                .background(ObsidianBg)
-                .padding(2.dp),
-            horizontalArrangement = Arrangement.spacedBy(2.dp)
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
         ) {
-            HeaderTabPill(
-                label = stringResource(R.string.tab_wizard),
-                selected = state.activeConsoleTab == ConsoleTab.WIZARD,
-                testTag = "tab_wizard_button",
-                onClick = { onSelectTab(ConsoleTab.WIZARD) }
-            )
-            HeaderTabPill(
-                label = "${stringResource(R.string.tab_logs)} (${state.logs.size})",
-                selected = state.activeConsoleTab == ConsoleTab.LOGS,
-                testTag = "tab_logs_button",
-                onClick = { onSelectTab(ConsoleTab.LOGS) }
-            )
+            // Horizontally scrollable 4-tab console switcher
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                HeaderTabPill(
+                    label = stringResource(R.string.tab_wizard),
+                    selected = state.activeConsoleTab == ConsoleTab.WIZARD,
+                    accent = ElectricCyan,
+                    testTag = "tab_wizard_button",
+                    onClick = { onSelectTab(ConsoleTab.WIZARD) }
+                )
+                HeaderTabPill(
+                    label = "${stringResource(R.string.tab_staging)} (${state.stagingBuffer.size})",
+                    selected = state.activeConsoleTab == ConsoleTab.STAGING,
+                    accent = AssetAmber,
+                    testTag = "tab_staging_button",
+                    onClick = { onSelectTab(ConsoleTab.STAGING) }
+                )
+                HeaderTabPill(
+                    label = "${stringResource(R.string.tab_entities)} (${state.discoveredEntities.size})",
+                    selected = state.activeConsoleTab == ConsoleTab.ENTITIES,
+                    accent = TelemetryViolet,
+                    testTag = "tab_entities_button",
+                    onClick = { onSelectTab(ConsoleTab.ENTITIES) }
+                )
+                HeaderTabPill(
+                    label = "${stringResource(R.string.tab_logs)} (${state.logs.size})",
+                    selected = state.activeConsoleTab == ConsoleTab.LOGS,
+                    accent = SignalEmerald,
+                    testTag = "tab_logs_button",
+                    onClick = { onSelectTab(ConsoleTab.LOGS) }
+                )
+            }
+
+            // JS Console Toggle
+            Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = if (state.isJsDrawerOpen) MaterialTheme.colorScheme.primaryContainer else ObsidianSurfaceHighest,
+                border = BorderStroke(
+                    1.dp,
+                    if (state.isJsDrawerOpen) ElectricCyan else ObsidianBorder
+                ),
+                modifier = Modifier
+                    .heightIn(min = 34.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .clickable(onClick = onToggleJsDrawer)
+                    .testTag("toggle_js_drawer_button")
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Terminal,
+                        contentDescription = stringResource(R.string.cd_toggle_js_drawer),
+                        tint = if (state.isJsDrawerOpen) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Text(
+                        text = "JS",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = if (state.isJsDrawerOpen) ElectricCyan else MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            }
+
+            if (state.activeConsoleTab == ConsoleTab.LOGS) {
+                IconButton(
+                    onClick = onClearLogs,
+                    modifier = Modifier
+                        .size(34.dp)
+                        .testTag("clear_logs_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DeleteSweep,
+                        contentDescription = stringResource(R.string.cd_clear_logs),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(17.dp)
+                    )
+                }
+            }
+
+            IconButton(
+                onClick = onToggleExpanded,
+                modifier = Modifier
+                    .size(34.dp)
+                    .testTag("toggle_split_button")
+            ) {
+                Icon(
+                    imageVector = if (state.isConsoleExpanded) Icons.Default.ExpandMore else Icons.Default.ExpandLess,
+                    contentDescription = stringResource(R.string.cd_toggle_split),
+                    tint = ElectricCyan,
+                    modifier = Modifier.size(19.dp)
+                )
+            }
         }
 
-        // Compact Async Scan Status Pill
-        Box(modifier = Modifier.weight(1f)) {
+        // Slim live telemetry status strip
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianBg.copy(alpha = 0.65f))
+                .padding(horizontal = 8.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
             AsyncScanStatusPill(
                 status = state.scanStatus,
-                detail = state.scanStatusDetail
+                detail = state.scanStatusDetail,
+                modifier = Modifier.weight(1f)
             )
-        }
-
-        // JS Console Toggle
-        Surface(
-            shape = RoundedCornerShape(6.dp),
-            color = if (state.isJsDrawerOpen) MaterialTheme.colorScheme.primaryContainer else ObsidianSurfaceHighest,
-            border = BorderStroke(
-                1.dp,
-                if (state.isJsDrawerOpen) ElectricCyan else ObsidianBorder
-            ),
-            modifier = Modifier
-                .heightIn(min = 36.dp)
-                .clip(RoundedCornerShape(6.dp))
-                .clickable(onClick = onToggleJsDrawer)
-                .testTag("toggle_js_drawer_button")
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Terminal,
-                    contentDescription = stringResource(R.string.cd_toggle_js_drawer),
-                    tint = if (state.isJsDrawerOpen) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(15.dp)
-                )
-                Text(
-                    text = "JS",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = if (state.isJsDrawerOpen) ElectricCyan else MaterialTheme.colorScheme.onSurface
-                )
+            if (state.livePollActive) {
+                Surface(
+                    color = SignalEmerald.copy(alpha = 0.16f),
+                    shape = RoundedCornerShape(4.dp),
+                    border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.5f))
+                ) {
+                    Text(
+                        text = "LIVE 200ms",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = SignalEmerald,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                    )
+                }
             }
-        }
-
-        if (state.activeConsoleTab == ConsoleTab.LOGS) {
-            IconButton(
-                onClick = onClearLogs,
-                modifier = Modifier
-                    .size(36.dp)
-                    .testTag("clear_logs_button")
-            ) {
-                Icon(
-                    imageVector = Icons.Default.DeleteSweep,
-                    contentDescription = stringResource(R.string.cd_clear_logs),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(18.dp)
-                )
+            if (state.pinnedCandidateCount > 0) {
+                Surface(
+                    color = AssetAmber.copy(alpha = 0.16f),
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Bookmark,
+                            contentDescription = null,
+                            tint = AssetAmber,
+                            modifier = Modifier.size(10.dp)
+                        )
+                        Text(
+                            text = "${state.pinnedCandidateCount}",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = AssetAmber,
+                            fontSize = 9.sp
+                        )
+                    }
+                }
             }
-        }
-
-        IconButton(
-            onClick = onToggleExpanded,
-            modifier = Modifier
-                .size(36.dp)
-                .testTag("toggle_split_button")
-        ) {
-            Icon(
-                imageVector = if (state.isConsoleExpanded) Icons.Default.ExpandMore else Icons.Default.ExpandLess,
-                contentDescription = stringResource(R.string.cd_toggle_split),
-                tint = ElectricCyan,
-                modifier = Modifier.size(20.dp)
-            )
         }
     }
 }
@@ -299,22 +394,26 @@ private fun ConsoleHeaderBar(
 private fun HeaderTabPill(
     label: String,
     selected: Boolean,
+    accent: Color,
     testTag: String,
     onClick: () -> Unit
 ) {
     Surface(
         onClick = onClick,
         shape = RoundedCornerShape(6.dp),
-        color = if (selected) ElectricCyan.copy(alpha = 0.2f) else Color.Transparent,
-        border = if (selected) BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.6f)) else null,
+        color = if (selected) accent.copy(alpha = 0.2f) else ObsidianBg,
+        border = BorderStroke(
+            1.dp,
+            if (selected) accent.copy(alpha = 0.7f) else ObsidianBorder
+        ),
         modifier = Modifier.testTag(testTag)
     ) {
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall,
             fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-            color = if (selected) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+            color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
         )
     }
 }
@@ -328,6 +427,8 @@ private fun GuidedFourStepWizard(
     onRunStep3: () -> Unit,
     onExportReport: () -> Unit,
     onShareReport: () -> Unit,
+    onOpenStaging: () -> Unit,
+    onOpenEntities: () -> Unit,
     onOpenLogs: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -364,19 +465,20 @@ private fun GuidedFourStepWizard(
                     val preview = state.customGlobals.take(6).joinToString(", ")
                     CapturedSnippetBox(
                         accent = ElectricCyan,
-                        text = "Found ${state.customGlobals.size} custom globals ($timing) • ${state.canvasCount} canvas(es)" +
-                            if (preview.isNotEmpty()) "\nGlobals: $preview" else ""
+                        text = "Found ${state.customGlobals.size} custom globals ($timing) • ${state.stagingBuffer.size} staged" +
+                            if (preview.isNotEmpty()) "\nGlobals: $preview" else "",
+                        actionLabel = "Open Staging (${state.stagingBuffer.size}) ›",
+                        onActionClick = onOpenStaging
                     )
                 }
             }
 
-            // STEP 2 — Lock On to Player Coordinates
+            // STEP 2 — Lock On to Live Player Coordinates (200ms direct ref polling)
             WizardStepCard(
                 title = stringResource(R.string.wizard_step_2_title),
                 badge = state.step2Badge,
                 accent = SignalEmerald
             ) {
-                // Button 2A + plain-English instruction
                 StepActionButton(
                     label = stringResource(R.string.step_2a_capture_baseline),
                     icon = Icons.Default.TrackChanges,
@@ -394,7 +496,6 @@ private fun GuidedFourStepWizard(
 
                 Spacer(Modifier.height(2.dp))
 
-                // Button 2B + plain-English instruction
                 StepActionButton(
                     label = stringResource(R.string.step_2b_compute_delta),
                     icon = Icons.Default.Timeline,
@@ -410,13 +511,17 @@ private fun GuidedFourStepWizard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                // Live Real-Time X, Y, Z Readout once isolated
                 state.livePlayerCoords?.let { coords ->
-                    LivePlayerCoordsReadout(coords = coords)
+                    LivePlayerCoordsReadout(
+                        coords = coords,
+                        propertyKeys = state.playerPropertyKeys,
+                        tickCount = state.livePollTickCount,
+                        isLive = state.livePollActive
+                    )
                 }
             }
 
-            // STEP 3 — Find Nearby Monsters / Entities
+            // STEP 3 — Visual Entity Inspection
             WizardStepCard(
                 title = stringResource(R.string.wizard_step_3_title),
                 badge = state.step3Badge,
@@ -444,7 +549,9 @@ private fun GuidedFourStepWizard(
                     }
                     CapturedSnippetBox(
                         accent = TelemetryViolet,
-                        text = "Array: ${state.discoveredEntityArrayPath} (${state.discoveredEntities.size} entities)\n$sampleLine"
+                        text = "Array: ${state.discoveredEntityArrayPath} (${state.discoveredEntities.size} detected)\n$sampleLine",
+                        actionLabel = "Open Entity Console (${state.discoveredEntities.size}) ›",
+                        onActionClick = onOpenEntities
                     )
                 }
             }
@@ -507,13 +614,13 @@ private fun GuidedFourStepWizard(
                 if (state.lastExport?.success == true) {
                     CapturedSnippetBox(
                         accent = SignalEmerald,
-                        text = "Saved to ${state.lastExport.displayPath} • ${state.interceptedAssets.size} asset URLs included"
+                        text = "Saved to ${state.lastExport.displayPath} • ${state.pinnedCandidateCount} pinned • ${state.discoveredEntities.size} entities"
                     )
                 }
             }
         }
 
-        // Latest Log Ticker Bar (tap to jump straight to Live Logs)
+        // Latest Log Ticker Bar
         val latest = state.logs.lastOrNull()
         if (latest != null) {
             HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
@@ -550,7 +657,7 @@ private fun GuidedFourStepWizard(
                     modifier = Modifier.weight(1f)
                 )
                 Text(
-                    text = "View Logs ›",
+                    text = "Logs ›",
                     style = MaterialTheme.typography.labelSmall,
                     color = ElectricCyan
                 )
@@ -686,7 +793,12 @@ private fun StepActionButton(
 }
 
 @Composable
-private fun LivePlayerCoordsReadout(coords: PlayerCoordinates) {
+private fun LivePlayerCoordsReadout(
+    coords: PlayerCoordinates,
+    propertyKeys: String,
+    tickCount: Int,
+    isLive: Boolean
+) {
     Surface(
         color = SignalEmerald.copy(alpha = 0.12f),
         shape = RoundedCornerShape(8.dp),
@@ -710,13 +822,13 @@ private fun LivePlayerCoordsReadout(coords: PlayerCoordinates) {
                     modifier = Modifier.size(15.dp)
                 )
                 Text(
-                    text = "LIVE PLAYER LOCK",
+                    text = if (isLive) "LIVE 200ms (#$tickCount)" else "PLAYER LOCK",
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
                     color = SignalEmerald
                 )
                 Text(
-                    text = coords.path,
+                    text = coords.path + if (propertyKeys.isNotBlank()) " [$propertyKeys]" else "",
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = JetBrainsMonoFontFamily,
                     color = MaterialTheme.colorScheme.onSurface,
@@ -772,13 +884,19 @@ private fun CoordAxisTile(
 }
 
 @Composable
-private fun CapturedSnippetBox(accent: Color, text: String) {
-    Box(
+private fun CapturedSnippetBox(
+    accent: Color,
+    text: String,
+    actionLabel: String? = null,
+    onActionClick: (() -> Unit)? = null
+) {
+    Column(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(6.dp))
             .background(ObsidianBg)
-            .padding(horizontal = 8.dp, vertical = 6.dp)
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         Text(
             text = text,
@@ -787,63 +905,17 @@ private fun CapturedSnippetBox(accent: Color, text: String) {
             color = accent,
             lineHeight = 15.sp
         )
-    }
-}
-
-@Composable
-private fun LiveLogConsoleView(
-    state: DiagnosticsUiState,
-    onSelectFilter: (LogCategory) -> Unit,
-    onCopyPayload: (String) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val filteredLogs = remember(state.logs, state.selectedFilter) {
-        if (state.selectedFilter == LogCategory.ALL) state.logs
-        else state.logs.filter { it.category == state.selectedFilter }
-    }
-
-    val listState = rememberLazyListState()
-    LaunchedEffect(filteredLogs.size) {
-        if (filteredLogs.isNotEmpty()) {
-            listState.animateScrollToItem(filteredLogs.lastIndex)
-        }
-    }
-
-    Column(modifier = modifier) {
-        LogFilterRow(
-            selectedFilter = state.selectedFilter,
-            assetCount = state.interceptedAssets.size,
-            deltaCount = state.isolatedPaths.size,
-            onSelectFilter = onSelectFilter
-        )
-        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
-
-        if (filteredLogs.isEmpty()) {
-            ConsoleEmptyState(
-                hasAnyLogs = state.logs.isNotEmpty(),
-                selectedFilter = state.selectedFilter,
+        if (actionLabel != null && onActionClick != null) {
+            Text(
+                text = actionLabel,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface,
                 modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(4.dp))
+                    .clickable(onClick = onActionClick)
+                    .padding(vertical = 2.dp)
             )
-        } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .background(ObsidianBg)
-                    .testTag("telemetry_log_list"),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                verticalArrangement = Arrangement.spacedBy(5.dp)
-            ) {
-                items(filteredLogs, key = { it.id }) { entry ->
-                    TelemetryLogRow(
-                        entry = entry,
-                        onCopyPayload = onCopyPayload
-                    )
-                }
-            }
         }
     }
 }
@@ -857,7 +929,7 @@ private fun ManualJsExecutionDrawer(
 ) {
     val quickProbes = remember {
         listOf(
-            "Player path" to "window.__wvDiagState ? window.__wvDiagState.discoveredPlayerPath : null",
+            "Live ref" to "window.__wvDiagState && window.__wvDiagState.liveRef ? ({path: window.__wvDiagState.liveRef.path, keys: [window.__wvDiagState.liveRef.xKey, window.__wvDiagState.liveRef.yKey, window.__wvDiagState.liveRef.zKey]}) : null",
             "Entity array" to "window.__wvDiagState ? window.__wvDiagState.discoveredEntityArrayPath : null",
             "Custom globals" to "window.__wvDiagState ? window.__wvDiagState.customGlobals : []",
             "Viewport" to "({w: innerWidth, h: innerHeight, dpr: devicePixelRatio})"
@@ -1001,188 +1073,10 @@ private fun ManualJsExecutionDrawer(
 }
 
 @Composable
-private fun LogFilterRow(
-    selectedFilter: LogCategory,
-    assetCount: Int,
-    deltaCount: Int,
-    onSelectFilter: (LogCategory) -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(ObsidianSurface)
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(5.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        LogCategory.entries.forEach { category ->
-            val selected = category == selectedFilter
-            val accent = categoryAccentColor(category)
-            val suffix = when (category) {
-                LogCategory.ASSET -> if (assetCount > 0) " ($assetCount)" else ""
-                LogCategory.DELTA -> if (deltaCount > 0) " ($deltaCount)" else ""
-                else -> ""
-            }
-            Surface(
-                onClick = { onSelectFilter(category) },
-                shape = RoundedCornerShape(6.dp),
-                color = if (selected) accent.copy(alpha = 0.22f) else ObsidianBg,
-                border = BorderStroke(
-                    width = 1.dp,
-                    color = if (selected) accent else ObsidianBorder
-                ),
-                modifier = Modifier.testTag("filter_chip_${category.tag.lowercase()}")
-            ) {
-                Text(
-                    text = "${category.label}$suffix",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                    color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun TelemetryLogRow(
-    entry: TelemetryLogEntry,
-    onCopyPayload: (String) -> Unit
-) {
-    var expanded by remember(entry.id) { mutableStateOf(false) }
-    val accent = categoryAccentColor(entry.category)
-    val hasRichPayload = entry.payload.isNotBlank() && entry.payload != entry.summary
-
-    Surface(
-        shape = RoundedCornerShape(6.dp),
-        color = ObsidianSurface,
-        border = BorderStroke(
-            width = 1.dp,
-            color = if (expanded) accent.copy(alpha = 0.5f) else ObsidianBorder.copy(alpha = 0.55f)
-        ),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(enabled = hasRichPayload) { expanded = !expanded }
-            .testTag("log_entry_${entry.id}")
-    ) {
-        Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(
-                    text = entry.timestamp,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 9.sp
-                )
-                Surface(
-                    color = accent.copy(alpha = 0.18f),
-                    shape = RoundedCornerShape(4.dp)
-                ) {
-                    Text(
-                        text = entry.category.tag,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = accent,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                    )
-                }
-                Text(
-                    text = entry.summary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = if (expanded) Int.MAX_VALUE else 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                if (hasRichPayload) {
-                    IconButton(
-                        onClick = { onCopyPayload(entry.payload) },
-                        modifier = Modifier.size(28.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.ContentCopy,
-                            contentDescription = stringResource(R.string.cd_copy_log),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(14.dp)
-                        )
-                    }
-                }
-            }
-
-            if (expanded && hasRichPayload) {
-                Spacer(Modifier.height(4.dp))
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(ObsidianBg)
-                        .padding(6.dp)
-                ) {
-                    Text(
-                        text = entry.payload,
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = accent.copy(alpha = 0.92f),
-                        fontSize = 10.sp,
-                        lineHeight = 14.sp
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ConsoleEmptyState(
-    hasAnyLogs: Boolean,
-    selectedFilter: LogCategory,
-    modifier: Modifier = Modifier
-) {
-    Box(
-        modifier = modifier
-            .background(ObsidianBg)
-            .padding(16.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Default.Radar,
-                contentDescription = null,
-                tint = ElectricCyan.copy(alpha = 0.7f),
-                modifier = Modifier.size(28.dp)
-            )
-            Text(
-                text = if (hasAnyLogs) "No ${selectedFilter.label} events yet" else stringResource(R.string.console_empty_title),
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                text = if (hasAnyLogs) {
-                    "Switch back to All or run the corresponding Wizard step."
-                } else {
-                    stringResource(R.string.console_empty_subtitle)
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 3
-            )
-        }
-    }
-}
-
-@Composable
 private fun AsyncScanStatusPill(
     status: AsyncScanStatus,
-    detail: String
+    detail: String,
+    modifier: Modifier = Modifier
 ) {
     val accent = when (status) {
         AsyncScanStatus.IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -1199,55 +1093,37 @@ private fun AsyncScanStatusPill(
     val displayText = if (detail.isNotBlank() && status != AsyncScanStatus.IDLE) {
         detail
     } else {
-        statusLabel
+        "Scan: $statusLabel"
     }
 
-    Surface(
-        color = accent.copy(alpha = if (status == AsyncScanStatus.IDLE) 0.12f else 0.18f),
-        shape = RoundedCornerShape(6.dp),
-        border = BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
-        modifier = Modifier.testTag("async_scan_status_pill")
+    Row(
+        modifier = modifier.testTag("async_scan_status_pill"),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp)
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp)
-        ) {
-            if (status == AsyncScanStatus.RUNNING) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(10.dp),
-                    strokeWidth = 1.6.dp,
-                    color = accent
-                )
-            } else {
-                Box(
-                    modifier = Modifier
-                        .size(7.dp)
-                        .clip(CircleShape)
-                        .background(accent)
-                )
-            }
-            Text(
-                text = displayText,
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = accent,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+        if (status == AsyncScanStatus.RUNNING) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(10.dp),
+                strokeWidth = 1.6.dp,
+                color = accent
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(7.dp)
+                    .clip(CircleShape)
+                    .background(accent)
             )
         }
+        Text(
+            text = displayText,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = accent,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 
 private fun fmtCoord(value: Double): String = String.format(Locale.US, "%.2f", value)
-
-private fun categoryAccentColor(category: LogCategory): Color = when (category) {
-    LogCategory.ALL -> ElectricCyan
-    LogCategory.SCOPE -> ElectricCyan
-    LogCategory.DELTA -> SignalEmerald
-    LogCategory.ENTITY -> TelemetryViolet
-    LogCategory.ASSET -> AssetAmber
-    LogCategory.JS -> Color(0xFF60A5FA)
-    LogCategory.SYSTEM -> Color(0xFF94A3B8)
-    LogCategory.ERROR -> AlertCoral
-}

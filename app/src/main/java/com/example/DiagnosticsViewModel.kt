@@ -62,10 +62,18 @@ class DiagnosticsViewModel : ViewModel() {
                         activeUrl = targetUrl,
                         scanStatus = AsyncScanStatus.IDLE,
                         scanStatusDetail = "",
+                        step1Completed = false,
+                        customGlobals = emptyList(),
+                        step1DurationMs = null,
                         discoveredShallowPaths = emptyList(),
                         baselineCaptured = false,
                         baselineMetricCount = 0,
                         isolatedPaths = emptyList(),
+                        discoveredPlayerPath = null,
+                        livePlayerCoords = null,
+                        discoveredEntityArrayPath = null,
+                        entityProjectionMode = "",
+                        discoveredEntities = emptyList(),
                         lastEntityCount = 0,
                         interceptedAssets = emptyList(),
                         estimatedFps = null,
@@ -99,6 +107,10 @@ class DiagnosticsViewModel : ViewModel() {
                 reloadAfter = _uiState.value.activeUrl != "about:blank"
             )
         )
+    }
+
+    fun onSelectConsoleTab(tab: ConsoleTab) {
+        _uiState.update { it.copy(activeConsoleTab = tab) }
     }
 
     fun onPageStarted(url: String) {
@@ -148,11 +160,7 @@ class DiagnosticsViewModel : ViewModel() {
     }
 
     fun onBlockedSchemeAttempt(url: String) {
-        appendLog(
-            LogCategory.ERROR,
-            "Blocked disallowed URI scheme navigation",
-            url
-        )
+        appendLog(LogCategory.ERROR, "Blocked disallowed URI scheme navigation", url)
     }
 
     fun onScanStatusChanged(status: AsyncScanStatus, detail: String) {
@@ -164,51 +172,73 @@ class DiagnosticsViewModel : ViewModel() {
         }
     }
 
-    // Step 1: Non-Blocking Shallow Heuristic Global Scope Inspection
+    fun onPlayerCoordsUpdated(path: String, x: Double, y: Double, z: Double) {
+        _uiState.update { state ->
+            state.copy(
+                discoveredPlayerPath = state.discoveredPlayerPath ?: path,
+                livePlayerCoords = PlayerCoordinates(
+                    path = path,
+                    x = x,
+                    y = y,
+                    z = z,
+                    updatedAtMs = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    // Step 1: Zero-Freeze Filtered Custom Global Check (<2 ms)
     fun runStep1InspectScope() {
-        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 1: Scheduling shallow scan…")
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 1: Filtering custom globals…")
         appendLog(
             LogCategory.SCOPE,
-            "Running Step 1: Async Shallow Heuristic Scope Scan…",
-            "Scanning window globals & engine namespaces (depth 1–2, chunked via rAF)"
+            "Step 1: Scanning custom globals (zero-freeze filter)…",
+            "Filtering standard DOM/Web APIs out of window keys and checking active Canvas/WebGL contexts"
         )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildInspectGlobalScopeScript()))
     }
 
-    // Step 2A: Non-Blocking Shallow State Baseline
+    // Step 2A: Capture Standing Baseline
     fun runStep2ACaptureBaseline() {
-        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2A: Capturing shallow baseline…")
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2A: Capturing standing baseline…")
         appendLog(
             LogCategory.DELTA,
-            "Running Step 2A: Async Shallow State Baseline…",
-            "Snapshotting top-level numeric properties & vectors (max depth 2)"
+            "Step 2A: Capturing standing baseline…",
+            "Snapshotting numeric properties across filtered custom globals"
         )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildCaptureBaselineScript()))
     }
 
-    // Step 2B: Non-Blocking Shallow State Delta
+    // Step 2B: Isolate Player Coords + start live X/Y/Z tracker
     fun runStep2BComputeDelta() {
-        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2B: Computing shallow deltas…")
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2B: Isolating player coords…")
         appendLog(
             LogCategory.DELTA,
-            "Running Step 2B: Async Shallow State Delta…",
-            "Comparing live shallow runtime values against baseline snapshot"
+            "Step 2B: Isolating player coordinates…",
+            "Comparing live runtime state against standing baseline to lock on to moving X/Y/Z object"
         )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildComputeDeltaScript()))
     }
 
-    // Step 3: Non-Blocking Shallow Entity Bounding Box & Canvas Projection Analysis
+    // Step 3: Player-Anchored Nearby Entity Discovery
     fun runStep3ScanEntities() {
-        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 3: Scanning shallow entities…")
+        val anchor = _uiState.value.discoveredPlayerPath
+        if (anchor.isNullOrBlank()) {
+            val msg = "Complete Step 2B first so Step 3 can anchor to your player coordinates."
+            appendLog(LogCategory.ENTITY, msg, msg)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 3: Climbing parent tree from $anchor…")
         appendLog(
             LogCategory.ENTITY,
-            "Running Step 3: Async Shallow Entity Scan…",
-            "Probing shallow entity collections and 3D→2D canvas projection"
+            "Step 3: Scanning sibling entity collections anchored to $anchor…",
+            "Climbing 1–3 parent levels up from $anchor to inspect sibling Arrays/Maps/Sets & project to 2D canvas"
         )
-        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildScanEntitiesScript()))
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildScanEntitiesScript(anchor)))
     }
 
-    // Step 4: Automatic Resource & Asset Request Monitor (called from WebViewClient.shouldInterceptRequest)
+    // Passive Resource & Asset Request Monitor (called from WebViewClient.shouldInterceptRequest)
     fun onResourceRequestObserved(request: WebResourceRequest) {
         val uri = request.url ?: return
         val fullUrl = uri.toString()
@@ -242,17 +272,20 @@ class DiagnosticsViewModel : ViewModel() {
         }
     }
 
-    // Step 5: Export Diagnostic Report (.json)
+    // Step 4: Export Complete Telemetry Handoff JSON Report
     fun requestExportReport(context: Context, armBridge: () -> Unit, disarmBridge: () -> Boolean) {
         if (_uiState.value.isExporting) return
         val appContext = context.applicationContext
         pendingExportContext = appContext
         _uiState.update { it.copy(isExporting = true) }
         armBridge()
-        appendLog(LogCategory.SYSTEM, "Collecting viewport telemetry for JSON export…", "Invoking TelemetryBridge.exportReport()")
+        appendLog(
+            LogCategory.SYSTEM,
+            "Step 4: Collecting viewport & telemetry map for JSON export…",
+            "Invoking TelemetryBridge.exportReport()"
+        )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildCollectViewportMetricsScript()))
 
-        // Safety fallback if the current page cannot execute JS (e.g. blank/network error)
         pendingExportJob?.cancel()
         pendingExportJob = viewModelScope.launch {
             delay(1_200L)
@@ -346,9 +379,6 @@ class DiagnosticsViewModel : ViewModel() {
         _uiState.update { it.copy(logs = emptyList()) }
     }
 
-    /**
-     * Receives structured telemetry messages forwarded from [TelemetryBridge.logTelemetry].
-     */
     fun onTelemetryFromBridge(rawCategory: String, payload: String) {
         val category = LogCategory.fromRaw(rawCategory)
         val parsedSummary = parseStructuredTelemetry(category, payload)
@@ -366,46 +396,51 @@ class DiagnosticsViewModel : ViewModel() {
         return when (stage) {
             "GLOBAL_SCOPE_INSPECTED" -> {
                 val canvases = json.optInt("canvasCount", 0)
-                val candidateCount = json.optInt("candidateCount", json.optInt("customObjectCount", 0))
-                val chunks = json.optInt("chunksExecuted", 1)
-                val fps = if (json.isNull("estimatedFps")) null else json.optInt("estimatedFps", -1).takeIf { it > 0 }
-                val discovered = extractStringArray(json.optJSONArray("shallowPaths"))
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val totalFiltered = json.optInt("totalWindowKeysFiltered", 0)
+                val customArray = json.optJSONArray("customGlobals") ?: JSONArray()
+                val globalKeys = buildList {
+                    for (i in 0 until customArray.length()) {
+                        val key = customArray.optJSONObject(i)?.optString("key", "")?.trim().orEmpty()
+                        if (key.isNotEmpty()) add(key)
+                    }
+                }
+                val shallow = globalKeys.map { "window.$it" }
                 _uiState.update {
                     it.copy(
+                        step1Completed = true,
+                        customGlobals = globalKeys,
+                        step1DurationMs = durationMs,
                         canvasCount = canvases,
-                        estimatedFps = fps ?: it.estimatedFps,
-                        discoveredShallowPaths = mergeShallowPaths(it.discoveredShallowPaths, discovered),
+                        discoveredShallowPaths = mergeShallowPaths(it.discoveredShallowPaths, shallow),
                         scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "Step 1: $candidateCount containers (${chunks} chunks)"
+                        scanStatusDetail = "${globalKeys.size} globals in ${durationMs}ms"
                     )
                 }
-                val fpsLabel = fps?.let { "${it}fps" } ?: "rAF idle"
-                "Scope (depth≤2, ${chunks} chunks): $candidateCount containers • ${discovered.size} shallow paths • $canvases canvas(es) • $fpsLabel"
+                "Step 1 (${durationMs}ms): Found ${globalKeys.size} custom globals (filtered $totalFiltered window keys) • $canvases canvas(es)"
             }
             "BASELINE_CAPTURED" -> {
                 val metrics = json.optInt("metricCount", 0)
                 val roots = json.optInt("rootObjectCount", 0)
                 val chunks = json.optInt("chunksExecuted", 1)
-                val discovered = extractStringArray(json.optJSONArray("shallowPaths"))
                 _uiState.update {
                     it.copy(
                         baselineCaptured = true,
                         baselineMetricCount = metrics,
-                        discoveredShallowPaths = mergeShallowPaths(it.discoveredShallowPaths, discovered),
                         scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "2A Armed ($metrics shallow metrics)"
+                        scanStatusDetail = "2A Captured ($metrics values)"
                     )
                 }
-                "Shallow baseline (${chunks} chunks): $metrics numeric metrics across $roots roots"
+                "Step 2A (${chunks} chunks): Captured $metrics standing values across $roots custom globals"
             }
             "BASELINE_MISSING" -> {
                 _uiState.update {
                     it.copy(
                         scanStatus = AsyncScanStatus.IDLE,
-                        scanStatusDetail = "Capture 2A baseline first"
+                        scanStatusDetail = "Capture 2A while standing still first"
                     )
                 }
-                json.optString("message", "Capture baseline (2A) first.")
+                json.optString("message", "Stand still and capture 2A baseline first.")
             }
             "DELTA_COMPUTED" -> {
                 val deltasArray = json.optJSONArray("deltas") ?: JSONArray()
@@ -422,36 +457,88 @@ class DiagnosticsViewModel : ViewModel() {
                         )
                     }
                 }
-                val newPaths = isolatedList.map { it.path }.filter { it.isNotBlank() }
-                _uiState.update {
-                    it.copy(
+                val playerPath = json.optString("discoveredPlayerPath", "").takeIf { it.isNotBlank() && it != "null" }
+                val liveObj = json.optJSONObject("liveSample")
+                val liveCoords = if (playerPath != null && liveObj != null) {
+                    PlayerCoordinates(
+                        path = playerPath,
+                        x = liveObj.optDouble("x", 0.0),
+                        y = liveObj.optDouble("y", 0.0),
+                        z = liveObj.optDouble("z", 0.0)
+                    )
+                } else null
+
+                val newPaths = buildList {
+                    if (playerPath != null) add(playerPath)
+                    isolatedList.forEach { if (it.path.isNotBlank()) add(it.path) }
+                }
+                _uiState.update { state ->
+                    state.copy(
                         isolatedPaths = isolatedList,
-                        discoveredShallowPaths = mergeShallowPaths(it.discoveredShallowPaths, newPaths),
-                        scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "Step 2B: ${isolatedList.size} deltas isolated"
+                        discoveredPlayerPath = playerPath ?: state.discoveredPlayerPath,
+                        livePlayerCoords = liveCoords ?: state.livePlayerCoords,
+                        discoveredShallowPaths = mergeShallowPaths(state.discoveredShallowPaths, newPaths),
+                        scanStatus = if (playerPath != null) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = playerPath?.let { "Locked: $it" } ?: "No movement detected"
                     )
                 }
-                val totalChanged = json.optInt("totalChanged", isolatedList.size)
                 val elapsedMs = json.optInt("elapsedMs", 0)
-                val chunks = json.optInt("chunksExecuted", 1)
-                if (isolatedList.isEmpty()) {
-                    "Delta (${elapsedMs}ms, ${chunks} chunks): 0 active coordinate changes detected"
+                if (playerPath == null) {
+                    "Step 2B (${elapsedMs}ms): No player movement detected — walk 5–10 steps and retry."
                 } else {
-                    "Delta (${elapsedMs}ms, ${chunks} chunks): Isolated ${isolatedList.size}/$totalChanged paths (top: ${isolatedList.first().path})"
+                    "Step 2B (${elapsedMs}ms): Locked on to $playerPath (${isolatedList.size} deltas)"
                 }
+            }
+            "ANCHOR_MISSING" -> {
+                _uiState.update {
+                    it.copy(
+                        scanStatus = AsyncScanStatus.IDLE,
+                        scanStatusDetail = "Complete Step 2B first"
+                    )
+                }
+                json.optString("message", "Complete Step 2B first.")
             }
             "ENTITIES_SCANNED" -> {
                 val count = json.optInt("entityCount", 0)
-                val mode = json.optString("projectionMode", "pinhole")
-                val chunks = json.optInt("chunksExecuted", 1)
+                val arrayPath = json.optString("entityArrayPath", "").takeIf { it.isNotBlank() && it != "null" }
+                val mode = json.optString("projectionMode", "pinhole_viewport_fallback")
+                val entitiesArr = json.optJSONArray("entities") ?: JSONArray()
+                val parsedEntities = buildList {
+                    for (i in 0 until entitiesArr.length()) {
+                        val obj = entitiesArr.optJSONObject(i) ?: continue
+                        val world = obj.optJSONObject("world")
+                        add(
+                            DiscoveredEntitySample(
+                                name = obj.optString("name", "Entity"),
+                                id = obj.optString("id", ""),
+                                path = obj.optString("path", ""),
+                                worldX = world?.optDouble("x", 0.0) ?: 0.0,
+                                worldY = world?.optDouble("y", 0.0) ?: 0.0,
+                                worldZ = world?.optDouble("z", 0.0) ?: 0.0,
+                                distanceToPlayer = obj.optDouble("distanceToPlayer", 0.0),
+                                screenX = obj.optDouble("screenX", 0.0),
+                                screenY = obj.optDouble("screenY", 0.0),
+                                inViewport = obj.optBoolean("inViewport", false),
+                                sampleKeys = extractStringArray(obj.optJSONArray("sampleKeys"))
+                            )
+                        )
+                    }
+                }
                 _uiState.update {
                     it.copy(
+                        discoveredEntityArrayPath = arrayPath,
+                        entityProjectionMode = mode,
+                        discoveredEntities = parsedEntities,
                         lastEntityCount = count,
-                        scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "Step 3: $count entities projected"
+                        scanStatus = if (count > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = if (arrayPath != null) "$count entities in $arrayPath" else "0 sibling entities"
                     )
                 }
-                "Entities (${chunks} chunks): $count projected to 2D canvas via $mode"
+                if (arrayPath != null) {
+                    "Step 3: Found $count entities in $arrayPath (projection: $mode)"
+                } else {
+                    "Step 3: 0 sibling entity collections found near ${_uiState.value.discoveredPlayerPath}"
+                }
             }
             "MANUAL_EVAL" -> {
                 val type = json.optString("resultType", "unknown")
@@ -514,30 +601,46 @@ class DiagnosticsViewModel : ViewModel() {
         root.put("pageTitle", state.pageTitle)
         root.put("desktopUserAgentEnabled", state.isDesktopMode)
         root.put("remoteWebContentsDebuggingEnabled", false)
-        root.put("scannerArchitecture", "async_chunked_shallow_heuristic_depth_2")
-        root.put("lastScanStatus", state.scanStatus.label)
-        root.put("lastScanDetail", state.scanStatusDetail)
-        root.put("estimatedFps", state.estimatedFps ?: JSONObject.NULL)
-        root.put("canvasCount", state.canvasCount)
 
-        val viewportObj = try {
+        val bridgeObj = try {
             JSONObject(viewportMetricsJson)
         } catch (_: Exception) {
             JSONObject().put("raw", viewportMetricsJson)
         }
-        root.put("viewportMetrics", viewportObj)
 
-        val combinedShallow = mergeShallowPaths(
-            state.discoveredShallowPaths,
-            extractStringArray(viewportObj.optJSONArray("discoveredShallowPaths"))
-        )
-        val shallowPathsArray = JSONArray()
-        combinedShallow.forEach { path -> shallowPathsArray.put(path) }
-        root.put("discoveredShallowPaths", shallowPathsArray)
+        // 1. Viewport dimensions (width, height, devicePixelRatio + canvases)
+        val viewportObj = bridgeObj.optJSONObject("viewport") ?: JSONObject()
+        val viewportOut = JSONObject()
+            .put("width", viewportObj.optInt("width", viewportObj.optInt("innerWidth", 0)))
+            .put("height", viewportObj.optInt("height", viewportObj.optInt("innerHeight", 0)))
+            .put("devicePixelRatio", viewportObj.optDouble("devicePixelRatio", 1.0))
+            .put("canvases", bridgeObj.optJSONArray("canvases") ?: JSONArray())
+        root.put("viewport", viewportOut)
 
-        val pathsArray = JSONArray()
+        // 2. Confirmed custom globals from Step 1
+        val customGlobalsArr = JSONArray()
+        state.customGlobals.forEach { customGlobalsArr.put(it) }
+        root.put("customGlobals", customGlobalsArr)
+
+        // 3. Confirmed JS path for player coordinates + live sample values (Step 2B)
+        val confirmedPlayerPath = state.discoveredPlayerPath
+            ?: bridgeObj.optString("discoveredPlayerPath", "").takeIf { it.isNotBlank() && it != "null" }
+        val liveSampleJson = JSONObject().apply {
+            val live = state.livePlayerCoords
+            val bridgeLive = bridgeObj.optJSONObject("livePlayerSample")
+            if (bridgeLive != null) {
+                put("x", bridgeLive.optDouble("x", live?.x ?: 0.0))
+                put("y", bridgeLive.optDouble("y", live?.y ?: 0.0))
+                put("z", bridgeLive.optDouble("z", live?.z ?: 0.0))
+            } else if (live != null) {
+                put("x", live.x)
+                put("y", live.y)
+                put("z", live.z)
+            }
+        }
+        val deltasArr = JSONArray()
         state.isolatedPaths.forEach { item ->
-            pathsArray.put(
+            deltasArr.put(
                 JSONObject()
                     .put("path", item.path)
                     .put("baseline", item.baselineValue)
@@ -545,8 +648,54 @@ class DiagnosticsViewModel : ViewModel() {
                     .put("delta", item.delta)
             )
         }
-        root.put("isolatedVariablePaths", pathsArray)
+        root.put(
+            "playerCoordinates",
+            JSONObject()
+                .put("confirmedJsPath", confirmedPlayerPath ?: JSONObject.NULL)
+                .put("liveSample", if (liveSampleJson.length() > 0) liveSampleJson else JSONObject.NULL)
+                .put("isolatedDeltas", deltasArr)
+        )
 
+        // 4. Confirmed JS path for entity array + sample entity objects (Step 3)
+        val confirmedEntityPath = state.discoveredEntityArrayPath
+            ?: bridgeObj.optString("discoveredEntityArrayPath", "").takeIf { it.isNotBlank() && it != "null" }
+        val entitiesArr = JSONArray()
+        state.discoveredEntities.forEach { ent ->
+            val keysJson = JSONArray()
+            ent.sampleKeys.forEach { keysJson.put(it) }
+            entitiesArr.put(
+                JSONObject()
+                    .put("name", ent.name)
+                    .put("id", ent.id)
+                    .put("path", ent.path)
+                    .put(
+                        "worldCoords",
+                        JSONObject()
+                            .put("x", ent.worldX)
+                            .put("y", ent.worldY)
+                            .put("z", ent.worldZ)
+                    )
+                    .put("distanceToPlayer", ent.distanceToPlayer)
+                    .put(
+                        "projectedScreenCoords",
+                        JSONObject()
+                            .put("screenX", ent.screenX)
+                            .put("screenY", ent.screenY)
+                            .put("inViewport", ent.inViewport)
+                    )
+                    .put("sampleKeys", keysJson)
+            )
+        }
+        root.put(
+            "entityCollection",
+            JSONObject()
+                .put("confirmedJsPath", confirmedEntityPath ?: JSONObject.NULL)
+                .put("projectionMode", state.entityProjectionMode)
+                .put("entityCount", state.discoveredEntities.size)
+                .put("sampleEntities", entitiesArr)
+        )
+
+        // 5. Intercepted map / chunk / asset URLs
         val assetsArray = JSONArray()
         state.interceptedAssets.forEach { asset ->
             assetsArray.put(
@@ -558,8 +707,9 @@ class DiagnosticsViewModel : ViewModel() {
                     .put("isForMainFrame", asset.isForMainFrame)
             )
         }
-        root.put("interceptedAssets", assetsArray)
+        root.put("interceptedAssetUrls", assetsArray)
 
+        // 6. Session logs
         val logsArray = JSONArray()
         state.logs.forEach { entry ->
             logsArray.put(
@@ -572,7 +722,7 @@ class DiagnosticsViewModel : ViewModel() {
                     .put("payload", entry.payload)
             )
         }
-        root.put("rawLogs", logsArray)
+        root.put("sessionLogs", logsArray)
 
         return root.toString(2)
     }

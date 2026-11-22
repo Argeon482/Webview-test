@@ -31,6 +31,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
@@ -39,6 +40,7 @@ import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Share
@@ -77,10 +79,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.AsyncScanStatus
+import com.example.ConsoleTab
 import com.example.DiagnosticsUiState
 import com.example.LogCategory
+import com.example.PlayerCoordinates
 import com.example.R
 import com.example.TelemetryLogEntry
+import com.example.WizardStepBadge
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
 import com.example.ui.theme.ElectricCyan
@@ -92,6 +97,7 @@ import com.example.ui.theme.ObsidianSurfaceElevated
 import com.example.ui.theme.ObsidianSurfaceHighest
 import com.example.ui.theme.SignalEmerald
 import com.example.ui.theme.TelemetryViolet
+import java.util.Locale
 
 @Composable
 fun TelemetryConsolePanel(
@@ -102,6 +108,7 @@ fun TelemetryConsolePanel(
     onRunStep3: () -> Unit,
     onExportReport: () -> Unit,
     onShareReport: () -> Unit,
+    onSelectConsoleTab: (ConsoleTab) -> Unit,
     onSelectFilter: (LogCategory) -> Unit,
     onToggleJsDrawer: () -> Unit,
     onManualJsChanged: (String) -> Unit,
@@ -115,26 +122,15 @@ fun TelemetryConsolePanel(
         BackHandler { onToggleJsDrawer() }
     }
 
-    val filteredLogs = remember(state.logs, state.selectedFilter) {
-        if (state.selectedFilter == LogCategory.ALL) state.logs
-        else state.logs.filter { it.category == state.selectedFilter }
-    }
-
-    val listState = rememberLazyListState()
-    LaunchedEffect(filteredLogs.size) {
-        if (filteredLogs.isNotEmpty()) {
-            listState.animateScrollToItem(filteredLogs.lastIndex)
-        }
-    }
-
     Surface(
         modifier = modifier.fillMaxSize(),
         color = ObsidianSurface
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Console Header Bar
+            // Top Header: Wizard / Logs Tab Switcher + Live Async Scan Status + JS Console + Expand
             ConsoleHeaderBar(
                 state = state,
+                onSelectTab = onSelectConsoleTab,
                 onToggleJsDrawer = onToggleJsDrawer,
                 onClearLogs = onClearLogs,
                 onToggleExpanded = onToggleExpanded
@@ -142,18 +138,7 @@ fun TelemetryConsolePanel(
 
             HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
-            // Guided Diagnostic Wizard Action Rail
-            DiagnosticWizardStrip(
-                state = state,
-                onRunStep1 = onRunStep1,
-                onRunStep2A = onRunStep2A,
-                onRunStep2B = onRunStep2B,
-                onRunStep3 = onRunStep3,
-                onExportReport = onExportReport,
-                onShareReport = onShareReport
-            )
-
-            // Manual JavaScript Execution Drawer
+            // Manual JavaScript Execution Drawer (available over either tab)
             AnimatedVisibility(
                 visible = state.isJsDrawerOpen,
                 enter = expandVertically() + fadeIn(),
@@ -167,42 +152,31 @@ fun TelemetryConsolePanel(
                 )
             }
 
-            // Category Filter Chips
-            LogFilterRow(
-                selectedFilter = state.selectedFilter,
-                assetCount = state.interceptedAssets.size,
-                deltaCount = state.isolatedPaths.size,
-                onSelectFilter = onSelectFilter
-            )
-
-            HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
-
-            // Live Scrolling Telemetry Log Console
-            if (filteredLogs.isEmpty()) {
-                ConsoleEmptyState(
-                    hasAnyLogs = state.logs.isNotEmpty(),
-                    selectedFilter = state.selectedFilter,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                )
-            } else {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxWidth()
-                        .background(ObsidianBg)
-                        .testTag("telemetry_log_list"),
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                    verticalArrangement = Arrangement.spacedBy(5.dp)
-                ) {
-                    items(filteredLogs, key = { it.id }) { entry ->
-                        TelemetryLogRow(
-                            entry = entry,
-                            onCopyPayload = onCopyPayload
-                        )
-                    }
+            when (state.activeConsoleTab) {
+                ConsoleTab.WIZARD -> {
+                    GuidedFourStepWizard(
+                        state = state,
+                        onRunStep1 = onRunStep1,
+                        onRunStep2A = onRunStep2A,
+                        onRunStep2B = onRunStep2B,
+                        onRunStep3 = onRunStep3,
+                        onExportReport = onExportReport,
+                        onShareReport = onShareReport,
+                        onOpenLogs = { onSelectConsoleTab(ConsoleTab.LOGS) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                    )
+                }
+                ConsoleTab.LOGS -> {
+                    LiveLogConsoleView(
+                        state = state,
+                        onSelectFilter = onSelectFilter,
+                        onCopyPayload = onCopyPayload,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                    )
                 }
             }
         }
@@ -212,6 +186,7 @@ fun TelemetryConsolePanel(
 @Composable
 private fun ConsoleHeaderBar(
     state: DiagnosticsUiState,
+    onSelectTab: (ConsoleTab) -> Unit,
     onToggleJsDrawer: () -> Unit,
     onClearLogs: () -> Unit,
     onToggleExpanded: () -> Unit
@@ -220,67 +195,79 @@ private fun ConsoleHeaderBar(
         modifier = Modifier
             .fillMaxWidth()
             .background(ObsidianSurfaceElevated)
-            .padding(horizontal = 10.dp, vertical = 4.dp),
+            .padding(horizontal = 8.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
     ) {
+        // Segmented Wizard / Logs Switcher
         Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            modifier = Modifier.weight(1f)
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .background(ObsidianBg)
+                .padding(2.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
+            HeaderTabPill(
+                label = stringResource(R.string.tab_wizard),
+                selected = state.activeConsoleTab == ConsoleTab.WIZARD,
+                testTag = "tab_wizard_button",
+                onClick = { onSelectTab(ConsoleTab.WIZARD) }
+            )
+            HeaderTabPill(
+                label = "${stringResource(R.string.tab_logs)} (${state.logs.size})",
+                selected = state.activeConsoleTab == ConsoleTab.LOGS,
+                testTag = "tab_logs_button",
+                onClick = { onSelectTab(ConsoleTab.LOGS) }
+            )
+        }
+
+        // Compact Async Scan Status Pill
+        Box(modifier = Modifier.weight(1f)) {
             AsyncScanStatusPill(
                 status = state.scanStatus,
                 detail = state.scanStatusDetail
             )
-            state.estimatedFps?.let { fps ->
-                MetricBadge(text = "${fps}fps", tint = SignalEmerald)
-            }
-            if (state.discoveredShallowPaths.isNotEmpty()) {
-                MetricBadge(text = "${state.discoveredShallowPaths.size} paths", tint = ElectricCyan)
-            }
-            if (state.interceptedAssets.isNotEmpty()) {
-                MetricBadge(text = "${state.interceptedAssets.size} assets", tint = AssetAmber)
+        }
+
+        // JS Console Toggle
+        Surface(
+            shape = RoundedCornerShape(6.dp),
+            color = if (state.isJsDrawerOpen) MaterialTheme.colorScheme.primaryContainer else ObsidianSurfaceHighest,
+            border = BorderStroke(
+                1.dp,
+                if (state.isJsDrawerOpen) ElectricCyan else ObsidianBorder
+            ),
+            modifier = Modifier
+                .heightIn(min = 36.dp)
+                .clip(RoundedCornerShape(6.dp))
+                .clickable(onClick = onToggleJsDrawer)
+                .testTag("toggle_js_drawer_button")
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Terminal,
+                    contentDescription = stringResource(R.string.cd_toggle_js_drawer),
+                    tint = if (state.isJsDrawerOpen) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(15.dp)
+                )
+                Text(
+                    text = "JS",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = if (state.isJsDrawerOpen) ElectricCyan else MaterialTheme.colorScheme.onSurface
+                )
             }
         }
 
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Surface(
-                shape = RoundedCornerShape(6.dp),
-                color = if (state.isJsDrawerOpen) MaterialTheme.colorScheme.primaryContainer else ObsidianSurfaceHighest,
-                border = BorderStroke(
-                    1.dp,
-                    if (state.isJsDrawerOpen) ElectricCyan else ObsidianBorder
-                ),
-                modifier = Modifier
-                    .heightIn(min = 36.dp)
-                    .clip(RoundedCornerShape(6.dp))
-                    .clickable(onClick = onToggleJsDrawer)
-                    .testTag("toggle_js_drawer_button")
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Terminal,
-                        contentDescription = stringResource(R.string.cd_toggle_js_drawer),
-                        tint = if (state.isJsDrawerOpen) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(15.dp)
-                    )
-                    Text(
-                        text = stringResource(R.string.action_js_drawer),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (state.isJsDrawerOpen) ElectricCyan else MaterialTheme.colorScheme.onSurface
-                    )
-                }
-            }
-
+        if (state.activeConsoleTab == ConsoleTab.LOGS) {
             IconButton(
                 onClick = onClearLogs,
                 modifier = Modifier
-                    .size(40.dp)
+                    .size(36.dp)
                     .testTag("clear_logs_button")
             ) {
                 Icon(
@@ -290,144 +277,282 @@ private fun ConsoleHeaderBar(
                     modifier = Modifier.size(18.dp)
                 )
             }
+        }
 
-            IconButton(
-                onClick = onToggleExpanded,
-                modifier = Modifier
-                    .size(40.dp)
-                    .testTag("toggle_split_button")
-            ) {
-                Icon(
-                    imageVector = if (state.isConsoleExpanded) Icons.Default.ExpandMore else Icons.Default.ExpandLess,
-                    contentDescription = stringResource(R.string.cd_toggle_split),
-                    tint = ElectricCyan,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
+        IconButton(
+            onClick = onToggleExpanded,
+            modifier = Modifier
+                .size(36.dp)
+                .testTag("toggle_split_button")
+        ) {
+            Icon(
+                imageVector = if (state.isConsoleExpanded) Icons.Default.ExpandMore else Icons.Default.ExpandLess,
+                contentDescription = stringResource(R.string.cd_toggle_split),
+                tint = ElectricCyan,
+                modifier = Modifier.size(20.dp)
+            )
         }
     }
 }
 
 @Composable
-private fun DiagnosticWizardStrip(
+private fun HeaderTabPill(
+    label: String,
+    selected: Boolean,
+    testTag: String,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(6.dp),
+        color = if (selected) ElectricCyan.copy(alpha = 0.2f) else Color.Transparent,
+        border = if (selected) BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.6f)) else null,
+        modifier = Modifier.testTag(testTag)
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+            color = if (selected) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+        )
+    }
+}
+
+@Composable
+private fun GuidedFourStepWizard(
     state: DiagnosticsUiState,
     onRunStep1: () -> Unit,
     onRunStep2A: () -> Unit,
     onRunStep2B: () -> Unit,
     onRunStep3: () -> Unit,
     onExportReport: () -> Unit,
-    onShareReport: () -> Unit
+    onShareReport: () -> Unit,
+    onOpenLogs: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(ObsidianSurface)
-            .padding(horizontal = 8.dp, vertical = 6.dp),
-        verticalArrangement = Arrangement.spacedBy(5.dp)
-    ) {
-        Row(
+    Column(modifier = modifier.background(ObsidianBg)) {
+        Column(
             modifier = Modifier
+                .weight(1f)
                 .fillMaxWidth()
-                .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            WizardActionPill(
-                label = stringResource(R.string.step_1_inspect_scope),
-                icon = Icons.Default.Radar,
-                accent = ElectricCyan,
-                highlighted = false,
-                testTag = "step_1_inspect_scope_button",
-                onClick = onRunStep1
-            )
-            WizardActionPill(
-                label = stringResource(R.string.step_2a_capture_baseline),
-                icon = Icons.Default.TrackChanges,
-                accent = SignalEmerald,
-                highlighted = state.baselineCaptured,
-                testTag = "step_2a_baseline_button",
-                onClick = onRunStep2A
-            )
-            WizardActionPill(
-                label = stringResource(R.string.step_2b_compute_delta),
-                icon = Icons.Default.Timeline,
-                accent = SignalEmerald,
-                highlighted = state.isolatedPaths.isNotEmpty(),
-                testTag = "step_2b_delta_button",
-                onClick = onRunStep2B
-            )
-            WizardActionPill(
-                label = stringResource(R.string.step_3_scan_entities),
-                icon = Icons.Default.ViewInAr,
-                accent = TelemetryViolet,
-                highlighted = state.lastEntityCount > 0,
-                testTag = "step_3_entities_button",
-                onClick = onRunStep3
-            )
-            WizardActionPill(
-                label = stringResource(R.string.step_5_export_report),
-                icon = Icons.Default.Download,
-                accent = AssetAmber,
-                highlighted = state.lastExport?.success == true,
-                isBusy = state.isExporting,
-                testTag = "step_5_export_report_button",
-                onClick = onExportReport
-            )
-
-            if (state.lastExport?.success == true && state.lastExport.contentUri != null) {
-                OutlinedButton(
-                    onClick = onShareReport,
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                    shape = RoundedCornerShape(8.dp),
-                    border = BorderStroke(1.dp, SignalEmerald),
-                    modifier = Modifier
-                        .height(38.dp)
-                        .testTag("share_report_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Share,
-                        contentDescription = stringResource(R.string.cd_share_report),
-                        tint = SignalEmerald,
-                        modifier = Modifier.size(15.dp)
+            // STEP 1 — Find Game Engine
+            WizardStepCard(
+                title = stringResource(R.string.wizard_step_1_title),
+                badge = state.step1Badge,
+                accent = ElectricCyan
+            ) {
+                StepActionButton(
+                    label = stringResource(R.string.step_1_inspect_scope),
+                    icon = Icons.Default.Radar,
+                    accent = ElectricCyan,
+                    enabled = true,
+                    testTag = "step_1_inspect_scope_button",
+                    onClick = onRunStep1
+                )
+                Text(
+                    text = stringResource(R.string.wizard_step_1_instruction),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                if (state.step1Completed) {
+                    val timing = state.step1DurationMs?.let { String.format(Locale.US, "%.2fms", it) } ?: ""
+                    val preview = state.customGlobals.take(6).joinToString(", ")
+                    CapturedSnippetBox(
+                        accent = ElectricCyan,
+                        text = "Found ${state.customGlobals.size} custom globals ($timing) • ${state.canvasCount} canvas(es)" +
+                            if (preview.isNotEmpty()) "\nGlobals: $preview" else ""
                     )
-                    Spacer(Modifier.width(5.dp))
-                    Text(
-                        text = stringResource(R.string.action_share_report),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = SignalEmerald
+                }
+            }
+
+            // STEP 2 — Lock On to Player Coordinates
+            WizardStepCard(
+                title = stringResource(R.string.wizard_step_2_title),
+                badge = state.step2Badge,
+                accent = SignalEmerald
+            ) {
+                // Button 2A + plain-English instruction
+                StepActionButton(
+                    label = stringResource(R.string.step_2a_capture_baseline),
+                    icon = Icons.Default.TrackChanges,
+                    accent = SignalEmerald,
+                    enabled = true,
+                    filled = state.baselineCaptured,
+                    testTag = "step_2a_baseline_button",
+                    onClick = onRunStep2A
+                )
+                Text(
+                    text = stringResource(R.string.wizard_step_2a_instruction),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(Modifier.height(2.dp))
+
+                // Button 2B + plain-English instruction
+                StepActionButton(
+                    label = stringResource(R.string.step_2b_compute_delta),
+                    icon = Icons.Default.Timeline,
+                    accent = SignalEmerald,
+                    enabled = true,
+                    filled = state.livePlayerCoords != null,
+                    testTag = "step_2b_delta_button",
+                    onClick = onRunStep2B
+                )
+                Text(
+                    text = stringResource(R.string.wizard_step_2b_instruction),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                // Live Real-Time X, Y, Z Readout once isolated
+                state.livePlayerCoords?.let { coords ->
+                    LivePlayerCoordsReadout(coords = coords)
+                }
+            }
+
+            // STEP 3 — Find Nearby Monsters / Entities
+            WizardStepCard(
+                title = stringResource(R.string.wizard_step_3_title),
+                badge = state.step3Badge,
+                accent = TelemetryViolet
+            ) {
+                val canRunStep3 = !state.discoveredPlayerPath.isNullOrBlank()
+                StepActionButton(
+                    label = stringResource(R.string.step_3_scan_entities),
+                    icon = Icons.Default.ViewInAr,
+                    accent = TelemetryViolet,
+                    enabled = canRunStep3,
+                    filled = state.discoveredEntities.isNotEmpty(),
+                    testTag = "step_3_entities_button",
+                    onClick = onRunStep3
+                )
+                Text(
+                    text = stringResource(R.string.wizard_step_3_instruction),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                if (!state.discoveredEntityArrayPath.isNullOrBlank() && state.discoveredEntities.isNotEmpty()) {
+                    val sampleLine = state.discoveredEntities.take(2).joinToString("\n") { e ->
+                        "• ${e.name} world(${fmtCoord(e.worldX)}, ${fmtCoord(e.worldY)}, ${fmtCoord(e.worldZ)}) -> screen(${fmtCoord(e.screenX)}, ${fmtCoord(e.screenY)})"
+                    }
+                    CapturedSnippetBox(
+                        accent = TelemetryViolet,
+                        text = "Array: ${state.discoveredEntityArrayPath} (${state.discoveredEntities.size} entities)\n$sampleLine"
+                    )
+                }
+            }
+
+            // STEP 4 — Export Handoff File
+            WizardStepCard(
+                title = stringResource(R.string.wizard_step_4_title),
+                badge = state.step4Badge,
+                accent = AssetAmber
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    StepActionButton(
+                        label = stringResource(R.string.step_4_export_report),
+                        icon = Icons.Default.Download,
+                        accent = AssetAmber,
+                        enabled = !state.isExporting,
+                        isBusy = state.isExporting,
+                        filled = state.step4Badge == WizardStepBadge.READY || state.step4Badge == WizardStepBadge.CAPTURED,
+                        testTag = "step_5_export_report_button",
+                        onClick = onExportReport,
+                        modifier = Modifier.weight(1f)
+                    )
+
+                    if (state.lastExport?.success == true && state.lastExport.contentUri != null) {
+                        OutlinedButton(
+                            onClick = onShareReport,
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, SignalEmerald),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .testTag("share_report_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Share,
+                                contentDescription = stringResource(R.string.cd_share_report),
+                                tint = SignalEmerald,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                text = stringResource(R.string.action_share_report),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = SignalEmerald
+                            )
+                        }
+                    }
+                }
+
+                Text(
+                    text = stringResource(R.string.wizard_step_4_instruction),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                if (state.lastExport?.success == true) {
+                    CapturedSnippetBox(
+                        accent = SignalEmerald,
+                        text = "Saved to ${state.lastExport.displayPath} • ${state.interceptedAssets.size} asset URLs included"
                     )
                 }
             }
         }
 
-        // Step 2 Guidance Strip (always visible, pulses emerald once 2A baseline is armed)
-        Surface(
-            color = if (state.baselineCaptured) SignalEmerald.copy(alpha = 0.12f) else ObsidianSurfaceElevated,
-            shape = RoundedCornerShape(6.dp),
-            border = BorderStroke(
-                width = 1.dp,
-                color = if (state.baselineCaptured) SignalEmerald.copy(alpha = 0.45f) else ObsidianBorder.copy(alpha = 0.7f)
-            ),
-            modifier = Modifier.fillMaxWidth()
-        ) {
+        // Latest Log Ticker Bar (tap to jump straight to Live Logs)
+        val latest = state.logs.lastOrNull()
+        if (latest != null) {
+            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
             Row(
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(ObsidianSurface)
+                    .clickable(onClick = onOpenLogs)
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .testTag("latest_log_ticker"),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                val accent = categoryAccentColor(latest.category)
+                Surface(
+                    color = accent.copy(alpha = 0.2f),
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Text(
+                        text = latest.category.tag,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = accent,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                    )
+                }
                 Text(
-                    text = if (state.baselineCaptured) "2A ARMED (${state.baselineMetricCount})" else "STEP 2 GUIDE",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = if (state.baselineCaptured) SignalEmerald else ElectricCyan
-                )
-                Text(
-                    text = stringResource(R.string.step_2_instruction),
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
+                    text = latest.summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = "View Logs ›",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ElectricCyan
                 )
             }
         }
@@ -435,53 +560,290 @@ private fun DiagnosticWizardStrip(
 }
 
 @Composable
-private fun WizardActionPill(
+private fun WizardStepCard(
+    title: String,
+    badge: WizardStepBadge,
+    accent: Color,
+    content: @Composable () -> Unit
+) {
+    val borderColor = when (badge) {
+        WizardStepBadge.CAPTURED -> SignalEmerald.copy(alpha = 0.55f)
+        WizardStepBadge.READY -> accent.copy(alpha = 0.45f)
+        WizardStepBadge.PENDING -> ObsidianBorder
+    }
+
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = ObsidianSurface,
+        border = BorderStroke(1.dp, borderColor),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
+                )
+                StepStatusBadgeChip(badge = badge)
+            }
+            content()
+        }
+    }
+}
+
+@Composable
+private fun StepStatusBadgeChip(badge: WizardStepBadge) {
+    val (bg, fg) = when (badge) {
+        WizardStepBadge.CAPTURED -> SignalEmerald.copy(alpha = 0.18f) to SignalEmerald
+        WizardStepBadge.READY -> ElectricCyan.copy(alpha = 0.18f) to ElectricCyan
+        WizardStepBadge.PENDING -> ObsidianSurfaceElevated to MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Surface(
+        color = bg,
+        shape = RoundedCornerShape(5.dp),
+        border = BorderStroke(1.dp, fg.copy(alpha = 0.45f)),
+        modifier = Modifier.testTag("badge_${badge.name.lowercase()}")
+    ) {
+        Text(
+            text = badge.displayText,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+            color = fg,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+        )
+    }
+}
+
+@Composable
+private fun StepActionButton(
     label: String,
     icon: ImageVector,
     accent: Color,
-    highlighted: Boolean,
+    enabled: Boolean,
     testTag: String,
+    filled: Boolean = false,
     isBusy: Boolean = false,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    Surface(
+    Button(
         onClick = onClick,
+        enabled = enabled,
         shape = RoundedCornerShape(8.dp),
-        color = if (highlighted) accent.copy(alpha = 0.18f) else ObsidianSurfaceElevated,
-        border = BorderStroke(
-            width = 1.dp,
-            color = if (highlighted) accent else accent.copy(alpha = 0.45f)
+        colors = ButtonDefaults.buttonColors(
+            containerColor = if (filled) accent else accent.copy(alpha = 0.18f),
+            contentColor = if (filled) ObsidianBg else MaterialTheme.colorScheme.onSurface,
+            disabledContainerColor = ObsidianSurfaceElevated,
+            disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
         ),
-        modifier = Modifier
-            .heightIn(min = 40.dp)
+        border = BorderStroke(
+            1.dp,
+            if (enabled) accent.copy(alpha = if (filled) 1f else 0.65f) else ObsidianBorder
+        ),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
             .testTag(testTag)
     ) {
-        Row(
+        if (isBusy) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(16.dp),
+                strokeWidth = 2.dp,
+                color = if (filled) ObsidianBg else accent
+            )
+        } else {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = when {
+                    !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
+                    filled -> ObsidianBg
+                    else -> accent
+                },
+                modifier = Modifier.size(18.dp)
+            )
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun LivePlayerCoordsReadout(coords: PlayerCoordinates) {
+    Surface(
+        color = SignalEmerald.copy(alpha = 0.12f),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.55f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("live_player_coords_readout")
+    ) {
+        Column(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
-            if (isBusy) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(14.dp),
-                    strokeWidth = 2.dp,
-                    color = accent
-                )
-            } else {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
                 Icon(
-                    imageVector = icon,
+                    imageVector = Icons.Default.MyLocation,
                     contentDescription = null,
-                    tint = accent,
-                    modifier = Modifier.size(16.dp)
+                    tint = SignalEmerald,
+                    modifier = Modifier.size(15.dp)
+                )
+                Text(
+                    text = "LIVE PLAYER LOCK",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = SignalEmerald
+                )
+                Text(
+                    text = coords.path,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
                 )
             }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                CoordAxisTile(axis = "X", value = coords.x, modifier = Modifier.weight(1f))
+                CoordAxisTile(axis = "Y", value = coords.y, modifier = Modifier.weight(1f))
+                CoordAxisTile(axis = "Z", value = coords.z, modifier = Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun CoordAxisTile(
+    axis: String,
+    value: Double,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = ObsidianBg,
+        shape = RoundedCornerShape(6.dp),
+        border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.35f)),
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
             Text(
-                text = label,
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 1
+                text = axis,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = SignalEmerald
             )
+            Text(
+                text = fmtCoord(value),
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = JetBrainsMonoFontFamily,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+        }
+    }
+}
+
+@Composable
+private fun CapturedSnippetBox(accent: Color, text: String) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .background(ObsidianBg)
+            .padding(horizontal = 8.dp, vertical = 6.dp)
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.labelSmall,
+            fontFamily = JetBrainsMonoFontFamily,
+            color = accent,
+            lineHeight = 15.sp
+        )
+    }
+}
+
+@Composable
+private fun LiveLogConsoleView(
+    state: DiagnosticsUiState,
+    onSelectFilter: (LogCategory) -> Unit,
+    onCopyPayload: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val filteredLogs = remember(state.logs, state.selectedFilter) {
+        if (state.selectedFilter == LogCategory.ALL) state.logs
+        else state.logs.filter { it.category == state.selectedFilter }
+    }
+
+    val listState = rememberLazyListState()
+    LaunchedEffect(filteredLogs.size) {
+        if (filteredLogs.isNotEmpty()) {
+            listState.animateScrollToItem(filteredLogs.lastIndex)
+        }
+    }
+
+    Column(modifier = modifier) {
+        LogFilterRow(
+            selectedFilter = state.selectedFilter,
+            assetCount = state.interceptedAssets.size,
+            deltaCount = state.isolatedPaths.size,
+            onSelectFilter = onSelectFilter
+        )
+        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
+
+        if (filteredLogs.isEmpty()) {
+            ConsoleEmptyState(
+                hasAnyLogs = state.logs.isNotEmpty(),
+                selectedFilter = state.selectedFilter,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+            )
+        } else {
+            LazyColumn(
+                state = listState,
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .background(ObsidianBg)
+                    .testTag("telemetry_log_list"),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                items(filteredLogs, key = { it.id }) { entry ->
+                    TelemetryLogRow(
+                        entry = entry,
+                        onCopyPayload = onCopyPayload
+                    )
+                }
+            }
         }
     }
 }
@@ -495,9 +857,9 @@ private fun ManualJsExecutionDrawer(
 ) {
     val quickProbes = remember {
         listOf(
-            "Shallow paths" to "window.__wvDiagState ? window.__wvDiagState.shallowPaths : []",
-            "Isolated" to "window.__wvDiagState ? window.__wvDiagState.isolatedPaths : []",
-            "Canvas count" to "document.querySelectorAll('canvas').length",
+            "Player path" to "window.__wvDiagState ? window.__wvDiagState.discoveredPlayerPath : null",
+            "Entity array" to "window.__wvDiagState ? window.__wvDiagState.discoveredEntityArrayPath : null",
+            "Custom globals" to "window.__wvDiagState ? window.__wvDiagState.customGlobals : []",
             "Viewport" to "({w: innerWidth, h: innerHeight, dpr: devicePixelRatio})"
         )
     }
@@ -805,7 +1167,7 @@ private fun ConsoleEmptyState(
             )
             Text(
                 text = if (hasAnyLogs) {
-                    "Switch back to All or trigger the corresponding diagnostic step above."
+                    "Switch back to All or run the corresponding Wizard step."
                 } else {
                     stringResource(R.string.console_empty_subtitle)
                 },
@@ -835,9 +1197,9 @@ private fun AsyncScanStatusPill(
         AsyncScanStatus.ERROR -> stringResource(R.string.scan_status_error)
     }
     val displayText = if (detail.isNotBlank() && status != AsyncScanStatus.IDLE) {
-        "$statusLabel · $detail"
+        detail
     } else {
-        "Scan: $statusLabel"
+        statusLabel
     }
 
     Surface(
@@ -847,7 +1209,7 @@ private fun AsyncScanStatusPill(
         modifier = Modifier.testTag("async_scan_status_pill")
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(5.dp)
         ) {
@@ -877,22 +1239,7 @@ private fun AsyncScanStatusPill(
     }
 }
 
-@Composable
-private fun MetricBadge(text: String, tint: Color) {
-    Surface(
-        color = tint.copy(alpha = 0.16f),
-        shape = RoundedCornerShape(4.dp),
-        border = BorderStroke(1.dp, tint.copy(alpha = 0.4f))
-    ) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.labelSmall,
-            color = tint,
-            fontSize = 9.sp,
-            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-        )
-    }
-}
+private fun fmtCoord(value: Double): String = String.format(Locale.US, "%.2f", value)
 
 private fun categoryAccentColor(category: LogCategory): Color = when (category) {
     LogCategory.ALL -> ElectricCyan

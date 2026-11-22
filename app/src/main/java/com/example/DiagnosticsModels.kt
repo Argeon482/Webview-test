@@ -21,6 +21,17 @@ enum class AsyncScanStatus(val label: String) {
     }
 }
 
+enum class WizardStepBadge(val displayText: String) {
+    PENDING("[PENDING]"),
+    READY("[READY]"),
+    CAPTURED("[CAPTURED ✓]")
+}
+
+enum class ConsoleTab {
+    WIZARD,
+    LOGS
+}
+
 enum class LogCategory(val tag: String, val label: String) {
     ALL("ALL", "All"),
     SCOPE("SCOPE", "Scope"),
@@ -69,6 +80,30 @@ data class IsolatedCoordinatePath(
 )
 
 @Immutable
+data class PlayerCoordinates(
+    val path: String,
+    val x: Double,
+    val y: Double,
+    val z: Double,
+    val updatedAtMs: Long = System.currentTimeMillis()
+)
+
+@Immutable
+data class DiscoveredEntitySample(
+    val name: String,
+    val id: String,
+    val path: String,
+    val worldX: Double,
+    val worldY: Double,
+    val worldZ: Double,
+    val distanceToPlayer: Double,
+    val screenX: Double,
+    val screenY: Double,
+    val inViewport: Boolean,
+    val sampleKeys: List<String>
+)
+
+@Immutable
 data class ExportReportOutcome(
     val success: Boolean,
     val fileName: String,
@@ -87,11 +122,24 @@ data class DiagnosticsUiState(
     val isDesktopMode: Boolean = true,
     val scanStatus: AsyncScanStatus = AsyncScanStatus.IDLE,
     val scanStatusDetail: String = "",
+    val activeConsoleTab: ConsoleTab = ConsoleTab.WIZARD,
+    // Step 1 state
+    val step1Completed: Boolean = false,
+    val customGlobals: List<String> = emptyList(),
+    val step1DurationMs: Double? = null,
+    // Step 2 state
     val discoveredShallowPaths: List<String> = emptyList(),
     val baselineCaptured: Boolean = false,
     val baselineMetricCount: Int = 0,
     val isolatedPaths: List<IsolatedCoordinatePath> = emptyList(),
+    val discoveredPlayerPath: String? = null,
+    val livePlayerCoords: PlayerCoordinates? = null,
+    // Step 3 state
+    val discoveredEntityArrayPath: String? = null,
+    val entityProjectionMode: String = "",
+    val discoveredEntities: List<DiscoveredEntitySample> = emptyList(),
     val lastEntityCount: Int = 0,
+    // Step 4 / Passive asset & console state
     val interceptedAssets: List<InterceptedAsset> = emptyList(),
     val logs: List<TelemetryLogEntry> = emptyList(),
     val selectedFilter: LogCategory = LogCategory.ALL,
@@ -102,7 +150,35 @@ data class DiagnosticsUiState(
     val lastExport: ExportReportOutcome? = null,
     val estimatedFps: Int? = null,
     val canvasCount: Int = 0
-)
+) {
+    val step1Badge: WizardStepBadge
+        get() = if (step1Completed && (customGlobals.isNotEmpty() || canvasCount > 0)) {
+            WizardStepBadge.CAPTURED
+        } else {
+            WizardStepBadge.READY
+        }
+
+    val step2Badge: WizardStepBadge
+        get() = when {
+            !discoveredPlayerPath.isNullOrBlank() && livePlayerCoords != null -> WizardStepBadge.CAPTURED
+            step1Completed || baselineCaptured -> WizardStepBadge.READY
+            else -> WizardStepBadge.PENDING
+        }
+
+    val step3Badge: WizardStepBadge
+        get() = when {
+            !discoveredEntityArrayPath.isNullOrBlank() && discoveredEntities.isNotEmpty() -> WizardStepBadge.CAPTURED
+            !discoveredPlayerPath.isNullOrBlank() -> WizardStepBadge.READY
+            else -> WizardStepBadge.PENDING
+        }
+
+    val step4Badge: WizardStepBadge
+        get() = when {
+            lastExport?.success == true -> WizardStepBadge.CAPTURED
+            step2Badge == WizardStepBadge.CAPTURED && step3Badge == WizardStepBadge.CAPTURED -> WizardStepBadge.READY
+            else -> WizardStepBadge.PENDING
+        }
+}
 
 sealed interface UrlValidationResult {
     data class Valid(val normalizedUrl: String) : UrlValidationResult

@@ -16,17 +16,20 @@ import java.util.concurrent.atomic.AtomicLong
  * - Export writes are gated behind an explicit user-triggered arming flag ([armExport]) so an
  *   arbitrary page cannot write files to device storage unsolicited.
  * - Async scan status updates are validated against a strict allowlist ([AsyncScanStatus]).
+ * - Live player coordinate telemetry validates finite numeric coordinates and throttles updates.
  * - All UI state mutations are marshaled safely onto the Android main thread.
  */
 class TelemetryBridge(
     private val onTelemetryReceived: (category: String, payload: String) -> Unit,
     private val onReportPayloadReceived: (jsonContent: String) -> Unit,
-    private val onScanStatusChanged: (status: AsyncScanStatus, detail: String) -> Unit = { _, _ -> }
+    private val onScanStatusChanged: (status: AsyncScanStatus, detail: String) -> Unit = { _, _ -> },
+    private val onPlayerCoordsUpdated: (path: String, x: Double, y: Double, z: Double) -> Unit = { _, _, _, _ -> }
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exportArmed = AtomicBoolean(false)
     private val lastLogWindowStartMs = AtomicLong(0L)
     private val logsInCurrentWindow = AtomicLong(0L)
+    private val lastCoordUpdateMs = AtomicLong(0L)
 
     /**
      * Arms the bridge to accept the next structured report payload produced by a user-initiated
@@ -63,6 +66,26 @@ class TelemetryBridge(
 
         mainHandler.post {
             onScanStatusChanged(parsedStatus, safeDetail)
+        }
+    }
+
+    @JavascriptInterface
+    fun updatePlayerCoords(path: String, x: Double, y: Double, z: Double) {
+        if (!x.isFinite() || !y.isFinite() || !z.isFinite()) return
+
+        val now = System.currentTimeMillis()
+        val prev = lastCoordUpdateMs.get()
+        if (now - prev < MIN_COORD_INTERVAL_MS) return
+        if (!lastCoordUpdateMs.compareAndSet(prev, now)) return
+
+        val safePath = sanitizePayload(path, MAX_PATH_CHARS)
+            .replace('\n', ' ')
+            .replace('\r', ' ')
+            .trim()
+        if (safePath.isEmpty()) return
+
+        mainHandler.post {
+            onPlayerCoordsUpdated(safePath, x, y, z)
         }
     }
 
@@ -126,9 +149,11 @@ class TelemetryBridge(
         const val BRIDGE_NAME = "TelemetryBridge"
         private const val MAX_CATEGORY_CHARS = 16
         private const val MAX_STATUS_DETAIL_CHARS = 120
+        private const val MAX_PATH_CHARS = 240
         private const val MAX_LOG_PAYLOAD_CHARS = 16_384
         private const val MAX_EXPORT_PAYLOAD_CHARS = 1_500_000
         private const val RATE_LIMIT_WINDOW_MS = 1_000L
         private const val MAX_LOGS_PER_WINDOW = 60L
+        private const val MIN_COORD_INTERVAL_MS = 150L
     }
 }

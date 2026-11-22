@@ -5,23 +5,39 @@
     <string name="action_reload">Reload</string>
     <string name="action_desktop_ua">Desktop UA</string>
     <string name="action_mobile_ua">Mobile UA</string>
-    <string name="step_1_inspect_scope">1. Inspect Global Scope</string>
-    <string name="step_2a_capture_baseline">2A. Capture State Baseline</string>
-    <string name="step_2b_compute_delta">2B. Compute State Delta</string>
-    <string name="step_2_instruction">Shift application focus or trigger movement in the web view, then tap 2B.</string>
-    <string name="step_3_scan_entities">3. Scan Active Entities</string>
-    <string name="step_5_export_report">Export Diagnostic Report</string>
+
+    <!-- Guided 4-Step Wizard Titles, Buttons, and Plain-English Instructions -->
+    <string name="wizard_step_1_title">Step 1 — Find Game Engine</string>
+    <string name="step_1_inspect_scope">1. Scan Custom Globals</string>
+    <string name="wizard_step_1_instruction">Load the web app and log in until your character is visible on screen, then tap \'1. Scan Custom Globals\'. (Runs instantly without freezing).</string>
+
+    <string name="wizard_step_2_title">Step 2 — Lock On to Player Coordinates</string>
+    <string name="step_2a_capture_baseline">2A. Capture Standing Baseline</string>
+    <string name="wizard_step_2a_instruction">Stand completely still in-game and tap \'2A. Capture Standing Baseline\'.</string>
+    <string name="step_2b_compute_delta">2B. Isolate Player Coords</string>
+    <string name="wizard_step_2b_instruction">Walk your character 5–10 steps in any direction, stop, and tap \'2B. Isolate Player Coords\'.</string>
+
+    <string name="wizard_step_3_title">Step 3 — Find Nearby Monsters / Entities</string>
+    <string name="step_3_scan_entities">3. Scan Nearby Entities</string>
+    <string name="wizard_step_3_instruction">Make sure 2+ monsters or entities are visible on your screen, then tap \'3. Scan Nearby Entities\' (requires Step 2B completed).</string>
+
+    <string name="wizard_step_4_title">Step 4 — Export Handoff File</string>
+    <string name="step_4_export_report">4. Export Report (.json)</string>
+    <string name="wizard_step_4_instruction">Once Steps 2B and 3 show [CAPTURED ✓], tap \'4. Export Report (.json)\' to save the full telemetry map to your Downloads folder.</string>
+
     <string name="action_share_report">Share JSON</string>
     <string name="action_js_drawer">JS Console</string>
     <string name="action_execute_script">Execute Script</string>
     <string name="js_input_hint">Enter JS expression or query path…</string>
+    <string name="tab_wizard">Wizard</string>
+    <string name="tab_logs">Logs</string>
     <string name="console_title">TELEMETRY CONSOLE</string>
     <string name="scan_status_idle">Idle</string>
     <string name="scan_status_running">Scanning…</string>
     <string name="scan_status_completed">Completed</string>
     <string name="scan_status_error">Error</string>
     <string name="console_empty_title">Diagnostic Engine Armed</string>
-    <string name="console_empty_subtitle">Load any web application URL above, then run Steps 1 → 3 to inspect runtime state, coordinate deltas, canvas projections, and asset streams.</string>
+    <string name="console_empty_subtitle">Follow Steps 1 → 4 in the Wizard tab to inspect custom globals, lock onto player coordinates, scan nearby entities, and export your JSON report.</string>
     <string name="cd_reload_page">Reload current page</string>
     <string name="cd_toggle_desktop_ua">Toggle desktop user agent mode</string>
     <string name="cd_toggle_js_drawer">Toggle manual JavaScript execution drawer</string>

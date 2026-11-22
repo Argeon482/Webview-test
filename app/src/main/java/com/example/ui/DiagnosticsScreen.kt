@@ -119,6 +119,9 @@ fun DiagnosticsScreen(
             },
             onScanStatusChanged = { status, detail ->
                 viewModel.onScanStatusChanged(status, detail)
+            },
+            onPlayerCoordsUpdated = { path, x, y, z ->
+                viewModel.onPlayerCoordsUpdated(path, x, y, z)
             }
         )
     }
@@ -243,6 +246,7 @@ fun DiagnosticsScreen(
                             )
                         },
                         onShareReport = viewModel::onShareLastReport,
+                        onSelectConsoleTab = viewModel::onSelectConsoleTab,
                         onSelectFilter = viewModel::onSelectFilter,
                         onToggleJsDrawer = { viewModel.onToggleJsDrawer() },
                         onManualJsChanged = viewModel::onManualJsInputChanged,
@@ -292,6 +296,7 @@ fun DiagnosticsScreen(
                             )
                         },
                         onShareReport = viewModel::onShareLastReport,
+                        onSelectConsoleTab = viewModel::onSelectConsoleTab,
                         onSelectFilter = viewModel::onSelectFilter,
                         onToggleJsDrawer = { viewModel.onToggleJsDrawer() },
                         onManualJsChanged = viewModel::onManualJsInputChanged,

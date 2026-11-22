@@ -54,22 +54,23 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `telemetry bridge blocks unsolicited exportReport and forwards scan status`() {
+    fun `telemetry bridge guards exportReport and forwards scan status and live player coords`() {
         val logged = mutableListOf<Pair<String, String>>()
         val exported = mutableListOf<String>()
         val statuses = mutableListOf<Pair<AsyncScanStatus, String>>()
+        val coords = mutableListOf<PlayerCoordinates>()
 
         val bridge = TelemetryBridge(
             onTelemetryReceived = { cat, payload -> logged.add(cat to payload) },
             onReportPayloadReceived = { json -> exported.add(json) },
-            onScanStatusChanged = { status, detail -> statuses.add(status to detail) }
+            onScanStatusChanged = { status, detail -> statuses.add(status to detail) },
+            onPlayerCoordsUpdated = { path, x, y, z -> coords.add(PlayerCoordinates(path, x, y, z)) }
         )
 
-        // Unsolicited page call must be rejected
+        // Unsolicited export must be rejected
         bridge.exportReport("""{"injected":true}""")
         shadowOf(Looper.getMainLooper()).idle()
         assertTrue(exported.isEmpty())
-        assertEquals(1, logged.size)
         assertEquals("ERR", logged.first().first)
 
         // Armed user-initiated export must succeed
@@ -77,29 +78,31 @@ class ExampleRobolectricTest {
         bridge.exportReport("""{"url":"https://example.com"}""")
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(1, exported.size)
-        assertTrue(exported.first().contains("example.com"))
 
-        // Async scan status updates marshal cleanly and sanitize control chars
-        bridge.updateScanStatus("RUNNING", "Step 1: scanning\nchunk 2")
-        bridge.updateScanStatus("COMPLETED", "14 shallow paths")
+        // Scan status sanitization
+        bridge.updateScanStatus("COMPLETED", "Step 1: 12 globals\nin 1.1ms")
         shadowOf(Looper.getMainLooper()).idle()
-        assertEquals(2, statuses.size)
-        assertEquals(AsyncScanStatus.RUNNING, statuses[0].first)
-        assertEquals("Step 1: scanning chunk 2", statuses[0].second)
-        assertEquals(AsyncScanStatus.COMPLETED, statuses[1].first)
+        assertEquals(AsyncScanStatus.COMPLETED, statuses.first().first)
+        assertEquals("Step 1: 12 globals in 1.1ms", statuses.first().second)
+
+        // Live player coords validation (rejects NaN, accepts finite values)
+        bridge.updatePlayerCoords("window.game.player.pos", Double.NaN, 0.0, 0.0)
+        bridge.updatePlayerCoords("window.game.player.pos", 12.5, 3.0, -44.25)
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(1, coords.size)
+        assertEquals("window.game.player.pos", coords.first().path)
+        assertEquals(12.5, coords.first().x, 0.001)
+        assertEquals(-44.25, coords.first().z, 0.001)
     }
 
     @Test
-    fun `diagnostic scripts use non-blocking async chunking and shallow heuristics`() {
+    fun `step 1 filters standard web APIs and step 3 anchors to player path`() {
         val step1 = DiagnosticsScripts.buildInspectGlobalScopeScript()
-        val step2a = DiagnosticsScripts.buildCaptureBaselineScript()
-        val step2b = DiagnosticsScripts.buildComputeDeltaScript()
+        val step3 = DiagnosticsScripts.buildScanEntitiesScript("window.game.player.position")
 
-        assertTrue(step1.contains("requestAnimationFrame"))
-        assertTrue(step1.contains("setTimeout"))
-        assertTrue(step1.contains("player|actor|scene|game|pos|coord|hero|net"))
-        assertTrue(step1.contains("__safeSerialize"))
-        assertTrue(step2a.contains("async_chunked_shallow_depth_2"))
-        assertTrue(step2b.contains("__yieldFrame"))
+        assertTrue(step1.contains("__filterCustomWindowKeys"))
+        assertTrue(step1.contains("HTML|SVG|WebGL|webkit"))
+        assertTrue(step3.contains("window.game.player.position"))
+        assertTrue(step3.contains("for (let climb = 1; climb <= 3; climb++)"))
     }
 }

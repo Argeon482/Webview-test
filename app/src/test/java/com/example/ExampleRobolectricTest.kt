@@ -257,4 +257,46 @@ class ExampleRobolectricTest {
         assertFalse(safeName.contains("/"))
         assertFalse(safeName.contains("\\"))
     }
+
+    @Test
+    fun `step 1 async yielding batches targeted game roots and manual path inspector stage immediately`() {
+        val step1 = DiagnosticsScripts.buildInspectGlobalScopeScript()
+        val queryScript = DiagnosticsScripts.buildQueryPropertyPathScript("game.player")
+
+        // Verify true async yielding loop (15ms Promise yield + rAF) and targeted engine roots
+        assertTrue(step1.contains("(async function()"))
+        assertTrue(step1.contains("const BATCH_YIELD_MS = 15;"))
+        assertTrue(step1.contains("await __yieldBatchAsync(BATCH_YIELD_MS)"))
+        assertTrue(step1.contains("GAME_NAMESPACE_DETECTED"))
+        assertTrue(step1.contains("'Phaser'"))
+        assertTrue(step1.contains("'PIXI'"))
+        assertTrue(step1.contains("'BABYLON'"))
+        assertTrue(step1.contains("'Module'"))
+        assertTrue(step1.contains("ArrayBuffer.isView(val)"))
+
+        // Verify manual property inspector script
+        assertTrue(queryScript.contains("MANUAL_PATH_QUERY"))
+        assertTrue(queryScript.contains("game.player"))
+
+        // Verify ViewModel stages auto-detected game roots and pins manual path queries
+        val vm = DiagnosticsViewModel()
+        vm.onTelemetryFromBridge(
+            "SCOPE",
+            """{"stage":"GAME_NAMESPACE_DETECTED","detectedNamespaces":["window.game","window.Module"],"detectedEntries":[{"key":"game","path":"window.game","constructor":"GameEngine","keyCount":14,"previewKeys":["player","scene"]},{"key":"Module","path":"window.Module","constructor":"Object","keyCount":42,"previewKeys":["HEAPU8","asm"]}]}"""
+        )
+        assertTrue(vm.uiState.value.detectedGameNamespaces.contains("window.game"))
+        assertTrue(vm.uiState.value.detectedGameNamespaces.contains("window.Module"))
+        assertTrue(vm.uiState.value.stagingBuffer.any { it.path == "window.game" && it.sourceStep == "Auto-Root" })
+
+        vm.onTelemetryFromBridge(
+            "SCOPE",
+            """{"stage":"MANUAL_PATH_QUERY","found":true,"requestedPath":"game.player","normalizedPath":"window.game.player","rootKey":"game","type":"object","constructor":"PlayerEntity","keyCount":9,"detail":"PlayerEntity Vec3(12.00, 1.50, -8.25)","childEntries":[{"path":"window.game.player.position","detail":"Vector3 (3 keys)"}]}"""
+        )
+        val stagedPlayer = vm.uiState.value.stagingBuffer.firstOrNull { it.path == "window.game.player" }
+        assertTrue(stagedPlayer != null)
+        assertTrue(stagedPlayer!!.isPinned)
+        assertEquals("Manual Query", stagedPlayer.sourceStep)
+        assertTrue(vm.uiState.value.stagingBuffer.any { it.path == "window.game.player.position" })
+        assertTrue(vm.uiState.value.lastManualQuerySummary.contains("window.game.player"))
+    }
 }

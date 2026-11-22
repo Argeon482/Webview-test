@@ -40,6 +40,7 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Radar
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Timeline
@@ -97,6 +98,8 @@ fun TelemetryConsolePanel(
     onRunStep1: () -> Unit,
     onPauseStep1: () -> Unit,
     onResumeStep1: () -> Unit,
+    onManualPathInputChanged: (String) -> Unit,
+    onQueryManualPath: (String?) -> Unit,
     onRunStep2A: () -> Unit,
     onRunStep2B: () -> Unit,
     onRunStep3: () -> Unit,
@@ -161,6 +164,8 @@ fun TelemetryConsolePanel(
                         onRunStep1 = onRunStep1,
                         onPauseStep1 = onPauseStep1,
                         onResumeStep1 = onResumeStep1,
+                        onManualPathInputChanged = onManualPathInputChanged,
+                        onQueryManualPath = onQueryManualPath,
                         onRunStep2A = onRunStep2A,
                         onRunStep2B = onRunStep2B,
                         onRunStep3 = onRunStep3,
@@ -458,6 +463,8 @@ private fun GuidedFourStepWizard(
     onRunStep1: () -> Unit,
     onPauseStep1: () -> Unit,
     onResumeStep1: () -> Unit,
+    onManualPathInputChanged: (String) -> Unit,
+    onQueryManualPath: (String?) -> Unit,
     onRunStep2A: () -> Unit,
     onRunStep2B: () -> Unit,
     onRunStep3: () -> Unit,
@@ -477,7 +484,7 @@ private fun GuidedFourStepWizard(
                 .padding(horizontal = 10.dp, vertical = 8.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // STEP 1 — Find Game Engine (100-item Batched Chunked Scan)
+            // STEP 1 — Find Game Engine (Non-Blocking Yielding Batches + Auto-Roots + Manual Path Inspector)
             WizardStepCard(
                 title = stringResource(R.string.wizard_step_1_title),
                 badge = state.step1Badge,
@@ -500,17 +507,37 @@ private fun GuidedFourStepWizard(
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
+                if (state.detectedGameNamespaces.isNotEmpty()) {
+                    CapturedSnippetBox(
+                        accent = SignalEmerald,
+                        text = "Auto-detected roots: ${state.detectedGameNamespaces.joinToString(", ")}",
+                        actionLabel = "View in Staging (${state.stagingBuffer.size}) ›",
+                        onActionClick = onOpenStaging
+                    )
+                }
                 Text(
                     text = stringResource(R.string.wizard_step_1_instruction),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+
+                // Step 1 Manual Property Inspector Drawer (for closure-scoped / custom paths)
+                Step1ManualPropertyInspectorBox(
+                    pathInput = state.manualPropertyPathInput,
+                    lastResultSummary = state.lastManualQuerySummary,
+                    onPathInputChanged = onManualPathInputChanged,
+                    onQueryPath = onQueryManualPath,
+                    onOpenStaging = onOpenStaging
+                )
+
                 if (state.step1Completed) {
                     val timing = state.step1DurationMs?.let { String.format(Locale.US, "%.0fms", it) } ?: ""
                     val preview = state.customGlobals.take(6).joinToString(", ")
                     CapturedSnippetBox(
                         accent = ElectricCyan,
-                        text = "Found ${state.customGlobals.size} custom globals ($timing) • ${state.stagingBuffer.size} staged" +
+                        text = "Found ${state.customGlobals.size} custom globals" +
+                            (if (timing.isNotEmpty()) " ($timing)" else "") +
+                            " • ${state.stagingBuffer.size} staged" +
                             if (preview.isNotEmpty()) "\nGlobals: $preview" else "",
                         actionLabel = "Search & Pin in Staging (${state.stagingBuffer.size}) ›",
                         onActionClick = onOpenStaging
@@ -961,6 +988,166 @@ private fun CapturedSnippetBox(
                     .clickable(onClick = onActionClick)
                     .padding(vertical = 2.dp)
             )
+        }
+    }
+}
+
+@Composable
+private fun Step1ManualPropertyInspectorBox(
+    pathInput: String,
+    lastResultSummary: String,
+    onPathInputChanged: (String) -> Unit,
+    onQueryPath: (String?) -> Unit,
+    onOpenStaging: () -> Unit
+) {
+    val quickRoots = remember {
+        listOf("game.player", "window.game", "window.app", "window.Module", "window.PIXI")
+    }
+
+    Surface(
+        color = ObsidianBg,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.35f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("step_1_manual_property_inspector")
+    ) {
+        Column(
+            modifier = Modifier.padding(8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Search,
+                    contentDescription = null,
+                    tint = ElectricCyan,
+                    modifier = Modifier.size(15.dp)
+                )
+                Text(
+                    text = stringResource(R.string.step_1_manual_query_title),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = ElectricCyan
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                OutlinedTextField(
+                    value = pathInput,
+                    onValueChange = onPathInputChanged,
+                    singleLine = true,
+                    placeholder = {
+                        Text(
+                            text = stringResource(R.string.step_1_manual_query_hint),
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    },
+                    textStyle = MaterialTheme.typography.bodySmall.copy(
+                        fontFamily = JetBrainsMonoFontFamily,
+                        color = MaterialTheme.colorScheme.onSurface
+                    ),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { onQueryPath(null) }),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = ElectricCyan,
+                        unfocusedBorderColor = ObsidianBorder,
+                        focusedContainerColor = ObsidianSurface,
+                        unfocusedContainerColor = ObsidianSurface
+                    ),
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("manual_path_query_input")
+                )
+
+                Button(
+                    onClick = { onQueryPath(null) },
+                    enabled = pathInput.isNotBlank(),
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ElectricCyan,
+                        contentColor = ObsidianBg,
+                        disabledContainerColor = ObsidianSurfaceElevated,
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("manual_path_query_button")
+                ) {
+                    Text(
+                        text = stringResource(R.string.action_query_path),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
+            ) {
+                quickRoots.forEach { samplePath ->
+                    Surface(
+                        onClick = { onQueryPath(samplePath) },
+                        shape = RoundedCornerShape(5.dp),
+                        color = ObsidianSurfaceElevated,
+                        border = BorderStroke(1.dp, ObsidianBorder)
+                    ) {
+                        Text(
+                            text = samplePath,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+            }
+
+            if (lastResultSummary.isNotBlank()) {
+                val isFound = lastResultSummary.startsWith("Staged")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = lastResultSummary,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        color = if (isFound) SignalEmerald else AssetAmber,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (isFound) {
+                        Text(
+                            text = "Staging ›",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = ElectricCyan,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .clickable(onClick = onOpenStaging)
+                                .padding(horizontal = 4.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+            }
         }
     }
 }

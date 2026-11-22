@@ -26,6 +26,13 @@ object DiagnosticsScripts {
           scopeBatch: null
         });
 
+        const __TARGETED_ENGINE_ROOTS = [
+          'game', 'app', 'engine', 'Phaser', 'PIXI', 'BABYLON', 'Module',
+          'THREE', 'unityInstance', 'pc', 'cc',
+          'Game', 'App', 'Engine', 'World', 'world', 'Scene', 'scene',
+          'Client', 'client', 'Player', 'player', 'Main', 'main', 'Core', 'core', 'State', 'state'
+        ];
+
         const __KNOWN_ENGINE_GLOBALS = new Set([
           'THREE', 'BABYLON', 'PIXI', 'Phaser', 'pc', 'cc', 'Module', 'unityInstance',
           'Game', 'game', 'App', 'app', 'Engine', 'engine', 'Scene', 'scene',
@@ -195,16 +202,141 @@ object DiagnosticsScripts {
             const guardTimer = setTimeout(function() {
               if (!fired) { fired = true; callback(); }
             }, 32);
-            requestAnimationFrame(function() {
+            try {
+              requestAnimationFrame(function() {
+                if (!fired) {
+                  fired = true;
+                  clearTimeout(guardTimer);
+                  setTimeout(callback, 0);
+                }
+              });
+            } catch (_) {
               if (!fired) {
                 fired = true;
                 clearTimeout(guardTimer);
-                setTimeout(callback, 0);
+                setTimeout(callback, 8);
               }
-            });
+            }
           } else {
             setTimeout(callback, 8);
           }
+        };
+
+        /**
+         * True async batch yield: gives the browser main thread >= 15ms plus a render frame
+         * boundary (guarded by a 24ms timeout fallback) so frames and network packets never stall.
+         */
+        const __yieldBatchAsync = function(delayMs) {
+          const waitMs = (typeof delayMs === 'number' && delayMs >= 0) ? delayMs : 15;
+          return new Promise(function(resolve) {
+            setTimeout(function() {
+              if (typeof requestAnimationFrame === 'function') {
+                let settled = false;
+                const guard = setTimeout(function() {
+                  if (!settled) { settled = true; resolve(); }
+                }, 24);
+                try {
+                  requestAnimationFrame(function() {
+                    if (!settled) {
+                      settled = true;
+                      clearTimeout(guard);
+                      resolve();
+                    }
+                  });
+                } catch (_) {
+                  if (!settled) {
+                    settled = true;
+                    clearTimeout(guard);
+                    resolve();
+                  }
+                }
+              } else {
+                resolve();
+              }
+            }, waitMs);
+          });
+        };
+
+        /**
+         * O(1)-safe check for whether an object has at least one own enumerable key without
+         * calling Object.keys() on massive TypedArrays, ArrayBuffers, or huge Arrays.
+         */
+        const __hasAnyOwnKey = function(val) {
+          if (!val || (typeof val !== 'object' && typeof val !== 'function')) return false;
+          try {
+            if (ArrayBuffer.isView(val)) return val.byteLength > 0;
+            if (typeof ArrayBuffer !== 'undefined' && val instanceof ArrayBuffer) return val.byteLength > 0;
+            if (Array.isArray(val)) return val.length > 0;
+            if (val instanceof Map || val instanceof Set) return val.size > 0;
+            for (const pk in val) {
+              if (Object.prototype.hasOwnProperty.call(val, pk)) return true;
+            }
+          } catch (_) {
+            return false;
+          }
+          return false;
+        };
+
+        /**
+         * Bounded, stall-free object metadata inspector. Never enumerates all indices of
+         * TypedArrays (e.g. WASM HEAPU8) or huge Arrays/Maps, capping key inspection at 48 keys.
+         */
+        const __safeInspectObjectSummary = function(k, val, isKnown) {
+          const t = typeof val;
+          let ctor = t;
+          let keyCount = 0;
+          let previewKeys = [];
+          let heuristicBoost = isKnown ? 100 : 0;
+
+          try {
+            if (val && val.constructor && val.constructor.name) {
+              ctor = String(val.constructor.name);
+            }
+          } catch (_) {}
+
+          try {
+            if (ArrayBuffer.isView(val)) {
+              keyCount = typeof val.length === 'number' ? val.length : val.byteLength;
+              previewKeys = ['byteLength:' + val.byteLength];
+            } else if (typeof ArrayBuffer !== 'undefined' && val instanceof ArrayBuffer) {
+              keyCount = val.byteLength;
+              previewKeys = ['byteLength:' + val.byteLength];
+            } else if (val instanceof Map || val instanceof Set) {
+              keyCount = val.size;
+              let idx = 0;
+              for (const mk of val.keys()) {
+                if (idx >= 5) break;
+                previewKeys.push(String(mk).slice(0, 24));
+                idx++;
+              }
+            } else if (Array.isArray(val)) {
+              keyCount = val.length;
+              previewKeys = ['length:' + val.length];
+            } else {
+              let scanned = 0;
+              const MAX_SCAN = 48;
+              for (const pk in val) {
+                if (!Object.prototype.hasOwnProperty.call(val, pk)) continue;
+                scanned++;
+                if (previewKeys.length < 5) previewKeys.push(pk);
+                if (__HEURISTIC_KEY_RE.test(pk)) heuristicBoost += 20;
+                if (scanned >= MAX_SCAN) break;
+              }
+              keyCount = scanned;
+            }
+          } catch (_) {}
+
+          if (__HEURISTIC_KEY_RE.test(k)) heuristicBoost += 50;
+
+          return {
+            key: k,
+            path: 'window.' + k,
+            type: t,
+            constructor: ctor,
+            keyCount: keyCount,
+            previewKeys: previewKeys,
+            score: heuristicBoost + Math.min(keyCount, 30)
+          };
         };
 
         const __isCustomGlobalCandidate = function(k, val) {
@@ -216,11 +348,7 @@ object DiagnosticsScripts {
           if (t === 'function') {
             if (__isNativeFunction(val)) return false;
             if (__KNOWN_ENGINE_GLOBALS.has(k)) return true;
-            try {
-              return Object.keys(val).length > 0;
-            } catch (_) {
-              return false;
-            }
+            return __hasAnyOwnKey(val);
           }
 
           if (t !== 'object') return false;
@@ -229,10 +357,11 @@ object DiagnosticsScripts {
 
           if (__KNOWN_ENGINE_GLOBALS.has(k)) return true;
           if (ArrayBuffer.isView(val)) return true;
+          if (typeof ArrayBuffer !== 'undefined' && val instanceof ArrayBuffer) return val.byteLength > 0;
           if (val instanceof Map || val instanceof Set) return val.size > 0;
 
           try {
-            if (Object.keys(val).length > 0) return true;
+            if (__hasAnyOwnKey(val)) return true;
             const ctor = val.constructor;
             if (typeof ctor === 'function' && ctor !== Object && !__isNativeFunction(ctor)) {
               return true;
@@ -272,8 +401,14 @@ object DiagnosticsScripts {
 
         const __parsePathTokens = function(path) {
           if (!path || typeof path !== 'string') return [];
-          const clean = path.replace(/^window\./, '');
-          return clean.match(/[^.\[\]]+/g) || [];
+          const trimmed = path.trim().replace(/^(window|globalThis|self)\./, '');
+          const rawTokens = trimmed.match(/[^.\[\]'"]+/g) || [];
+          const out = [];
+          for (let i = 0; i < rawTokens.length; i++) {
+            const tok = rawTokens[i].trim();
+            if (tok.length > 0) out.push(tok);
+          }
+          return out;
         };
 
         const __resolvePath = function(path) {
@@ -499,22 +634,36 @@ object DiagnosticsScripts {
     """
 
     /**
-     * Step 1: Non-Blocking Batched Chunked Global Variable Inspection (100 items per batch).
-     * Processes `Object.getOwnPropertyNames(window)` in staggered async batches of 100 items,
-     * streams live batch progress (`Scanning batch X/Y (items A–B)…`), accumulates newly discovered
-     * custom globals into Staging incrementally, and supports live Pause/Resume.
+     * Step 1: Non-Blocking Yielding Batched Global Variable Inspection (100 items per batch)
+     * with Immediate Targeted Game Namespace Auto-Detection.
+     *
+     * 1) Immediately probes common game engine roots (window.game, window.app, window.engine,
+     *    window.Phaser, window.PIXI, window.BABYLON, window.Module, etc.) and injects matches
+     *    straight into the Staging buffer.
+     * 2) Iterates all `Object.getOwnPropertyNames(window)` keys in 100-item batches using a true
+     *    `async` loop with `await new Promise(resolve => setTimeout(resolve, 15))` + rAF yielding,
+     *    per-property try/catch guards, and O(1) TypedArray/object safety so it finishes every
+     *    batch from 1/N to N/N without hanging or halting the game engine.
      */
     fun buildInspectGlobalScopeScript(): String = """
-        (function() {
+        (async function() {
           try {
             $SHARED_RUNTIME
             const BATCH_SIZE = 100;
-            const BATCH_STAGGER_MS = 18;
+            const BATCH_YIELD_MS = 15;
 
             // Cancel any previously running batched scan cleanly
-            if (__state.scopeBatch && __state.scopeBatch.timerId !== null) {
-              clearTimeout(__state.scopeBatch.timerId);
-              __state.scopeBatch.timerId = null;
+            if (__state.scopeBatch) {
+              __state.scopeBatch.active = false;
+              __state.scopeBatch.paused = false;
+              if (__state.scopeBatch.timerId !== null) {
+                clearTimeout(__state.scopeBatch.timerId);
+                __state.scopeBatch.timerId = null;
+              }
+              if (typeof __state.scopeBatch.resumeResolver === 'function') {
+                try { __state.scopeBatch.resumeResolver(); } catch (_) {}
+                __state.scopeBatch.resumeResolver = null;
+              }
             }
 
             const mySeq = ++__state.scanSeq;
@@ -534,90 +683,85 @@ object DiagnosticsScripts {
               totalItems: totalItems,
               startTimeMs: performance.now(),
               customObjects: [],
+              detectedNamespaces: [],
               globalContexts: [],
-              timerId: null
+              timerId: null,
+              resumeResolver: null
             };
             __state.scopeBatch = job;
 
-            const scheduleNextBatch = function() {
-              if (!job.active || job.paused || job.seq !== __state.scanSeq) return;
-              job.timerId = setTimeout(function() {
-                job.timerId = null;
-                __yieldFrame(runOneBatch);
-              }, BATCH_STAGGER_MS);
-            };
+            const seenKeys = new Set();
 
-            const finalizeScan = function() {
-              if (job.seq !== __state.scanSeq) return;
-              job.active = false;
-              job.paused = false;
+            // Phase A: Immediate Targeted Game Namespace Auto-Detection
+            const autoRootsFound = [];
+            for (let ri = 0; ri < __TARGETED_ENGINE_ROOTS.length; ri++) {
+              const rk = __TARGETED_ENGINE_ROOTS[ri];
+              if (seenKeys.has(rk)) continue;
+              try {
+                if (!(rk in window)) continue;
+                const rv = window[rk];
+                if (rv === undefined || rv === null) continue;
+                const rt = typeof rv;
+                if (rt !== 'object' && rt !== 'function') continue;
+                if (rt === 'object' && __isSpecialHostObject(rv)) continue;
+                if (rt === 'function' && __isNativeFunction(rv)) continue;
 
-              job.customObjects.sort(function(a, b) { return b.score - a.score; });
+                const entry = __safeInspectObjectSummary(rk, rv, true);
+                entry.score += 150;
+                entry.autoDetected = true;
+                seenKeys.add(rk);
+                job.customObjects.push(entry);
+                job.detectedNamespaces.push('window.' + rk);
+                autoRootsFound.push(entry);
 
-              const canvases = [];
-              const domCanvases = document.querySelectorAll('canvas');
-              for (let c = 0; c < domCanvases.length && c < 8; c++) {
-                const el = domCanvases[c];
-                const rect = el.getBoundingClientRect();
-                let ctxHint = 'active';
-                try {
-                  if (el.__webgl || el.gl) ctxHint = 'WebGL';
-                  else if (el.width > 0 && el.height > 0 && el.getContext) {
-                    if (el.getContext('webgl2')) ctxHint = 'WebGL2';
-                    else if (el.getContext('webgl')) ctxHint = 'WebGL1';
-                    else if (el.getContext('2d')) ctxHint = 'Canvas2D';
+                // Also stage up to 4 high-signal 1-level children (e.g. window.game.player)
+                if (rt === 'object' && !ArrayBuffer.isView(rv) && !Array.isArray(rv)) {
+                  let childAdded = 0;
+                  for (const ck in rv) {
+                    if (childAdded >= 4) break;
+                    if (!Object.prototype.hasOwnProperty.call(rv, ck)) continue;
+                    if (!__HEURISTIC_KEY_RE.test(ck)) continue;
+                    try {
+                      const cv = rv[ck];
+                      if (cv && typeof cv === 'object' && !__isSpecialHostObject(cv)) {
+                        const childEntry = __safeInspectObjectSummary(rk + '.' + ck, cv, true);
+                        childEntry.path = 'window.' + rk + '.' + ck;
+                        childEntry.autoDetected = true;
+                        autoRootsFound.push(childEntry);
+                        childAdded++;
+                      }
+                    } catch (_) {}
                   }
-                } catch (_) {}
-                canvases.push({
-                  index: c,
-                  id: el.id || null,
-                  width: el.width,
-                  height: el.height,
-                  cssWidth: Math.round(rect.width),
-                  cssHeight: Math.round(rect.height),
-                  context: ctxHint
-                });
-              }
-
-              const durationMs = Number((performance.now() - job.startTimeMs).toFixed(2));
-              __state.customGlobals = job.customObjects.map(function(o) { return o.key; });
-              __state.shallowPaths = job.customObjects.map(function(o) { return o.path; });
-
-              __setBatchProgress(
-                job.totalBatches,
-                job.totalBatches,
-                Math.max(1, totalItems - BATCH_SIZE + 1),
-                totalItems,
-                totalItems,
-                job.customObjects.length,
-                false,
-                false
-              );
-              __setStatus('COMPLETED', 'Step 1: ' + job.customObjects.length + ' custom globals (' + job.totalBatches + ' batches)');
-
-              __emit('SCOPE', {
-                stage: 'GLOBAL_SCOPE_INSPECTED',
-                durationMs: durationMs,
-                batchesExecuted: job.totalBatches,
-                batchSize: BATCH_SIZE,
-                totalWindowKeysFiltered: totalItems,
-                customGlobalCount: job.customObjects.length,
-                customGlobals: job.customObjects.slice(0, 60),
-                canvasCount: domCanvases.length,
-                canvases: canvases,
-                globalContexts: job.globalContexts,
-                viewport: {
-                  width: window.innerWidth,
-                  height: window.innerHeight,
-                  dpr: window.devicePixelRatio || 1
                 }
+              } catch (_) {}
+            }
+
+            if (autoRootsFound.length > 0) {
+              __emit('SCOPE', {
+                stage: 'GAME_NAMESPACE_DETECTED',
+                detectedNamespaces: job.detectedNamespaces,
+                detectedEntries: autoRootsFound
               });
-            };
+            }
 
-            const runOneBatch = function() {
-              if (!job.active || job.paused || job.seq !== __state.scanSeq) return;
+            // Phase B: True Async Non-Blocking Yielding Batches (100 items / batch)
+            __setStatus('RUNNING', 'Scanning batch 1/' + totalBatches + ' (items 1–' + Math.min(BATCH_SIZE, totalItems) + ')…');
+            __setBatchProgress(1, totalBatches, totalItems > 0 ? 1 : 0, Math.min(BATCH_SIZE, totalItems), totalItems, job.customObjects.length, true, false);
 
-              const startIdx = job.cursor;
+            let skippedErrors = 0;
+
+            for (let startIdx = 0; startIdx < totalItems; startIdx += BATCH_SIZE) {
+              if (!job.active || job.seq !== __state.scanSeq) return;
+
+              // Suspend cleanly if user tapped Pause
+              while (job.paused && job.active && job.seq === __state.scanSeq) {
+                await new Promise(function(resolve) {
+                  job.resumeResolver = resolve;
+                });
+                job.resumeResolver = null;
+              }
+              if (!job.active || job.seq !== __state.scanSeq) return;
+
               const endIdx = Math.min(startIdx + BATCH_SIZE, totalItems);
               job.batchIndex++;
               const itemStart = totalItems > 0 ? (startIdx + 1) : 0;
@@ -639,66 +783,41 @@ object DiagnosticsScripts {
 
               const batchFound = [];
               for (let i = startIdx; i < endIdx; i++) {
-                const k = job.rawKeys[i];
-                if (/^\d+$/.test(k)) continue;
-                const isKnown = __KNOWN_ENGINE_GLOBALS.has(k);
-                if (!isKnown) {
-                  if (__BUILTIN_BLACKLIST_RE.test(k)) continue;
-                  if (__STANDARD_EXACT.has(k)) continue;
-                  if (__WEB_API_PREFIX_RE.test(k)) continue;
-                  if (__WEB_API_SUFFIX_RE.test(k)) continue;
-                }
-
-                let val;
-                try { val = window[k]; } catch (_) { continue; }
-                if (val === undefined || val === null) continue;
-                const t = typeof val;
-                if (t === 'object' && __isSpecialHostObject(val)) {
-                  const desc = __describeSkippedObject(val);
-                  if (desc.startsWith('[Context:')) {
-                    job.globalContexts.push({ source: 'window.' + k, kind: desc });
-                  }
-                  continue;
-                }
-                if (!__isCustomGlobalCandidate(k, val)) continue;
-
-                let ctor = t;
-                let keyCount = 0;
-                let previewKeys = [];
-                let heuristicBoost = isKnown ? 100 : 0;
-                try { ctor = val.constructor && val.constructor.name ? val.constructor.name : t; } catch (_) {}
                 try {
-                  if (val instanceof Map || val instanceof Set) {
-                    keyCount = val.size;
-                  } else {
-                    const ownKeys = Object.keys(val);
-                    keyCount = ownKeys.length;
-                    previewKeys = ownKeys.slice(0, 5);
-                    for (let pk = 0; pk < ownKeys.length && pk < 32; pk++) {
-                      if (__HEURISTIC_KEY_RE.test(ownKeys[pk])) {
-                        heuristicBoost += 20;
-                      }
-                    }
+                  const k = job.rawKeys[i];
+                  if (!k || seenKeys.has(k) || /^\d+$/.test(k)) continue;
+                  const isKnown = __KNOWN_ENGINE_GLOBALS.has(k);
+                  if (!isKnown) {
+                    if (__BUILTIN_BLACKLIST_RE.test(k)) continue;
+                    if (__STANDARD_EXACT.has(k)) continue;
+                    if (__WEB_API_PREFIX_RE.test(k)) continue;
+                    if (__WEB_API_SUFFIX_RE.test(k)) continue;
                   }
-                } catch (_) {}
-                if (__HEURISTIC_KEY_RE.test(k)) heuristicBoost += 50;
 
-                const entry = {
-                  key: k,
-                  path: 'window.' + k,
-                  type: t,
-                  constructor: ctor,
-                  keyCount: keyCount,
-                  previewKeys: previewKeys,
-                  score: heuristicBoost + Math.min(keyCount, 30)
-                };
-                job.customObjects.push(entry);
-                batchFound.push(entry);
+                  let val;
+                  try { val = window[k]; } catch (_) { skippedErrors++; continue; }
+                  if (val === undefined || val === null) continue;
+                  const t = typeof val;
+                  if (t === 'object' && __isSpecialHostObject(val)) {
+                    const desc = __describeSkippedObject(val);
+                    if (desc.indexOf('[Context:') === 0) {
+                      job.globalContexts.push({ source: 'window.' + k, kind: desc });
+                    }
+                    continue;
+                  }
+                  if (!__isCustomGlobalCandidate(k, val)) continue;
+
+                  const entry = __safeInspectObjectSummary(k, val, isKnown);
+                  seenKeys.add(k);
+                  job.customObjects.push(entry);
+                  batchFound.push(entry);
+                } catch (_) {
+                  skippedErrors++;
+                }
               }
 
               job.cursor = endIdx;
 
-              // Stream newly found custom globals directly into the Staging tab as batches finish
               if (batchFound.length > 0) {
                 __emit('SCOPE', {
                   stage: 'GLOBAL_SCOPE_BATCH',
@@ -723,19 +842,84 @@ object DiagnosticsScripts {
                 false
               );
 
+              // True async yield between batches (>=15ms + rAF) so the game engine never stalls
               if (job.cursor < totalItems) {
-                scheduleNextBatch();
-              } else {
-                finalizeScan();
+                await __yieldBatchAsync(BATCH_YIELD_MS);
               }
-            };
+            }
 
-            job.resumeRunner = scheduleNextBatch;
-            __setStatus('RUNNING', 'Scanning batch 1/' + totalBatches + ' (items 1–' + Math.min(BATCH_SIZE, totalItems) + ')…');
-            __setBatchProgress(1, totalBatches, totalItems > 0 ? 1 : 0, Math.min(BATCH_SIZE, totalItems), totalItems, 0, true, false);
-            __yieldFrame(runOneBatch);
+            if (!job.active || job.seq !== __state.scanSeq) return;
+
+            // Phase C: Safe Finalization (never calls getContext('2d') on active WebGL canvases)
+            job.active = false;
+            job.paused = false;
+            job.customObjects.sort(function(a, b) { return b.score - a.score; });
+
+            const canvases = [];
+            let domCanvasCount = 0;
+            try {
+              const domCanvases = document.querySelectorAll('canvas');
+              domCanvasCount = domCanvases.length;
+              for (let c = 0; c < domCanvases.length && c < 8; c++) {
+                try {
+                  const el = domCanvases[c];
+                  const rect = el.getBoundingClientRect();
+                  const ctxHint = (el.__webgl || el.gl) ? 'WebGL' : 'active';
+                  canvases.push({
+                    index: c,
+                    id: el.id || null,
+                    width: el.width,
+                    height: el.height,
+                    cssWidth: Math.round(rect.width),
+                    cssHeight: Math.round(rect.height),
+                    context: ctxHint
+                  });
+                } catch (_) {}
+              }
+            } catch (_) {}
+
+            const durationMs = Number((performance.now() - job.startTimeMs).toFixed(2));
+            __state.customGlobals = job.customObjects.map(function(o) { return o.key; });
+            __state.shallowPaths = job.customObjects.map(function(o) { return o.path; });
+
+            __setBatchProgress(
+              job.totalBatches,
+              job.totalBatches,
+              Math.max(1, totalItems - BATCH_SIZE + 1),
+              totalItems,
+              totalItems,
+              job.customObjects.length,
+              false,
+              false
+            );
+            __setStatus('COMPLETED', 'Step 1: ' + job.customObjects.length + ' custom globals (' + job.totalBatches + '/' + job.totalBatches + ' batches)');
+
+            __emit('SCOPE', {
+              stage: 'GLOBAL_SCOPE_INSPECTED',
+              durationMs: durationMs,
+              batchesExecuted: job.totalBatches,
+              batchSize: BATCH_SIZE,
+              yieldDelayMs: BATCH_YIELD_MS,
+              totalWindowKeysFiltered: totalItems,
+              skippedProtectedKeys: skippedErrors,
+              detectedNamespaces: job.detectedNamespaces,
+              customGlobalCount: job.customObjects.length,
+              customGlobals: job.customObjects.slice(0, 80),
+              canvasCount: domCanvasCount,
+              canvases: canvases,
+              globalContexts: job.globalContexts,
+              viewport: {
+                width: window.innerWidth,
+                height: window.innerHeight,
+                dpr: window.devicePixelRatio || 1
+              }
+            });
           } catch (err) {
             try {
+              if (window.__wvDiagState && window.__wvDiagState.scopeBatch) {
+                window.__wvDiagState.scopeBatch.active = false;
+                window.__wvDiagState.scopeBatch.paused = false;
+              }
               if (window.TelemetryBridge) {
                 window.TelemetryBridge.updateScanStatus('ERROR', 'Step 1 error');
                 window.TelemetryBridge.logTelemetry('ERR', 'Step 1 Scope error: ' + String(err));
@@ -746,8 +930,8 @@ object DiagnosticsScripts {
     """.trimIndent()
 
     /**
-     * Pauses an active Step 1 batched global scan cleanly between batches so the developer can
-     * inspect or search already-staged candidates without losing scan progress.
+     * Pauses an active Step 1 batched global scan cleanly between async batches so the developer
+     * can inspect or search already-staged candidates without losing scan progress.
      */
     fun buildPauseScopeScanScript(): String = """
         (function() {
@@ -769,7 +953,7 @@ object DiagnosticsScripts {
     """.trimIndent()
 
     /**
-     * Resumes a paused Step 1 batched global scan from its saved batch cursor.
+     * Resumes a paused Step 1 batched global scan by releasing its async pause gate.
      */
     fun buildResumeScopeScanScript(): String = """
         (function() {
@@ -783,12 +967,162 @@ object DiagnosticsScripts {
             const itemEnd = Math.min(job.cursor + job.batchSize, job.totalItems);
             __setStatus('RUNNING', 'Scanning batch ' + nextBatch + '/' + job.totalBatches + ' (items ' + itemStart + '–' + itemEnd + ')…');
             __setBatchProgress(nextBatch, job.totalBatches, itemStart, itemEnd, job.totalItems, job.customObjects.length, true, false);
-            if (typeof job.resumeRunner === 'function') {
-              job.resumeRunner();
+            if (typeof job.resumeResolver === 'function') {
+              const wake = job.resumeResolver;
+              job.resumeResolver = null;
+              wake();
             }
           } catch (_) {}
         })();
     """.trimIndent()
+
+    /**
+     * Step 1 Manual Property Inspector: resolves an arbitrary user-entered global/nested path
+     * (e.g. `game.player`, `window.AppInstance`, `Module.HEAPF32`) safely without blocking,
+     * inspects its type/keys/coordinates, and immediately stages it into the Staging buffer.
+     */
+    fun buildQueryPropertyPathScript(rawPath: String): String {
+        val escapedPath = JSONObject.quote(rawPath.trim())
+        return """
+        (function() {
+          try {
+            $SHARED_RUNTIME
+            const rawInput = $escapedPath;
+            const tokens = __parsePathTokens(rawInput);
+            if (tokens.length === 0) {
+              __emit('SCOPE', {
+                stage: 'MANUAL_PATH_QUERY',
+                found: false,
+                requestedPath: rawInput,
+                normalizedPath: rawInput,
+                message: 'Enter a property path such as game.player or window.AppInstance.'
+              });
+              return;
+            }
+
+            const normalizedPath = __buildPathFromTokens(tokens);
+            let cur = window;
+            let failedAt = null;
+            for (let i = 0; i < tokens.length; i++) {
+              if (cur === null || cur === undefined) {
+                failedAt = tokens.slice(0, i).join('.');
+                break;
+              }
+              try {
+                cur = cur[tokens[i]];
+              } catch (accessErr) {
+                __emit('SCOPE', {
+                  stage: 'MANUAL_PATH_QUERY',
+                  found: false,
+                  requestedPath: rawInput,
+                  normalizedPath: normalizedPath,
+                  failedSegment: tokens[i],
+                  message: 'Property access blocked at "' + tokens[i] + '": ' + String(accessErr)
+                });
+                return;
+              }
+              if (cur === undefined) {
+                failedAt = __buildPathFromTokens(tokens.slice(0, i + 1));
+                break;
+              }
+            }
+
+            if (cur === undefined || failedAt !== null) {
+              __setStatus('IDLE', 'Path not found on window');
+              __emit('SCOPE', {
+                stage: 'MANUAL_PATH_QUERY',
+                found: false,
+                requestedPath: rawInput,
+                normalizedPath: normalizedPath,
+                failedSegment: failedAt || normalizedPath,
+                message: 'Undefined at ' + (failedAt || normalizedPath) + ' (may be closure-scoped or not initialized yet).'
+              });
+              return;
+            }
+
+            const t = typeof cur;
+            let detail = t;
+            let ctor = t;
+            let keyCount = 0;
+            let previewKeys = [];
+            let vecSample = null;
+            const childEntries = [];
+
+            if (cur === null) {
+              detail = 'null';
+            } else if (t === 'number' || t === 'string' || t === 'boolean' || t === 'bigint') {
+              detail = t + ' = ' + String(cur).slice(0, 64);
+            } else if (t === 'object' && __isSpecialHostObject(cur)) {
+              detail = __describeSkippedObject(cur);
+            } else {
+              const summary = __safeInspectObjectSummary(tokens[tokens.length - 1], cur, true);
+              ctor = summary.constructor;
+              keyCount = summary.keyCount;
+              previewKeys = summary.previewKeys;
+              vecSample = __extractVec3(cur);
+              if (vecSample) {
+                detail = ctor + ' Vec3(' + vecSample.x.toFixed(2) + ', ' + vecSample.y.toFixed(2) + ', ' + vecSample.z.toFixed(2) + ')';
+              } else {
+                const previewSuffix = previewKeys.length > 0 ? ' • ' + previewKeys.slice(0, 4).join(', ') : '';
+                detail = ctor + ' (' + keyCount + ' keys' + previewSuffix + ')';
+              }
+
+              // Collect up to 6 shallow child hints for fast inspection
+              if (t === 'object' && !ArrayBuffer.isView(cur) && !Array.isArray(cur)) {
+                let added = 0;
+                for (const ck in cur) {
+                  if (added >= 6) break;
+                  if (!Object.prototype.hasOwnProperty.call(cur, ck)) continue;
+                  try {
+                    const cv = cur[ck];
+                    if (cv && typeof cv === 'object' && !__isSpecialHostObject(cv) && __HEURISTIC_KEY_RE.test(ck)) {
+                      const cs = __safeInspectObjectSummary(ck, cv, false);
+                      childEntries.push({
+                        path: normalizedPath + '.' + ck,
+                        detail: cs.constructor + ' (' + cs.keyCount + ' keys)'
+                      });
+                      added++;
+                    }
+                  } catch (_) {}
+                }
+              }
+            }
+
+            // Register root global so Steps 2A/2B include it automatically
+            const rootKey = tokens[0];
+            if (__state.customGlobals.indexOf(rootKey) === -1) {
+              __state.customGlobals.unshift(rootKey);
+            }
+            if (__state.shallowPaths.indexOf(normalizedPath) === -1) {
+              __state.shallowPaths.unshift(normalizedPath);
+            }
+
+            __setStatus('COMPLETED', 'Staged ' + normalizedPath);
+            __emit('SCOPE', {
+              stage: 'MANUAL_PATH_QUERY',
+              found: true,
+              requestedPath: rawInput,
+              normalizedPath: normalizedPath,
+              rootKey: rootKey,
+              type: t,
+              constructor: ctor,
+              keyCount: keyCount,
+              previewKeys: previewKeys,
+              vec3: vecSample,
+              detail: detail,
+              childEntries: childEntries
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.updateScanStatus('ERROR', 'Query Path failed');
+                window.TelemetryBridge.logTelemetry('ERR', 'Manual Path Query error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+        """.trimIndent()
+    }
 
     /**
      * Step 2A: Non-blocking, chunked shallow baseline capture across filtered custom globals.

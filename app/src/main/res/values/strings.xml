@@ -9,7 +9,11 @@
     <!-- Guided Wizard Titles, Buttons, and Plain-English Instructions -->
     <string name="wizard_step_1_title">Step 1 — Find Game Engine</string>
     <string name="step_1_inspect_scope">1. Scan Custom Globals</string>
-    <string name="wizard_step_1_instruction">Load the web app and log in until your character is visible on screen, then tap \'1. Scan Custom Globals\'. Discovered globals accumulate in the Staging tab.</string>
+    <string name="wizard_step_1_instruction">Load the web app and log in until your character is visible on screen, then tap \'1. Scan Custom Globals\'. Auto-detected engine roots and batched custom globals stream live into Staging.</string>
+    <string name="step_1_manual_query_title">Manual Property Inspector</string>
+    <string name="step_1_manual_query_hint">e.g. game.player or window.AppInstance</string>
+    <string name="action_query_path">Query Path</string>
+    <string name="cd_query_path">Inspect property path and stage it</string>
 
     <string name="wizard_step_2_title">Step 2 — Lock On to Live Player Coordinates</string>
     <string name="step_2a_capture_baseline">2A. Capture Standing Baseline</string>

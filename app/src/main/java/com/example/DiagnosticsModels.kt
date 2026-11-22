@@ -191,11 +191,14 @@ data class DiagnosticsUiState(
     val stagingBuffer: List<CandidateStagingItem> = emptyList(),
     val showPinnedOnly: Boolean = false,
     val stagingSearchQuery: String = "",
-    // Step 1 state + Batched Chunked Scanning (100 items / batch)
+    // Step 1 state + Batched Chunked Scanning (100 items / batch) + Manual Path Inspector
     val step1Completed: Boolean = false,
     val customGlobals: List<String> = emptyList(),
+    val detectedGameNamespaces: List<String> = emptyList(),
     val step1DurationMs: Double? = null,
     val scopeBatchProgress: ScopeBatchProgress = ScopeBatchProgress(),
+    val manualPropertyPathInput: String = "",
+    val lastManualQuerySummary: String = "",
     // Step 2 state + Live 200ms Reference Polling
     val baselineCaptured: Boolean = false,
     val baselineMetricCount: Int = 0,

@@ -64,8 +64,10 @@ class DiagnosticsViewModel : ViewModel() {
                         scanStatusDetail = "",
                         step1Completed = false,
                         customGlobals = emptyList(),
+                        detectedGameNamespaces = emptyList(),
                         step1DurationMs = null,
                         scopeBatchProgress = ScopeBatchProgress(),
+                        lastManualQuerySummary = "",
                         baselineCaptured = false,
                         baselineMetricCount = 0,
                         isolatedPaths = emptyList(),
@@ -309,6 +311,29 @@ class DiagnosticsViewModel : ViewModel() {
         }
         appendLog(LogCategory.SCOPE, "Step 1: Resumed batched scan", "Continuing remaining 100-item batches…")
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildResumeScopeScanScript()))
+    }
+
+    // Step 1 Manual Property Inspector (fallback for closure-scoped or known custom paths)
+    fun onManualPathInputChanged(input: String) {
+        _uiState.update { it.copy(manualPropertyPathInput = input) }
+    }
+
+    fun onQueryManualPropertyPath(overridePath: String? = null) {
+        val targetPath = (overridePath ?: _uiState.value.manualPropertyPathInput).trim()
+        if (targetPath.isEmpty()) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Enter a path like game.player or window.AppInstance"))
+            return
+        }
+        if (overridePath != null) {
+            _uiState.update { it.copy(manualPropertyPathInput = targetPath) }
+        }
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Querying path: $targetPath…")
+        appendLog(
+            LogCategory.SCOPE,
+            "Manual Path Query: $targetPath",
+            "Inspecting property path directly on window and staging if resolved"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildQueryPropertyPathScript(targetPath)))
     }
 
     // Step 2A: Capture Standing Baseline
@@ -627,6 +652,111 @@ class DiagnosticsViewModel : ViewModel() {
         val stage = json.optString("stage", "")
 
         return when (stage) {
+            "GAME_NAMESPACE_DETECTED" -> {
+                val nsArray = json.optJSONArray("detectedNamespaces") ?: JSONArray()
+                val detectedNs = extractStringArray(nsArray)
+                val entriesArr = json.optJSONArray("detectedEntries") ?: JSONArray()
+                val rootKeys = mutableListOf<String>()
+                val stagingPairs = mutableListOf<Pair<String, String>>()
+
+                for (i in 0 until entriesArr.length()) {
+                    val obj = entriesArr.optJSONObject(i) ?: continue
+                    val key = obj.optString("key", "").trim()
+                    val path = obj.optString("path", if (key.isNotEmpty()) "window.$key" else "").trim()
+                    if (path.isEmpty()) continue
+                    if (key.isNotEmpty() && !key.contains(".")) {
+                        rootKeys.add(key)
+                    }
+                    val ctor = obj.optString("constructor", obj.optString("type", "Object"))
+                    val keyCount = obj.optInt("keyCount", 0)
+                    val previewList = extractStringArray(obj.optJSONArray("previewKeys")).take(4)
+                    val previewSuffix = if (previewList.isNotEmpty()) " • ${previewList.joinToString(", ")}" else ""
+                    stagingPairs.add(path to "[Auto-Root] $ctor ($keyCount keys$previewSuffix)")
+                }
+
+                _uiState.update { state ->
+                    val currentScan = state.scanCounter.coerceAtLeast(1)
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Auto-Root",
+                        scanNumber = currentScan,
+                        timestamp = nowTs
+                    )
+                    state.copy(
+                        customGlobals = (detectedNs.map { it.removePrefix("window.") } + rootKeys + state.customGlobals).distinct(),
+                        detectedGameNamespaces = (state.detectedGameNamespaces + detectedNs).distinct(),
+                        stagingBuffer = mergedStaging
+                    )
+                }
+                "Auto-detected ${detectedNs.size} game namespace(s): ${detectedNs.joinToString(", ")} • Staged immediately"
+            }
+
+            "MANUAL_PATH_QUERY" -> {
+                val found = json.optBoolean("found", false)
+                val normalizedPath = json.optString("normalizedPath", json.optString("requestedPath", "")).trim()
+                if (!found) {
+                    val msg = json.optString("message", "Property path not found on window.")
+                    _uiState.update {
+                        it.copy(
+                            scanStatus = AsyncScanStatus.IDLE,
+                            scanStatusDetail = "Not found: $normalizedPath",
+                            lastManualQuerySummary = "Not found: $msg"
+                        )
+                    }
+                    _effects.tryEmit(DiagnosticsEffect.ShowToast("Not found: $normalizedPath"))
+                    "Manual Query failed: $msg"
+                } else {
+                    val rootKey = json.optString("rootKey", "").trim()
+                    val detail = json.optString("detail", json.optString("type", "Object"))
+                    val childArr = json.optJSONArray("childEntries") ?: JSONArray()
+                    val childPairs = buildList {
+                        for (i in 0 until childArr.length()) {
+                            val obj = childArr.optJSONObject(i) ?: continue
+                            val cp = obj.optString("path", "").trim()
+                            val cd = obj.optString("detail", "Object")
+                            if (cp.isNotEmpty()) add(cp to cd)
+                        }
+                    }
+
+                    _uiState.update { state ->
+                        val nextScan = state.scanCounter.coerceAtLeast(1)
+                        val withMain = mergeIntoStagingBuffer(
+                            existing = state.stagingBuffer,
+                            incoming = listOf(normalizedPath to detail),
+                            sourceStep = "Manual Query",
+                            scanNumber = nextScan,
+                            timestamp = nowTs,
+                            forcePin = true
+                        )
+                        val withChildren = if (childPairs.isNotEmpty()) {
+                            mergeIntoStagingBuffer(
+                                existing = withMain,
+                                incoming = childPairs,
+                                sourceStep = "Manual Query",
+                                scanNumber = nextScan,
+                                timestamp = nowTs,
+                                forcePin = false
+                            )
+                        } else withMain
+
+                        state.copy(
+                            step1Completed = true,
+                            customGlobals = if (rootKey.isNotEmpty()) {
+                                (listOf(rootKey) + state.customGlobals).distinct()
+                            } else state.customGlobals,
+                            stagingBuffer = withChildren,
+                            lastManualQuerySummary = "Staged & pinned $normalizedPath → $detail",
+                            scanStatus = AsyncScanStatus.COMPLETED,
+                            scanStatusDetail = "Staged $normalizedPath"
+                        )
+                    }
+                    _effects.tryEmit(DiagnosticsEffect.ShowToast("Staged & pinned: $normalizedPath"))
+                    "Manual Query staged $normalizedPath ($detail)" +
+                        if (childPairs.isNotEmpty()) " + ${childPairs.size} child hints" else ""
+                }
+            }
+
             "GLOBAL_SCOPE_BATCH" -> {
                 val batchIndex = json.optInt("batchIndex", 1)
                 val totalBatches = json.optInt("totalBatches", 1)
@@ -716,6 +846,7 @@ class DiagnosticsViewModel : ViewModel() {
                     stagingPairs.add(path to "$ctor ($keyCount keys$previewSuffix)")
                 }
 
+                val detectedNs = extractStringArray(json.optJSONArray("detectedNamespaces"))
                 _uiState.update { state ->
                     val nextScan = state.scanCounter + 1
                     val mergedStaging = mergeIntoStagingBuffer(
@@ -729,6 +860,7 @@ class DiagnosticsViewModel : ViewModel() {
                         scanCounter = nextScan,
                         step1Completed = true,
                         customGlobals = (state.customGlobals + globalKeys).distinct(),
+                        detectedGameNamespaces = (state.detectedGameNamespaces + detectedNs).distinct(),
                         step1DurationMs = durationMs,
                         canvasCount = canvases,
                         stagingBuffer = mergedStaging,
@@ -743,10 +875,10 @@ class DiagnosticsViewModel : ViewModel() {
                             foundCount = globalKeys.size
                         ),
                         scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "Scan #$nextScan: ${globalKeys.size} globals ($batchesExecuted batches)"
+                        scanStatusDetail = "Scan #$nextScan: ${globalKeys.size} globals ($batchesExecuted/$batchesExecuted batches)"
                     )
                 }
-                "Step 1 ($batchesExecuted batches, ${durationMs}ms): Found ${globalKeys.size} custom globals across $totalFiltered keys • Staged"
+                "Step 1 ($batchesExecuted/$batchesExecuted batches, ${durationMs}ms): Found ${globalKeys.size} custom globals across $totalFiltered keys • Staged"
             }
 
             "BASELINE_CAPTURED" -> {
@@ -1200,7 +1332,7 @@ class DiagnosticsViewModel : ViewModel() {
 
     companion object {
         private const val MAX_LOG_ENTRIES = 500
-        private const val MAX_TRACKED_ASSETS = 250
+        private const val MAX_TRACKED_ASSETS = 500
         private const val MAX_STAGING_ITEMS = 250
 
         const val DESKTOP_USER_AGENT =

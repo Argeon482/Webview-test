@@ -240,6 +240,11 @@ fun DiagnosticsScreen(
                         onRunStep1 = viewModel::runStep1InspectScope,
                         onPauseStep1 = viewModel::pauseStep1BatchScan,
                         onResumeStep1 = viewModel::resumeStep1BatchScan,
+                        onManualPathInputChanged = viewModel::onManualPathInputChanged,
+                        onQueryManualPath = { override ->
+                            focusManager.clearFocus()
+                            viewModel.onQueryManualPropertyPath(override)
+                        },
                         onRunStep2A = viewModel::runStep2ACaptureBaseline,
                         onRunStep2B = viewModel::runStep2BComputeDelta,
                         onRunStep3 = viewModel::runStep3ScanEntities,
@@ -302,6 +307,11 @@ fun DiagnosticsScreen(
                         onRunStep1 = viewModel::runStep1InspectScope,
                         onPauseStep1 = viewModel::pauseStep1BatchScan,
                         onResumeStep1 = viewModel::resumeStep1BatchScan,
+                        onManualPathInputChanged = viewModel::onManualPathInputChanged,
+                        onQueryManualPath = { override ->
+                            focusManager.clearFocus()
+                            viewModel.onQueryManualPropertyPath(override)
+                        },
                         onRunStep2A = viewModel::runStep2ACaptureBaseline,
                         onRunStep2B = viewModel::runStep2BComputeDelta,
                         onRunStep3 = viewModel::runStep3ScanEntities,

@@ -299,4 +299,30 @@ class ExampleRobolectricTest {
         assertTrue(vm.uiState.value.stagingBuffer.any { it.path == "window.game.player.position" })
         assertTrue(vm.uiState.value.lastManualQuerySummary.contains("window.game.player"))
     }
+
+    @Test
+    fun `step 2a and 2b explicitly exclude wasm heaps wasmTableMirror and typed arrays with sub-5ms cap`() {
+        val step2a = DiagnosticsScripts.buildCaptureBaselineScript()
+        val step2b = DiagnosticsScripts.buildComputeDeltaScript()
+
+        // Explicit WebAssembly memory keys & wasmTableMirror exclusions
+        listOf(
+            "HEAP8", "HEAPU8", "HEAP16", "HEAPU16", "HEAP32", "HEAPU32",
+            "HEAPF32", "HEAPF64", "HEAP64", "HEAPU64", "wasmTableMirror"
+        ).forEach { wasmKey ->
+            assertTrue("Step 2A must exclude $wasmKey", step2a.contains("'$wasmKey'"))
+            assertTrue("Step 2B must exclude $wasmKey", step2b.contains("'$wasmKey'"))
+        }
+
+        // Strict binary / TypedArray / ArrayBuffer / plain-object filtering and <5ms cap
+        assertTrue(step2a.contains("const MAX_TOTAL_MS = 4.5;"))
+        assertTrue(step2a.contains("const MAX_DEPTH = 2;"))
+        assertTrue(step2a.contains("__isSafeBaselineObject"))
+        assertTrue(step2a.contains("__isExcludedBinaryOrWasmObject"))
+        assertTrue(step2a.contains("ArrayBuffer.isView(val)"))
+        assertTrue(step2a.contains("val instanceof ArrayBuffer"))
+        assertTrue(step2a.contains("WebAssembly.Memory"))
+        assertTrue(step2b.contains("__isExcludedWasmKey(p)"))
+        assertTrue(step2b.contains("__isSafeBaselineObject(parentObj)"))
+    }
 }

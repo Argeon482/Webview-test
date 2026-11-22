@@ -884,7 +884,8 @@ class DiagnosticsViewModel : ViewModel() {
             "BASELINE_CAPTURED" -> {
                 val metrics = json.optInt("metricCount", 0)
                 val roots = json.optInt("rootObjectCount", 0)
-                val chunks = json.optInt("chunksExecuted", 1)
+                val durationMs = json.optDouble("durationMs", -1.0)
+                val skippedBinary = json.optInt("skippedBinaryOrWasm", 0)
                 val containersArr = json.optJSONArray("candidateContainers") ?: JSONArray()
                 val stagingPairs = buildList {
                     for (i in 0 until containersArr.length()) {
@@ -894,6 +895,7 @@ class DiagnosticsViewModel : ViewModel() {
                         if (p.isNotEmpty()) add(p to d)
                     }
                 }
+                val timingLabel = if (durationMs >= 0.0) "${String.format(Locale.US, "%.2f", durationMs)}ms" else "fast"
 
                 _uiState.update { state ->
                     val nextScan = state.scanCounter + 1
@@ -910,10 +912,10 @@ class DiagnosticsViewModel : ViewModel() {
                         baselineMetricCount = metrics,
                         stagingBuffer = mergedStaging,
                         scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "2A Captured ($metrics values)"
+                        scanStatusDetail = "2A Captured ($metrics nums in $timingLabel)"
                     )
                 }
-                "Step 2A (${chunks} chunks): Captured $metrics standing values across $roots custom globals"
+                "Step 2A ($timingLabel): Captured $metrics primitive numbers across $roots globals (skipped $skippedBinary WASM/buffer objects)"
             }
 
             "BASELINE_MISSING" -> {

@@ -72,8 +72,75 @@ object DiagnosticsScripts {
         const __HEURISTIC_KEY_RE = /(player|actor|scene|game|pos|coord|hero|net|camera|cam|entity|entities|world|avatar|char|unit|mob|monster|npc|enemy|enemies|state|transform|vec|loc|vel|rot|manager|engine|stage|renderer|level|map)/i;
         const __TIME_KEY_RE = /(time|timestamp|elapsed|clock|frame|tick|now|date|epoch|ms|fps|ping|latency|delta|dt)/i;
         const __COORD_AXIS_RE = /(\.(x|y|z|w|vx|vy|vz|px|py|pz|lat|lng|lon|left|top|tx|ty|tz)|\[[0-2]\]$)/i;
+        const __WASM_MEMORY_KEYS = new Set([
+          'HEAP8', 'HEAPU8', 'HEAP16', 'HEAPU16', 'HEAP32', 'HEAPU32',
+          'HEAPF32', 'HEAPF64', 'HEAP64', 'HEAPU64',
+          'wasmTableMirror', 'wasmTable', 'wasmMemory', 'wasmExports', 'wasmBinary'
+        ]);
+        const __WASM_MEMORY_KEY_RE = /(^|[.\[])(HEAP(U?8|U?16|U?32|F32|F64|U?64)|wasmTableMirror|wasmTable|wasmMemory|wasmExports|wasmBinary)([.\]]|$)/;
+        const __RENDER_BUFFER_CTOR_RE = /(Array$|Buffer$|DataView$|WebAssembly|Memory$|Table$|WebGL|GPU|Texture$|Shader$|Framebuffer$|Renderbuffer$|ImageData$|ImageBitmap$|Audio|Blob$|File$)/;
         const __CHUNK_BUDGET_MS = 4.0;
         const __LIVE_POLL_INTERVAL_MS = 200;
+
+        /**
+         * Returns true if a property key or path targets WebAssembly heap/table memory structures.
+         */
+        const __isExcludedWasmKey = function(keyOrPath) {
+          if (!keyOrPath || typeof keyOrPath !== 'string') return false;
+          return __WASM_MEMORY_KEYS.has(keyOrPath) || __WASM_MEMORY_KEY_RE.test(keyOrPath);
+        };
+
+        /**
+         * Returns true for TypedArrays, ArrayBuffers, SharedArrayBuffers, DataViews, WebAssembly
+         * Memory/Table/Instance/Module objects, raw byte arrays, and WebGL/rendering buffers.
+         */
+        const __isExcludedBinaryOrWasmObject = function(val) {
+          if (!val || typeof val !== 'object') return false;
+          try {
+            if (ArrayBuffer.isView(val)) return true;
+            if (typeof ArrayBuffer !== 'undefined' && val instanceof ArrayBuffer) return true;
+            if (typeof SharedArrayBuffer !== 'undefined' && val instanceof SharedArrayBuffer) return true;
+            if (typeof WebAssembly !== 'undefined') {
+              if (WebAssembly.Memory && val instanceof WebAssembly.Memory) return true;
+              if (WebAssembly.Table && val instanceof WebAssembly.Table) return true;
+              if (WebAssembly.Instance && val instanceof WebAssembly.Instance) return true;
+              if (WebAssembly.Module && val instanceof WebAssembly.Module) return true;
+            }
+            if (Array.isArray(val)) return true;
+            if (val instanceof Map || val instanceof Set || val instanceof WeakMap || val instanceof WeakSet) return true;
+            if (typeof ImageData !== 'undefined' && val instanceof ImageData) return true;
+            if (typeof ImageBitmap !== 'undefined' && val instanceof ImageBitmap) return true;
+            const ctor = val.constructor;
+            if (ctor && ctor !== Object) {
+              const ctorName = typeof ctor.name === 'string' ? ctor.name : '';
+              if (ctorName && __RENDER_BUFFER_CTOR_RE.test(ctorName)) return true;
+            }
+          } catch (_) {
+            return true;
+          }
+          return false;
+        };
+
+        /**
+         * Strictly permits only plain JS objects and non-native custom game objects for Step 2A/2B
+         * numeric baseline snapshotting (never TypedArrays, ArrayBuffers, raw arrays, DOM, or WASM).
+         */
+        const __isSafeBaselineObject = function(val) {
+          if (!val || typeof val !== 'object') return false;
+          if (__isSpecialHostObject(val)) return false;
+          if (__isExcludedBinaryOrWasmObject(val)) return false;
+          try {
+            const proto = Object.getPrototypeOf(val);
+            if (proto === null || proto === Object.prototype) return true;
+            const ctor = val.constructor;
+            if (typeof ctor === 'function' && ctor !== Object && __isNativeFunction(ctor)) {
+              return false;
+            }
+            return true;
+          } catch (_) {
+            return false;
+          }
+        };
 
         const __isNativeFunction = function(v) {
           if (typeof v !== 'function') return false;
@@ -1125,18 +1192,23 @@ object DiagnosticsScripts {
     }
 
     /**
-     * Step 2A: Non-blocking, chunked shallow baseline capture across filtered custom globals.
+     * Step 2A: Ultra-fast (<5ms), freeze-proof shallow baseline capture.
+     *
+     * - Explicitly excludes WebAssembly heap/table structures (`HEAP8`, `HEAPU8`, `HEAP16`,
+     *   `HEAPU16`, `HEAP32`, `HEAPU32`, `HEAPF32`, `HEAPF64`, `HEAP64`, `HEAPU64`,
+     *   `wasmTableMirror`, `wasmTable`, `wasmMemory`) and ALL TypedArrays, ArrayBuffers,
+     *   raw byte arrays, and WebGL/rendering buffers.
+     * - Collects strictly standard JS primitive finite numbers from top-level and 1-level
+     *   nested plain/game objects using bounded `for..in` enumeration (never `Object.keys` on
+     *   large buffers) with a strict <5ms execution cap.
      */
     fun buildCaptureBaselineScript(): String = """
         (function() {
           try {
             $SHARED_RUNTIME
             const mySeq = ++__state.scanSeq;
+            const totalStartMs = performance.now();
             __setStatus('RUNNING', 'Step 2A: Capturing standing baseline…');
-
-            const rootKeys = Array.isArray(__state.customGlobals) && __state.customGlobals.length > 0
-              ? __state.customGlobals.slice(0, 40)
-              : __filterCustomWindowKeys().customKeys.slice(0, 40);
 
             const baseline = Object.create(null);
             const candidateContainers = [];
@@ -1144,21 +1216,50 @@ object DiagnosticsScripts {
             const visited = new WeakSet();
             const queue = [];
 
-            for (let i = 0; i < rootKeys.length; i++) {
+            let skippedExcluded = 0;
+            const MAX_ROOTS = 24;
+            const MAX_DEPTH = 2;
+            const MAX_METRICS = 600;
+            const MAX_OBJECTS = 120;
+            const MAX_KEYS_PER_OBJ = 48;
+            const MAX_TOTAL_MS = 4.5;
+
+            const enqueueRoot = function(path, obj) {
+              if (!path || __isExcludedWasmKey(path)) { skippedExcluded++; return; }
+              if (!__isSafeBaselineObject(obj)) { skippedExcluded++; return; }
+              if (visited.has(obj)) return;
+              queue.push({ obj: obj, path: path, depth: 1 });
+            };
+
+            // 1. Prioritize any manually queried / discovered candidate paths first
+            if (Array.isArray(__state.shallowPaths)) {
+              for (let si = 0; si < __state.shallowPaths.length && queue.length < MAX_ROOTS; si++) {
+                const sp = __state.shallowPaths[si];
+                if (!sp || __isExcludedWasmKey(sp)) { skippedExcluded++; continue; }
+                const sv = __resolvePath(sp);
+                enqueueRoot(sp, sv);
+              }
+            }
+
+            // 2. Add filtered custom global roots (excluding WASM heaps & TypedArrays)
+            const rootKeys = Array.isArray(__state.customGlobals) && __state.customGlobals.length > 0
+              ? __state.customGlobals.slice(0, MAX_ROOTS)
+              : __filterCustomWindowKeys().customKeys.slice(0, MAX_ROOTS);
+
+            for (let i = 0; i < rootKeys.length && queue.length < MAX_ROOTS; i++) {
               const k = rootKeys[i];
+              if (!k || __isExcludedWasmKey(k)) { skippedExcluded++; continue; }
               let v;
               try { v = window[k]; } catch (_) { continue; }
+              if (!__isSafeBaselineObject(v)) { skippedExcluded++; continue; }
               if (__isCustomGlobalCandidate(k, v)) {
-                queue.push({ obj: v, path: 'window.' + k, depth: 1 });
+                enqueueRoot('window.' + k, v);
               }
             }
 
             let metricCount = 0;
             let objectsScanned = 0;
             let chunksExecuted = 0;
-            const MAX_DEPTH = 3;
-            const MAX_METRICS = 2500;
-            const MAX_OBJECTS = 600;
 
             const recordNum = function(path, val) {
               if (metricCount >= MAX_METRICS) return;
@@ -1169,84 +1270,101 @@ object DiagnosticsScripts {
             };
 
             const processChunk = function() {
-              if (mySeq !== __state.scanSeq) return;
-              chunksExecuted++;
-              const sliceStart = performance.now();
+              try {
+                if (mySeq !== __state.scanSeq) return;
+                chunksExecuted++;
+                const sliceStart = performance.now();
 
-              while (queue.length > 0 && metricCount < MAX_METRICS && objectsScanned < MAX_OBJECTS && (performance.now() - sliceStart) < __CHUNK_BUDGET_MS) {
-                const item = queue.shift();
-                const obj = item.obj;
-                if (!obj || typeof obj !== 'object' || __isSpecialHostObject(obj) || visited.has(obj)) continue;
-                visited.add(obj);
-                objectsScanned++;
-
-                if (__extractVec3(obj) && !seenContainers.has(item.path) && candidateContainers.length < 25) {
-                  seenContainers.add(item.path);
-                  const v = __extractVec3(obj);
-                  candidateContainers.push({
-                    path: item.path,
-                    detail: 'Vec3(' + v.x.toFixed(1) + ', ' + v.y.toFixed(1) + ', ' + v.z.toFixed(1) + ')'
-                  });
-                }
-
-                if (__isShortNumericVector(obj)) {
-                  for (let vi = 0; vi < obj.length; vi++) {
-                    recordNum(item.path + '[' + vi + ']', obj[vi]);
+                while (
+                  queue.length > 0 &&
+                  metricCount < MAX_METRICS &&
+                  objectsScanned < MAX_OBJECTS &&
+                  (performance.now() - sliceStart) < MAX_TOTAL_MS &&
+                  (performance.now() - totalStartMs) < MAX_TOTAL_MS
+                ) {
+                  const item = queue.shift();
+                  const obj = item.obj;
+                  if (!__isSafeBaselineObject(obj) || visited.has(obj)) {
+                    skippedExcluded++;
+                    continue;
                   }
-                  continue;
+                  visited.add(obj);
+                  objectsScanned++;
+
+                  // Record Vec3-like plain coordinate container if top-level numeric x/y/z present
+                  try {
+                    if (
+                      typeof obj.x === 'number' && Number.isFinite(obj.x) &&
+                      (typeof obj.y === 'number' && Number.isFinite(obj.y) ||
+                       typeof obj.z === 'number' && Number.isFinite(obj.z)) &&
+                      !seenContainers.has(item.path) && candidateContainers.length < 20
+                    ) {
+                      seenContainers.add(item.path);
+                      const vy = (typeof obj.y === 'number' && Number.isFinite(obj.y)) ? obj.y : 0;
+                      const vz = (typeof obj.z === 'number' && Number.isFinite(obj.z)) ? obj.z : 0;
+                      candidateContainers.push({
+                        path: item.path,
+                        detail: 'Vec3(' + obj.x.toFixed(1) + ', ' + vy.toFixed(1) + ', ' + vz.toFixed(1) + ')'
+                      });
+                    }
+                  } catch (_) {}
+
+                  // Bounded own-property iteration (never allocates Object.keys() on huge objects)
+                  let inspectedKeys = 0;
+                  try {
+                    for (const k in obj) {
+                      if (inspectedKeys >= MAX_KEYS_PER_OBJ || metricCount >= MAX_METRICS) break;
+                      if ((performance.now() - totalStartMs) >= MAX_TOTAL_MS) break;
+                      if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+                      if (k.indexOf('__wvDiag') === 0 || /^\d+$/.test(k)) continue;
+
+                      // Explicit exclusion of WebAssembly heaps & tables by key name
+                      if (__isExcludedWasmKey(k)) {
+                        skippedExcluded++;
+                        continue;
+                      }
+                      inspectedKeys++;
+
+                      let v;
+                      try { v = obj[k]; } catch (_) { continue; }
+                      if (v === null || v === undefined) continue;
+                      const nextPath = item.path + '.' + k;
+
+                      if (typeof v === 'number') {
+                        if (Number.isFinite(v)) {
+                          recordNum(nextPath, v);
+                        }
+                      } else if (typeof v === 'object') {
+                        // Never descend into TypedArrays, ArrayBuffers, raw arrays, WASM memory, or rendering buffers
+                        if (!__isSafeBaselineObject(v)) {
+                          skippedExcluded++;
+                          continue;
+                        }
+                        if (item.depth < MAX_DEPTH && __HEURISTIC_KEY_RE.test(k)) {
+                          queue.push({ obj: v, path: nextPath, depth: item.depth + 1 });
+                        }
+                      }
+                    }
+                  } catch (_) {}
                 }
 
-                if (Array.isArray(obj)) {
-                  const arrLim = Math.min(obj.length, 16);
-                  for (let ai = 0; ai < arrLim && item.depth < MAX_DEPTH; ai++) {
-                    let elem;
-                    try { elem = obj[ai]; } catch (_) { continue; }
-                    if (elem && typeof elem === 'object' && !__isSpecialHostObject(elem)) {
-                      queue.push({ obj: elem, path: item.path + '[' + ai + ']', depth: item.depth + 1 });
-                    }
-                  }
-                  continue;
-                }
-
-                let keys;
-                try { keys = Object.keys(obj); } catch (_) { continue; }
-                const keyLimit = Math.min(keys.length, 56);
-                for (let i = 0; i < keyLimit && metricCount < MAX_METRICS; i++) {
-                  const k = keys[i];
-                  if (k.startsWith('__wvDiag')) continue;
-                  let v;
-                  try { v = obj[k]; } catch (_) { continue; }
-                  const nextPath = item.path + '.' + k;
-
-                  if (typeof v === 'number' && Number.isFinite(v)) {
-                    recordNum(nextPath, v);
-                  } else if (__isShortNumericVector(v)) {
-                    for (let vi = 0; vi < v.length; vi++) {
-                      recordNum(nextPath + '[' + vi + ']', v[vi]);
-                    }
-                  } else if (v && typeof v === 'object' && !__isSpecialHostObject(v) && item.depth < MAX_DEPTH) {
-                    if (__HEURISTIC_KEY_RE.test(k) || item.depth === 1) {
-                      queue.push({ obj: v, path: nextPath, depth: item.depth + 1 });
-                    }
-                  }
-                }
-              }
-
-              if (queue.length > 0 && metricCount < MAX_METRICS && objectsScanned < MAX_OBJECTS) {
-                __setStatus('RUNNING', 'Step 2A: ' + metricCount + ' values…');
-                __yieldFrame(processChunk);
-              } else {
+                const durationMs = Number((performance.now() - totalStartMs).toFixed(2));
                 __state.baseline = baseline;
                 __state.baselineTimeMs = performance.now();
-                __setStatus('COMPLETED', '2A Captured (' + metricCount + ' values)');
+                __setStatus('COMPLETED', '2A Captured (' + metricCount + ' nums in ' + durationMs + 'ms)');
                 __emit('DELTA', {
                   stage: 'BASELINE_CAPTURED',
+                  durationMs: durationMs,
                   chunksExecuted: chunksExecuted,
                   rootObjectCount: rootKeys.length,
                   objectsScanned: objectsScanned,
                   metricCount: metricCount,
+                  skippedBinaryOrWasm: skippedExcluded,
                   candidateContainers: candidateContainers
                 });
+              } catch (chunkErr) {
+                __setStatus('ERROR', 'Step 2A error');
+                __emit('ERR', 'Step 2A Baseline error: ' + String(chunkErr));
               }
             };
 
@@ -1263,9 +1381,10 @@ object DiagnosticsScripts {
     """.trimIndent()
 
     /**
-     * Step 2B: Isolates the moving player coordinate container, stores the direct JS object
-     * reference (`targetObject`) + exact property keys (`xKey`, `yKey`, `zKey`), and launches
-     * a continuous 200 ms `setInterval` live polling loop feeding Kotlin UI state.
+     * Step 2B: Isolates the moving player coordinate container from the standing baseline,
+     * explicitly skipping any WebAssembly heap/table keys, TypedArrays, or ArrayBuffers,
+     * binds the direct JS object reference (`parentObject[propName]` + `refObject`), and
+     * launches continuous 200 ms `setInterval` live coordinate polling.
      */
     fun buildComputeDeltaScript(): String = """
         (function() {
@@ -1287,146 +1406,179 @@ object DiagnosticsScripts {
             const changed = [];
             let cursor = 0;
             let chunksExecuted = 0;
+            let skippedExcluded = 0;
 
             const processChunk = function() {
-              if (mySeq !== __state.scanSeq) return;
-              chunksExecuted++;
-              const sliceStart = performance.now();
+              try {
+                if (mySeq !== __state.scanSeq) return;
+                chunksExecuted++;
+                const sliceStart = performance.now();
 
-              while (cursor < keys.length && (performance.now() - sliceStart) < __CHUNK_BUDGET_MS) {
-                const p = keys[cursor++];
-                const baseVal = baseline[p];
-                const curVal = __resolvePath(p);
-                if (typeof curVal !== 'number' || !Number.isFinite(curVal)) continue;
-
-                const diff = curVal - baseVal;
-                const absDiff = Math.abs(diff);
-                if (absDiff < 0.0001 || absDiff > 10000) continue;
-                if (Math.abs(curVal) > 1e11) continue;
-                if (__TIME_KEY_RE.test(p)) continue;
-
-                const tokens = __parsePathTokens(p);
-                const leaf = tokens.length > 0 ? tokens[tokens.length - 1] : '';
-                const parentPath = tokens.length > 1
-                  ? __buildPathFromTokens(tokens.slice(0, tokens.length - 1))
-                  : p;
-
-                const score =
-                  (__COORD_AXIS_RE.test(p) ? 120 : 0) +
-                  (__HEURISTIC_KEY_RE.test(p) ? 60 : 0) +
-                  (absDiff <= 500 ? 25 : 0);
-
-                changed.push({
-                  path: p,
-                  parentPath: parentPath,
-                  leaf: leaf,
-                  baseline: Number(baseVal.toFixed(4)),
-                  current: Number(curVal.toFixed(4)),
-                  delta: Number(diff.toFixed(4)),
-                  score: score
-                });
-              }
-
-              if (cursor < keys.length) {
-                __setStatus('RUNNING', 'Step 2B: ' + cursor + '/' + keys.length + ' checked…');
-                __yieldFrame(processChunk);
-              } else {
-                const groups = Object.create(null);
-                for (let i = 0; i < changed.length; i++) {
-                  const c = changed[i];
-                  if (!groups[c.parentPath]) {
-                    groups[c.parentPath] = { parentPath: c.parentPath, items: [], score: 0 };
+                while (cursor < keys.length && (performance.now() - sliceStart) < __CHUNK_BUDGET_MS) {
+                  const p = keys[cursor++];
+                  if (__isExcludedWasmKey(p)) {
+                    skippedExcluded++;
+                    continue;
                   }
-                  const g = groups[c.parentPath];
-                  g.items.push(c);
-                  g.score += c.score;
-                }
 
-                const rankedGroups = Object.keys(groups).map(function(gp) {
-                  const g = groups[gp];
-                  const multiAxisBonus = g.items.length >= 2 && g.items.length <= 4 ? 180 : 0;
-                  const playerHintBonus = /(player|hero|avatar|self|local|char|pos|position|coord)/i.test(gp) ? 100 : 0;
-                  return {
-                    parentPath: g.parentPath,
-                    items: g.items,
-                    totalScore: g.score + multiAxisBonus + playerHintBonus
-                  };
-                });
-                rankedGroups.sort(function(a, b) { return b.totalScore - a.totalScore; });
+                  const baseVal = baseline[p];
+                  if (typeof baseVal !== 'number' || !Number.isFinite(baseVal)) continue;
 
-                changed.sort(function(a, b) {
-                  if (b.score !== a.score) return b.score - a.score;
-                  return Math.abs(a.delta) - Math.abs(b.delta);
-                });
-
-                const topDeltas = changed.slice(0, 20).map(function(item) {
-                  return {
-                    path: item.path,
-                    baseline: item.baseline,
-                    current: item.current,
-                    delta: item.delta
-                  };
-                });
-
-                let discoveredPlayerPath = null;
-                let propertyKeysLabel = '';
-                let liveSample = null;
-
-                if (rankedGroups.length > 0) {
-                  const best = rankedGroups[0];
-                  discoveredPlayerPath = best.parentPath;
-                  const axisKeys = { x: null, y: null, z: null };
-                  for (let i = 0; i < best.items.length; i++) {
-                    const it = best.items[i];
-                    const lf = it.leaf.toLowerCase();
-                    if (lf === 'x' || lf === '0' || lf === 'px' || lf === 'left') axisKeys.x = it.leaf;
-                    else if (lf === 'y' || lf === '1' || lf === 'py' || lf === 'top') axisKeys.y = it.leaf;
-                    else if (lf === 'z' || lf === '2' || lf === 'pz') axisKeys.z = it.leaf;
+                  const tokens = __parsePathTokens(p);
+                  if (tokens.length === 0) continue;
+                  let hasExcludedSegment = false;
+                  for (let ti = 0; ti < tokens.length; ti++) {
+                    if (__isExcludedWasmKey(tokens[ti])) {
+                      hasExcludedSegment = true;
+                      break;
+                    }
                   }
-                  if (axisKeys.x === null && best.items[0]) axisKeys.x = best.items[0].leaf;
-                  if (axisKeys.y === null && best.items[1]) axisKeys.y = best.items[1].leaf;
-                  if (axisKeys.z === null && best.items[2]) axisKeys.z = best.items[2].leaf;
+                  if (hasExcludedSegment) {
+                    skippedExcluded++;
+                    continue;
+                  }
 
-                  // Also bind static third axis (e.g., y/z or [2] when walking on flat ground) from the live object
-                  const containerObj = __resolvePath(discoveredPlayerPath);
-                  if (containerObj && typeof containerObj === 'object') {
-                    if (axisKeys.x === null && typeof containerObj.x === 'number') axisKeys.x = 'x';
-                    if (axisKeys.y === null && typeof containerObj.y === 'number') axisKeys.y = 'y';
-                    if (axisKeys.z === null && typeof containerObj.z === 'number') axisKeys.z = 'z';
-                    if (__isShortNumericVector(containerObj)) {
-                      if (axisKeys.x === null) axisKeys.x = 0;
-                      if (axisKeys.y === null) axisKeys.y = 1;
-                      if (axisKeys.z === null && containerObj.length >= 3) axisKeys.z = 2;
+                  const leaf = tokens[tokens.length - 1];
+                  const parentPath = tokens.length > 1
+                    ? __buildPathFromTokens(tokens.slice(0, tokens.length - 1))
+                    : 'window';
+
+                  // Ensure parent container is a safe plain/game object (never TypedArray/WASM heap)
+                  let parentObj = window;
+                  if (tokens.length > 1) {
+                    parentObj = __resolvePath(parentPath);
+                    if (!__isSafeBaselineObject(parentObj)) {
+                      skippedExcluded++;
+                      continue;
                     }
                   }
 
-                  const bound = __bindLiveTargetRef(discoveredPlayerPath, axisKeys);
-                  if (bound) {
-                    const kList = [bound.xKey, bound.yKey, bound.zKey].filter(function(k) { return k !== null && k !== undefined; });
-                    propertyKeysLabel = kList.join(', ');
-                    liveSample = __readLiveRefVec();
-                  }
+                  let curVal;
+                  try { curVal = parentObj[leaf]; } catch (_) { continue; }
+                  if (typeof curVal !== 'number' || !Number.isFinite(curVal)) continue;
+
+                  const diff = curVal - baseVal;
+                  const absDiff = Math.abs(diff);
+                  if (absDiff < 0.0001 || absDiff > 10000) continue;
+                  if (Math.abs(curVal) > 1e11) continue;
+                  if (__TIME_KEY_RE.test(p)) continue;
+
+                  const score =
+                    (__COORD_AXIS_RE.test(p) ? 120 : 0) +
+                    (__HEURISTIC_KEY_RE.test(p) ? 60 : 0) +
+                    (absDiff <= 500 ? 25 : 0);
+
+                  changed.push({
+                    path: p,
+                    parentPath: parentPath,
+                    leaf: leaf,
+                    baseline: Number(baseVal.toFixed(4)),
+                    current: Number(curVal.toFixed(4)),
+                    delta: Number(diff.toFixed(4)),
+                    score: score
+                  });
                 }
 
-                __state.isolatedPaths = topDeltas;
-                const elapsedMs = Math.round(performance.now() - (__state.baselineTimeMs || performance.now()));
-                __setStatus(
-                  discoveredPlayerPath ? 'COMPLETED' : 'IDLE',
-                  discoveredPlayerPath ? ('Live 200ms: ' + discoveredPlayerPath) : 'No movement detected'
-                );
+                if (cursor < keys.length) {
+                  __setStatus('RUNNING', 'Step 2B: ' + cursor + '/' + keys.length + ' checked…');
+                  __yieldFrame(processChunk);
+                } else {
+                  const groups = Object.create(null);
+                  for (let i = 0; i < changed.length; i++) {
+                    const c = changed[i];
+                    if (!groups[c.parentPath]) {
+                      groups[c.parentPath] = { parentPath: c.parentPath, items: [], score: 0 };
+                    }
+                    const g = groups[c.parentPath];
+                    g.items.push(c);
+                    g.score += c.score;
+                  }
 
-                __emit('DELTA', {
-                  stage: 'DELTA_COMPUTED',
-                  chunksExecuted: chunksExecuted,
-                  elapsedMs: elapsedMs,
-                  comparedMetrics: keys.length,
-                  totalChanged: changed.length,
-                  discoveredPlayerPath: discoveredPlayerPath,
-                  propertyKeys: propertyKeysLabel,
-                  pollingIntervalMs: __LIVE_POLL_INTERVAL_MS,
-                  liveSample: liveSample,
-                  deltas: topDeltas
-                });
+                  const rankedGroups = Object.keys(groups).map(function(gp) {
+                    const g = groups[gp];
+                    const multiAxisBonus = g.items.length >= 2 && g.items.length <= 4 ? 180 : 0;
+                    const playerHintBonus = /(player|hero|avatar|self|local|char|pos|position|coord)/i.test(gp) ? 100 : 0;
+                    return {
+                      parentPath: g.parentPath,
+                      items: g.items,
+                      totalScore: g.score + multiAxisBonus + playerHintBonus
+                    };
+                  });
+                  rankedGroups.sort(function(a, b) { return b.totalScore - a.totalScore; });
+
+                  changed.sort(function(a, b) {
+                    if (b.score !== a.score) return b.score - a.score;
+                    return Math.abs(a.delta) - Math.abs(b.delta);
+                  });
+
+                  const topDeltas = changed.slice(0, 20).map(function(item) {
+                    return {
+                      path: item.path,
+                      baseline: item.baseline,
+                      current: item.current,
+                      delta: item.delta
+                    };
+                  });
+
+                  let discoveredPlayerPath = null;
+                  let propertyKeysLabel = '';
+                  let liveSample = null;
+
+                  if (rankedGroups.length > 0) {
+                    const best = rankedGroups[0];
+                    discoveredPlayerPath = best.parentPath;
+                    const axisKeys = { x: null, y: null, z: null };
+                    for (let i = 0; i < best.items.length; i++) {
+                      const it = best.items[i];
+                      const lf = it.leaf.toLowerCase();
+                      if (lf === 'x' || lf === 'px' || lf === 'left') axisKeys.x = it.leaf;
+                      else if (lf === 'y' || lf === 'py' || lf === 'top') axisKeys.y = it.leaf;
+                      else if (lf === 'z' || lf === 'pz') axisKeys.z = it.leaf;
+                    }
+                    if (axisKeys.x === null && best.items[0]) axisKeys.x = best.items[0].leaf;
+                    if (axisKeys.y === null && best.items[1]) axisKeys.y = best.items[1].leaf;
+                    if (axisKeys.z === null && best.items[2]) axisKeys.z = best.items[2].leaf;
+
+                    // Bind static third axis (e.g. y/z when walking on flat ground) from the live plain object
+                    const containerObj = __resolvePath(discoveredPlayerPath);
+                    if (__isSafeBaselineObject(containerObj)) {
+                      if (axisKeys.x === null && typeof containerObj.x === 'number') axisKeys.x = 'x';
+                      if (axisKeys.y === null && typeof containerObj.y === 'number') axisKeys.y = 'y';
+                      if (axisKeys.z === null && typeof containerObj.z === 'number') axisKeys.z = 'z';
+                    }
+
+                    const bound = __bindLiveTargetRef(discoveredPlayerPath, axisKeys);
+                    if (bound) {
+                      const kList = [bound.xKey, bound.yKey, bound.zKey].filter(function(k) { return k !== null && k !== undefined; });
+                      propertyKeysLabel = kList.join(', ');
+                      liveSample = __readLiveRefVec();
+                    }
+                  }
+
+                  __state.isolatedPaths = topDeltas;
+                  const elapsedMs = Math.round(performance.now() - (__state.baselineTimeMs || performance.now()));
+                  __setStatus(
+                    discoveredPlayerPath ? 'COMPLETED' : 'IDLE',
+                    discoveredPlayerPath ? ('Live 200ms: ' + discoveredPlayerPath) : 'No movement detected'
+                  );
+
+                  __emit('DELTA', {
+                    stage: 'DELTA_COMPUTED',
+                    chunksExecuted: chunksExecuted,
+                    elapsedMs: elapsedMs,
+                    comparedMetrics: keys.length,
+                    skippedBinaryOrWasm: skippedExcluded,
+                    totalChanged: changed.length,
+                    discoveredPlayerPath: discoveredPlayerPath,
+                    propertyKeys: propertyKeysLabel,
+                    pollingIntervalMs: __LIVE_POLL_INTERVAL_MS,
+                    liveSample: liveSample,
+                    deltas: topDeltas
+                  });
+                }
+              } catch (chunkErr) {
+                __setStatus('ERROR', 'Step 2B error');
+                __emit('ERR', 'Step 2B Delta error: ' + String(chunkErr));
               }
             };
 

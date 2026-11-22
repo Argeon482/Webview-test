@@ -11,15 +11,17 @@ import java.util.concurrent.atomic.AtomicLong
  * Secure native telemetry bridge exposed to the diagnostic WebView execution context.
  *
  * Security controls:
- * - Strict payload length bounds and control-character sanitization prevent memory exhaustion
- *   or log injection from untrusted web pages.
+ * - Strict payload length bounds, control-character sanitization, and sliding-window rate
+ *   limiting prevent memory exhaustion or log flooding from untrusted web pages.
  * - Export writes are gated behind an explicit user-triggered arming flag ([armExport]) so an
  *   arbitrary page cannot write files to device storage unsolicited.
+ * - Async scan status updates are validated against a strict allowlist ([AsyncScanStatus]).
  * - All UI state mutations are marshaled safely onto the Android main thread.
  */
 class TelemetryBridge(
     private val onTelemetryReceived: (category: String, payload: String) -> Unit,
-    private val onReportPayloadReceived: (jsonContent: String) -> Unit
+    private val onReportPayloadReceived: (jsonContent: String) -> Unit,
+    private val onScanStatusChanged: (status: AsyncScanStatus, detail: String) -> Unit = { _, _ -> }
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exportArmed = AtomicBoolean(false)
@@ -48,6 +50,19 @@ class TelemetryBridge(
 
         mainHandler.post {
             onTelemetryReceived(safeCategory, safePayload)
+        }
+    }
+
+    @JavascriptInterface
+    fun updateScanStatus(status: String, detail: String) {
+        val parsedStatus = AsyncScanStatus.fromRaw(status)
+        val safeDetail = sanitizePayload(detail, MAX_STATUS_DETAIL_CHARS)
+            .replace('\n', ' ')
+            .replace('\r', ' ')
+            .trim()
+
+        mainHandler.post {
+            onScanStatusChanged(parsedStatus, safeDetail)
         }
     }
 
@@ -110,6 +125,7 @@ class TelemetryBridge(
     companion object {
         const val BRIDGE_NAME = "TelemetryBridge"
         private const val MAX_CATEGORY_CHARS = 16
+        private const val MAX_STATUS_DETAIL_CHARS = 120
         private const val MAX_LOG_PAYLOAD_CHARS = 16_384
         private const val MAX_EXPORT_PAYLOAD_CHARS = 1_500_000
         private const val RATE_LIMIT_WINDOW_MS = 1_000L

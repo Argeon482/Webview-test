@@ -116,6 +116,9 @@ fun DiagnosticsScreen(
             },
             onReportPayloadReceived = { jsonContent ->
                 viewModel.onReportPayloadFromBridge(jsonContent)
+            },
+            onScanStatusChanged = { status, detail ->
+                viewModel.onScanStatusChanged(status, detail)
             }
         )
     }

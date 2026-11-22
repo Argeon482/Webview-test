@@ -76,6 +76,7 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.AsyncScanStatus
 import com.example.DiagnosticsUiState
 import com.example.LogCategory
 import com.example.R
@@ -228,22 +229,15 @@ private fun ConsoleHeaderBar(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             modifier = Modifier.weight(1f)
         ) {
-            Box(
-                modifier = Modifier
-                    .size(8.dp)
-                    .clip(CircleShape)
-                    .background(if (state.isLoading) AssetAmber else SignalEmerald)
-            )
-            Text(
-                text = stringResource(R.string.console_title),
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+            AsyncScanStatusPill(
+                status = state.scanStatus,
+                detail = state.scanStatusDetail
             )
             state.estimatedFps?.let { fps ->
                 MetricBadge(text = "${fps}fps", tint = SignalEmerald)
+            }
+            if (state.discoveredShallowPaths.isNotEmpty()) {
+                MetricBadge(text = "${state.discoveredShallowPaths.size} paths", tint = ElectricCyan)
             }
             if (state.interceptedAssets.isNotEmpty()) {
                 MetricBadge(text = "${state.interceptedAssets.size} assets", tint = AssetAmber)
@@ -501,10 +495,10 @@ private fun ManualJsExecutionDrawer(
 ) {
     val quickProbes = remember {
         listOf(
+            "Shallow paths" to "window.__wvDiagState ? window.__wvDiagState.shallowPaths : []",
+            "Isolated" to "window.__wvDiagState ? window.__wvDiagState.isolatedPaths : []",
             "Canvas count" to "document.querySelectorAll('canvas').length",
-            "Window keys" to "Object.keys(window).slice(0, 25)",
-            "Viewport" to "({w: innerWidth, h: innerHeight, dpr: devicePixelRatio})",
-            "Isolated" to "window.__wvDiagState ? window.__wvDiagState.isolatedPaths : []"
+            "Viewport" to "({w: innerWidth, h: innerHeight, dpr: devicePixelRatio})"
         )
     }
 
@@ -818,6 +812,66 @@ private fun ConsoleEmptyState(
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 3
+            )
+        }
+    }
+}
+
+@Composable
+private fun AsyncScanStatusPill(
+    status: AsyncScanStatus,
+    detail: String
+) {
+    val accent = when (status) {
+        AsyncScanStatus.IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
+        AsyncScanStatus.RUNNING -> ElectricCyan
+        AsyncScanStatus.COMPLETED -> SignalEmerald
+        AsyncScanStatus.ERROR -> AlertCoral
+    }
+    val statusLabel = when (status) {
+        AsyncScanStatus.IDLE -> stringResource(R.string.scan_status_idle)
+        AsyncScanStatus.RUNNING -> stringResource(R.string.scan_status_running)
+        AsyncScanStatus.COMPLETED -> stringResource(R.string.scan_status_completed)
+        AsyncScanStatus.ERROR -> stringResource(R.string.scan_status_error)
+    }
+    val displayText = if (detail.isNotBlank() && status != AsyncScanStatus.IDLE) {
+        "$statusLabel · $detail"
+    } else {
+        "Scan: $statusLabel"
+    }
+
+    Surface(
+        color = accent.copy(alpha = if (status == AsyncScanStatus.IDLE) 0.12f else 0.18f),
+        shape = RoundedCornerShape(6.dp),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
+        modifier = Modifier.testTag("async_scan_status_pill")
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp)
+        ) {
+            if (status == AsyncScanStatus.RUNNING) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(10.dp),
+                    strokeWidth = 1.6.dp,
+                    color = accent
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .clip(CircleShape)
+                        .background(accent)
+                )
+            }
+            Text(
+                text = displayText,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = accent,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
     }

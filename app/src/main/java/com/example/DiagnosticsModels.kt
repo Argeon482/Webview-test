@@ -3,6 +3,24 @@ package com.example
 import android.net.Uri
 import androidx.compose.runtime.Immutable
 
+enum class AsyncScanStatus(val label: String) {
+    IDLE("Idle"),
+    RUNNING("Scanning"),
+    COMPLETED("Completed"),
+    ERROR("Error");
+
+    companion object {
+        fun fromRaw(raw: String): AsyncScanStatus {
+            return when (raw.trim().uppercase()) {
+                "RUNNING", "STARTED", "SCANNING" -> RUNNING
+                "COMPLETED", "DONE", "SUCCESS" -> COMPLETED
+                "ERROR", "FAILED" -> ERROR
+                else -> IDLE
+            }
+        }
+    }
+}
+
 enum class LogCategory(val tag: String, val label: String) {
     ALL("ALL", "All"),
     SCOPE("SCOPE", "Scope"),
@@ -67,6 +85,9 @@ data class DiagnosticsUiState(
     val isLoading: Boolean = false,
     val loadProgress: Int = 0,
     val isDesktopMode: Boolean = true,
+    val scanStatus: AsyncScanStatus = AsyncScanStatus.IDLE,
+    val scanStatusDetail: String = "",
+    val discoveredShallowPaths: List<String> = emptyList(),
     val baselineCaptured: Boolean = false,
     val baselineMetricCount: Int = 0,
     val isolatedPaths: List<IsolatedCoordinatePath> = emptyList(),

@@ -60,6 +60,9 @@ class DiagnosticsViewModel : ViewModel() {
                     it.copy(
                         urlInput = if (targetUrl == "about:blank") "" else targetUrl,
                         activeUrl = targetUrl,
+                        scanStatus = AsyncScanStatus.IDLE,
+                        scanStatusDetail = "",
+                        discoveredShallowPaths = emptyList(),
                         baselineCaptured = false,
                         baselineMetricCount = 0,
                         isolatedPaths = emptyList(),
@@ -152,27 +155,56 @@ class DiagnosticsViewModel : ViewModel() {
         )
     }
 
-    // Step 1: Global Scope & Canvas Context Inspection
+    fun onScanStatusChanged(status: AsyncScanStatus, detail: String) {
+        _uiState.update {
+            it.copy(
+                scanStatus = status,
+                scanStatusDetail = detail
+            )
+        }
+    }
+
+    // Step 1: Non-Blocking Shallow Heuristic Global Scope Inspection
     fun runStep1InspectScope() {
-        appendLog(LogCategory.SCOPE, "Running Step 1: Inspect Global Scope…", "Scanning window globals, Canvas/WebGL contexts, and rAF cadence")
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 1: Scheduling shallow scan…")
+        appendLog(
+            LogCategory.SCOPE,
+            "Running Step 1: Async Shallow Heuristic Scope Scan…",
+            "Scanning window globals & engine namespaces (depth 1–2, chunked via rAF)"
+        )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildInspectGlobalScopeScript()))
     }
 
-    // Step 2A: Capture State Baseline
+    // Step 2A: Non-Blocking Shallow State Baseline
     fun runStep2ACaptureBaseline() {
-        appendLog(LogCategory.DELTA, "Running Step 2A: Capture State Baseline…", "Snapshotting finite numeric properties and vector arrays")
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2A: Capturing shallow baseline…")
+        appendLog(
+            LogCategory.DELTA,
+            "Running Step 2A: Async Shallow State Baseline…",
+            "Snapshotting top-level numeric properties & vectors (max depth 2)"
+        )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildCaptureBaselineScript()))
     }
 
-    // Step 2B: Compute State Delta
+    // Step 2B: Non-Blocking Shallow State Delta
     fun runStep2BComputeDelta() {
-        appendLog(LogCategory.DELTA, "Running Step 2B: Compute State Delta…", "Comparing live runtime state against baseline snapshot")
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2B: Computing shallow deltas…")
+        appendLog(
+            LogCategory.DELTA,
+            "Running Step 2B: Async Shallow State Delta…",
+            "Comparing live shallow runtime values against baseline snapshot"
+        )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildComputeDeltaScript()))
     }
 
-    // Step 3: Entity Bounding Box & Canvas Projection Analysis
+    // Step 3: Non-Blocking Shallow Entity Bounding Box & Canvas Projection Analysis
     fun runStep3ScanEntities() {
-        appendLog(LogCategory.ENTITY, "Running Step 3: Scan Active Entities…", "Probing entity collections and 3D→2D canvas projection")
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 3: Scanning shallow entities…")
+        appendLog(
+            LogCategory.ENTITY,
+            "Running Step 3: Async Shallow Entity Scan…",
+            "Probing shallow entity collections and 3D→2D canvas projection"
+        )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildScanEntitiesScript()))
     }
 
@@ -297,6 +329,7 @@ class DiagnosticsViewModel : ViewModel() {
     fun onExecuteManualScript() {
         val code = _uiState.value.manualJsInput.trim()
         if (code.isEmpty()) return
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Evaluating manual JS…")
         appendLog(LogCategory.JS, "Exec> ${code.take(90)}", code)
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildManualEvalScript(code)))
     }
@@ -333,29 +366,45 @@ class DiagnosticsViewModel : ViewModel() {
         return when (stage) {
             "GLOBAL_SCOPE_INSPECTED" -> {
                 val canvases = json.optInt("canvasCount", 0)
-                val customObjs = json.optInt("customObjectCount", 0)
+                val candidateCount = json.optInt("candidateCount", json.optInt("customObjectCount", 0))
+                val chunks = json.optInt("chunksExecuted", 1)
                 val fps = if (json.isNull("estimatedFps")) null else json.optInt("estimatedFps", -1).takeIf { it > 0 }
+                val discovered = extractStringArray(json.optJSONArray("shallowPaths"))
                 _uiState.update {
                     it.copy(
                         canvasCount = canvases,
-                        estimatedFps = fps ?: it.estimatedFps
+                        estimatedFps = fps ?: it.estimatedFps,
+                        discoveredShallowPaths = mergeShallowPaths(it.discoveredShallowPaths, discovered),
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Step 1: $candidateCount containers (${chunks} chunks)"
                     )
                 }
                 val fpsLabel = fps?.let { "${it}fps" } ?: "rAF idle"
-                "Scope: $customObjs app globals • $canvases canvas(es) • $fpsLabel"
+                "Scope (depth≤2, ${chunks} chunks): $candidateCount containers • ${discovered.size} shallow paths • $canvases canvas(es) • $fpsLabel"
             }
             "BASELINE_CAPTURED" -> {
                 val metrics = json.optInt("metricCount", 0)
                 val roots = json.optInt("rootObjectCount", 0)
+                val chunks = json.optInt("chunksExecuted", 1)
+                val discovered = extractStringArray(json.optJSONArray("shallowPaths"))
                 _uiState.update {
                     it.copy(
                         baselineCaptured = true,
-                        baselineMetricCount = metrics
+                        baselineMetricCount = metrics,
+                        discoveredShallowPaths = mergeShallowPaths(it.discoveredShallowPaths, discovered),
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "2A Armed ($metrics shallow metrics)"
                     )
                 }
-                "Baseline captured: $metrics numeric metrics across $roots app roots"
+                "Shallow baseline (${chunks} chunks): $metrics numeric metrics across $roots roots"
             }
             "BASELINE_MISSING" -> {
+                _uiState.update {
+                    it.copy(
+                        scanStatus = AsyncScanStatus.IDLE,
+                        scanStatusDetail = "Capture 2A baseline first"
+                    )
+                }
                 json.optString("message", "Capture baseline (2A) first.")
             }
             "DELTA_COMPUTED" -> {
@@ -373,29 +422,69 @@ class DiagnosticsViewModel : ViewModel() {
                         )
                     }
                 }
-                _uiState.update { it.copy(isolatedPaths = isolatedList) }
+                val newPaths = isolatedList.map { it.path }.filter { it.isNotBlank() }
+                _uiState.update {
+                    it.copy(
+                        isolatedPaths = isolatedList,
+                        discoveredShallowPaths = mergeShallowPaths(it.discoveredShallowPaths, newPaths),
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Step 2B: ${isolatedList.size} deltas isolated"
+                    )
+                }
                 val totalChanged = json.optInt("totalChanged", isolatedList.size)
                 val elapsedMs = json.optInt("elapsedMs", 0)
+                val chunks = json.optInt("chunksExecuted", 1)
                 if (isolatedList.isEmpty()) {
-                    "Delta (${elapsedMs}ms): 0 active coordinate changes detected"
+                    "Delta (${elapsedMs}ms, ${chunks} chunks): 0 active coordinate changes detected"
                 } else {
-                    "Delta (${elapsedMs}ms): Isolated ${isolatedList.size}/$totalChanged paths (top: ${isolatedList.first().path})"
+                    "Delta (${elapsedMs}ms, ${chunks} chunks): Isolated ${isolatedList.size}/$totalChanged paths (top: ${isolatedList.first().path})"
                 }
             }
             "ENTITIES_SCANNED" -> {
                 val count = json.optInt("entityCount", 0)
                 val mode = json.optString("projectionMode", "pinhole")
-                _uiState.update { it.copy(lastEntityCount = count) }
-                "Entities: $count projected to 2D canvas via $mode"
+                val chunks = json.optInt("chunksExecuted", 1)
+                _uiState.update {
+                    it.copy(
+                        lastEntityCount = count,
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Step 3: $count entities projected"
+                    )
+                }
+                "Entities (${chunks} chunks): $count projected to 2D canvas via $mode"
             }
             "MANUAL_EVAL" -> {
                 val type = json.optString("resultType", "unknown")
                 val ms = json.optDouble("durationMs", 0.0)
                 val preview = json.optString("result", "").replace('\n', ' ').take(72)
+                _uiState.update {
+                    it.copy(
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "JS eval (${ms}ms)"
+                    )
+                }
                 "Result ($type, ${ms}ms): $preview"
             }
             else -> payload.take(110)
         }
+    }
+
+    private fun extractStringArray(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val item = array.optString(i, "").trim()
+                if (item.isNotEmpty()) add(item)
+            }
+        }
+    }
+
+    private fun mergeShallowPaths(existing: List<String>, incoming: List<String>): List<String> {
+        if (incoming.isEmpty()) return existing
+        val merged = LinkedHashSet<String>(existing.size + incoming.size)
+        merged.addAll(existing)
+        merged.addAll(incoming)
+        return merged.take(MAX_SHALLOW_PATHS)
     }
 
     private fun appendLog(category: LogCategory, summary: String, payload: String) {
@@ -425,6 +514,9 @@ class DiagnosticsViewModel : ViewModel() {
         root.put("pageTitle", state.pageTitle)
         root.put("desktopUserAgentEnabled", state.isDesktopMode)
         root.put("remoteWebContentsDebuggingEnabled", false)
+        root.put("scannerArchitecture", "async_chunked_shallow_heuristic_depth_2")
+        root.put("lastScanStatus", state.scanStatus.label)
+        root.put("lastScanDetail", state.scanStatusDetail)
         root.put("estimatedFps", state.estimatedFps ?: JSONObject.NULL)
         root.put("canvasCount", state.canvasCount)
 
@@ -434,6 +526,14 @@ class DiagnosticsViewModel : ViewModel() {
             JSONObject().put("raw", viewportMetricsJson)
         }
         root.put("viewportMetrics", viewportObj)
+
+        val combinedShallow = mergeShallowPaths(
+            state.discoveredShallowPaths,
+            extractStringArray(viewportObj.optJSONArray("discoveredShallowPaths"))
+        )
+        val shallowPathsArray = JSONArray()
+        combinedShallow.forEach { path -> shallowPathsArray.put(path) }
+        root.put("discoveredShallowPaths", shallowPathsArray)
 
         val pathsArray = JSONArray()
         state.isolatedPaths.forEach { item ->
@@ -495,6 +595,7 @@ class DiagnosticsViewModel : ViewModel() {
     companion object {
         private const val MAX_LOG_ENTRIES = 500
         private const val MAX_TRACKED_ASSETS = 250
+        private const val MAX_SHALLOW_PATHS = 200
 
         const val DESKTOP_USER_AGENT =
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"

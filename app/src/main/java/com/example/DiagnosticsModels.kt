@@ -3,25 +3,19 @@ package com.example
 import android.net.Uri
 import androidx.compose.runtime.Immutable
 
-const val VERIFIED_PLAYER_BASE_INDEX = 581246
-
-enum class LockStatus(val label: String) {
-    UNLOCKED("UNLOCKED"),
-    LOCKED("LOCKED"),
-    RELOCKING("RELOCKING")
-}
-
 enum class AsyncScanStatus(val label: String) {
     IDLE("Idle"),
     RUNNING("Scanning"),
-    COMPLETED("Active"),
+    PAUSED("Paused"),
+    COMPLETED("Completed"),
     ERROR("Error");
 
     companion object {
         fun fromRaw(raw: String): AsyncScanStatus {
             return when (raw.trim().uppercase()) {
-                "RUNNING", "STARTED", "SCANNING", "RELOCKING" -> RUNNING
-                "COMPLETED", "DONE", "SUCCESS", "ACTIVE" -> COMPLETED
+                "RUNNING", "STARTED", "SCANNING" -> RUNNING
+                "PAUSED", "PAUSE" -> PAUSED
+                "COMPLETED", "DONE", "SUCCESS" -> COMPLETED
                 "ERROR", "FAILED" -> ERROR
                 else -> IDLE
             }
@@ -29,12 +23,50 @@ enum class AsyncScanStatus(val label: String) {
     }
 }
 
+@Immutable
+data class ScopeBatchProgress(
+    val isActive: Boolean = false,
+    val isPaused: Boolean = false,
+    val currentBatch: Int = 0,
+    val totalBatches: Int = 0,
+    val itemStart: Int = 0,
+    val itemEnd: Int = 0,
+    val totalItems: Int = 0,
+    val foundCount: Int = 0
+) {
+    val fraction: Float
+        get() = if (totalBatches > 0) (currentBatch.toFloat() / totalBatches.toFloat()).coerceIn(0f, 1f) else 0f
+
+    val statusText: String
+        get() = when {
+            isPaused && totalBatches > 0 ->
+                "Paused at batch $currentBatch/$totalBatches (items $itemStart–$itemEnd) • $foundCount custom"
+            isActive && totalBatches > 0 ->
+                "Scanning batch $currentBatch/$totalBatches (items $itemStart–$itemEnd)…"
+            totalBatches > 0 && currentBatch >= totalBatches ->
+                "Completed $totalBatches/$totalBatches batches ($totalItems keys) • $foundCount custom"
+            else -> ""
+        }
+}
+
+enum class WizardStepBadge(val displayText: String) {
+    PENDING("[PENDING]"),
+    READY("[READY]"),
+    CAPTURED("[CAPTURED ✓]")
+}
+
 enum class ConsoleTab {
-    SCANNER,
-    ANALYZER,
+    WIZARD,
+    WASM_HEAP,
+    STAGING,
     ENTITIES,
     ASSETS,
     LOGS
+}
+
+enum class Step2ScanMode {
+    WASM_FLOAT_HEAP,
+    JS_OBJECTS
 }
 
 enum class AssetCaptureStatus(val label: String) {
@@ -46,11 +78,10 @@ enum class AssetCaptureStatus(val label: String) {
 
 enum class LogCategory(val tag: String, val label: String) {
     ALL("ALL", "All"),
-    FEED("FEED", "Feed"),
-    SCAN("SCAN", "Scan"),
-    PTR("PTR", "Ptr/Sig"),
-    RELOCK("RELOCK", "Relock"),
+    SCOPE("SCOPE", "Scope"),
+    DELTA("DELTA", "Delta"),
     ENTITY("ENTITY", "Entity"),
+    WASM("WASM", "WASM"),
     ASSET("ASSET", "Asset"),
     JS("JS", "JS"),
     SYSTEM("SYS", "Sys"),
@@ -77,6 +108,17 @@ data class TelemetryLogEntry(
 )
 
 @Immutable
+data class CandidateStagingItem(
+    val path: String,
+    val sourceStep: String,
+    val detail: String,
+    val scanNumber: Int,
+    val seenCount: Int = 1,
+    val isPinned: Boolean = false,
+    val lastSeenTimestamp: String
+)
+
+@Immutable
 data class InterceptedAsset(
     val url: String,
     val extension: String,
@@ -99,123 +141,35 @@ data class InterceptedAsset(
 )
 
 @Immutable
-data class DirectHeapFeedState(
-    val baseIndex: Int = VERIFIED_PLAYER_BASE_INDEX,
-    val baseIndexInput: String = VERIFIED_PLAYER_BASE_INDEX.toString(),
-    val heapSourceLabel: String = "window.HEAPF32",
-    val heapByteLength: Long = 0L,
-    val lockStatus: LockStatus = LockStatus.UNLOCKED,
-    val isPolling: Boolean = false,
-    val isHeapReady: Boolean = false,
-    val x: Double = 0.0,
-    val y: Double = 0.0,
-    val z: Double = 0.0,
-    val tickCount: Int = 0,
-    val lastUpdatedMs: Long = 0L,
-    val statusMessage: String = "Ready to lock onto window.HEAPF32[$VERIFIED_PLAYER_BASE_INDEX..${VERIFIED_PLAYER_BASE_INDEX + 2}]",
-    val hasSignature: Boolean = false,
-    val signatureAnchorCount: Int = 0,
-    val signatureCapturedAtIndex: Int? = null,
-    val signatureJson: String? = null,
-    val isRelocking: Boolean = false,
-    val autoRelockOnReload: Boolean = true,
-    val lastRelockSummary: String = "",
-    val relockConfidencePercent: Int = 0,
-    val relockMethodUsed: String = ""
-) {
-    val byteAddress: Long
-        get() = baseIndex.toLong().coerceAtLeast(0L) * 4L
-}
-
-@Immutable
-data class FloatDeltaCandidate(
-    val heapIndex: Int,
-    val byteAddress: Long,
+data class IsolatedCoordinatePath(
+    val path: String,
     val baselineValue: Double,
     val currentValue: Double,
-    val delta: Double,
-    val previewY: Double = 0.0,
-    val previewZ: Double = 0.0,
-    val isStillNow: Boolean = true,
-    val clusterSize: Int = 1,
-    val axisHint: String = "X",
-    val liveChangeCount: Int = 0
+    val delta: Double
 )
 
 @Immutable
-data class FloatDeltaScannerState(
-    val isBusy: Boolean = false,
-    val baselineCaptured: Boolean = false,
-    val baselineSampleCount: Int = 0,
-    val prunedJitterCount: Int = 0,
-    val scanRound: Int = 0,
-    val totalMatchesFound: Int = 0,
-    val scanDurationMs: Double? = null,
-    val isLivePreviewing: Boolean = false,
-    val statusMessage: String = "Stand still, tap '1. Capture Standing Baseline', move in-game, stop, then tap '2. Scan Movement Deltas'.",
-    val candidates: List<FloatDeltaCandidate> = emptyList()
-)
-
-@Immutable
-data class MemorySlotPreview(
-    val offset: Int,
-    val heapIndex: Int,
-    val byteAddress: Long,
-    val floatValue: Double,
-    val uint32Hex: String,
-    val isCoordAxis: Boolean = false,
-    val isAnchor: Boolean = false
-)
-
-@Immutable
-data class ParentPointerMatch(
-    val pointerHeapIndex: Int,
-    val pointerByteAddress: Long,
-    val targetByteAddress: Long,
-    val fieldOffsetBytes: Int = 0,
-    val isExactMatch: Boolean = true
-)
-
-@Immutable
-data class PointerSignatureAnalysis(
-    val inspectedBaseIndex: Int? = null,
-    val inspectedByteAddress: Long = 0L,
-    val isAnalyzing: Boolean = false,
-    val aobPatternHex: String = "",
-    val floatPatternSummary: String = "",
-    val anchorCount: Int = 0,
-    val signatureJson: String? = null,
-    val parentPointers: List<ParentPointerMatch> = emptyList(),
-    val surroundingSlots: List<MemorySlotPreview> = emptyList(),
-    val analysisDurationMs: Double? = null,
-    val errorMessage: String? = null
-)
-
-@Immutable
-data class SavedLockProfile(
-    val baseIndex: Int,
-    val host: String,
-    val aobPatternHex: String,
-    val floatPatternSummary: String,
-    val anchorCount: Int,
-    val signatureJson: String,
-    val parentPointers: List<ParentPointerMatch> = emptyList(),
-    val autoRelockOnReload: Boolean = true,
-    val savedAtEpochMs: Long = 0L
-)
-
-@Immutable
-data class NearbyEntityStruct(
-    val baseIndex: Int,
-    val byteAddress: Long,
-    val offsetFromPlayer: Int,
+data class PlayerCoordinates(
+    val path: String,
     val x: Double,
     val y: Double,
     val z: Double,
+    val updatedAtMs: Long = System.currentTimeMillis()
+)
+
+@Immutable
+data class DiscoveredEntitySample(
+    val name: String,
+    val id: String,
+    val path: String,
+    val worldX: Double,
+    val worldY: Double,
+    val worldZ: Double,
     val distanceToPlayer: Double,
-    val strideGroup: Int = 0,
-    val confidenceScore: Int = 0,
-    val isPinned: Boolean = false
+    val screenX: Double,
+    val screenY: Double,
+    val inViewport: Boolean,
+    val sampleKeys: List<String>
 )
 
 @Immutable
@@ -229,6 +183,122 @@ data class ExportReportOutcome(
 )
 
 @Immutable
+data class WasmNeighborFloat(
+    val byteOffset: Int,
+    val heapIndex: Int,
+    val byteAddress: Long,
+    val floatValue: Double,
+    val intValue: Int,
+    val changedFromPrev: Boolean = false,
+    val changeCount: Int = 0
+)
+
+@Immutable
+data class WasmCandidateAddress(
+    val heapType: String,
+    val index: Int,
+    val byteAddress: Long,
+    val currentValue: String
+)
+
+@Immutable
+data class WasmHeapTrackerState(
+    val targetValueInput: String = "",
+    val isScanning: Boolean = false,
+    val scanProgressPercent: Int = 0,
+    val heapSourceLabel: String = "",
+    val heapByteLength: Long = 0L,
+    val initialSearchValue: Double? = null,
+    val lastFilterValue: Double? = null,
+    val totalMatches: Int = 0,
+    val heap32MatchCount: Int = 0,
+    val heapF32MatchCount: Int = 0,
+    val filterRound: Int = 0,
+    val survivingCandidates: List<WasmCandidateAddress> = emptyList(),
+    val isolatedHeapType: String? = null,
+    val isolatedIndex: Int? = null,
+    val isolatedByteAddress: Long? = null,
+    val isolatedCurrentValue: String = "",
+    val isNeighborPolling: Boolean = false,
+    val neighborPollTickCount: Int = 0,
+    val neighborFloats: List<WasmNeighborFloat> = emptyList(),
+    val statusMessage: String = "",
+    val isExportingMemoryMap: Boolean = false,
+    val lastMemoryMapExport: ExportReportOutcome? = null
+)
+
+@Immutable
+data class WasmFloatDeltaCandidate(
+    val heapIndex: Int,
+    val byteAddress: Long,
+    val baselineValue: Double,
+    val currentValue: Double,
+    val delta: Double,
+    val clusterSize: Int = 1,
+    val axisHint: String = "",
+    val isPinned: Boolean = false,
+    val changedFromPrev: Boolean = false,
+    val changeCount: Int = 0
+)
+
+@Immutable
+data class LockedWasmCoords(
+    val xIndex: Int,
+    val yIndex: Int?,
+    val zIndex: Int?,
+    val xByteAddress: Long,
+    val yByteAddress: Long?,
+    val zByteAddress: Long?,
+    val xValue: Double,
+    val yValue: Double,
+    val zValue: Double,
+    val lockedAtTimestamp: String = "",
+    val liveTickCount: Int = 0,
+    val isLivePolling: Boolean = true
+)
+
+@Immutable
+data class WasmPointerChain(
+    val id: String,
+    val depth: Int,
+    val basePointerAddress: Long,
+    val offsets: List<Int>,
+    val resolvedTargetAddress: Long,
+    val resolvedX: Double,
+    val resolvedY: Double,
+    val resolvedZ: Double,
+    val isLikelyStatic: Boolean,
+    val isVerifiedLive: Boolean = true,
+    val expression: String,
+    val isPinned: Boolean = false
+)
+
+@Immutable
+data class WasmFloatDeltaState(
+    val isSamplingBaseline: Boolean = false,
+    val isScanningDeltas: Boolean = false,
+    val baselineCaptured: Boolean = false,
+    val baselineSampleCount: Int = 0,
+    val baselinePrunedJitterCount: Int = 0,
+    val heapSourceLabel: String = "",
+    val heapByteLength: Long = 0L,
+    val totalDeltaMatches: Int = 0,
+    val scanRound: Int = 0,
+    val isLiveWatching: Boolean = false,
+    val liveWatchTickCount: Int = 0,
+    val candidates: List<WasmFloatDeltaCandidate> = emptyList(),
+    val pinnedIndices: Set<Int> = emptySet(),
+    val isWatcherExpanded: Boolean = true,
+    val statusMessage: String = "",
+    val lockedCoords: LockedWasmCoords? = null,
+    val isScanningPointers: Boolean = false,
+    val pointerScanTotalL1: Int = 0,
+    val pointerScanTotalL2: Int = 0,
+    val pointerChains: List<WasmPointerChain> = emptyList(),
+    val pointerStatusMessage: String = ""
+)
+
+@Immutable
 data class DiagnosticsUiState(
     val urlInput: String = "",
     val activeUrl: String = "about:blank",
@@ -238,43 +308,93 @@ data class DiagnosticsUiState(
     val isDesktopMode: Boolean = true,
     val scanStatus: AsyncScanStatus = AsyncScanStatus.IDLE,
     val scanStatusDetail: String = "",
-    val activeConsoleTab: ConsoleTab = ConsoleTab.SCANNER,
-    val isWebViewExpanded: Boolean = false,
-    // Fixed Top Live Telemetry Bar + Persistent Lock state
-    val heapFeed: DirectHeapFeedState = DirectHeapFeedState(),
-    val savedProfile: SavedLockProfile? = null,
-    val liveStreamHistory: List<String> = emptyList(),
-    val isTelemetryStreamExpanded: Boolean = false,
-    // Step 1: Movement Float Delta Scanner
-    val floatScanner: FloatDeltaScannerState = FloatDeltaScannerState(),
-    // Step 2: Pointer & Memory Signature Analyzer
-    val pointerAnalysis: PointerSignatureAnalysis = PointerSignatureAnalysis(),
-    // Nearby ±50,000 Entity Struct Scanner
-    val isScanningEntities: Boolean = false,
-    val entityScanRadius: Int = 50_000,
-    val entityScanDurationMs: Double? = null,
-    val entityDetectedStride: Int? = null,
-    val discoveredEntities: List<NearbyEntityStruct> = emptyList(),
-    // Passive Binary Asset Interceptor & Rolling Logs
+    val activeConsoleTab: ConsoleTab = ConsoleTab.WIZARD,
+    // Multi-Scan Candidate Staging Buffer
+    val scanCounter: Int = 0,
+    val stagingBuffer: List<CandidateStagingItem> = emptyList(),
+    val showPinnedOnly: Boolean = false,
+    val stagingSearchQuery: String = "",
+    // Step 1 state + Batched Chunked Scanning (100 items / batch) + Manual Path Inspector
+    val step1Completed: Boolean = false,
+    val customGlobals: List<String> = emptyList(),
+    val detectedGameNamespaces: List<String> = emptyList(),
+    val step1DurationMs: Double? = null,
+    val scopeBatchProgress: ScopeBatchProgress = ScopeBatchProgress(),
+    val manualPropertyPathInput: String = "",
+    val lastManualQuerySummary: String = "",
+    // Step 2 state + Live 200ms Reference Polling (JS Objects & WASM Float Heap Mode)
+    val step2ScanMode: Step2ScanMode = Step2ScanMode.WASM_FLOAT_HEAP,
+    val baselineCaptured: Boolean = false,
+    val baselineMetricCount: Int = 0,
+    val isolatedPaths: List<IsolatedCoordinatePath> = emptyList(),
+    val discoveredPlayerPath: String? = null,
+    val playerPropertyKeys: String = "",
+    val livePlayerCoords: PlayerCoordinates? = null,
+    val livePollActive: Boolean = false,
+    val livePollTickCount: Int = 0,
+    val wasmFloatDelta: WasmFloatDeltaState = WasmFloatDeltaState(),
+    // Step 3 state (Visual Entity Inspection Console)
+    val discoveredEntityArrayPath: String? = null,
+    val entityProjectionMode: String = "",
+    val entityViewportWidth: Int = 0,
+    val entityViewportHeight: Int = 0,
+    val discoveredEntities: List<DiscoveredEntitySample> = emptyList(),
+    val lastEntityCount: Int = 0,
+    // Step 4/5 Passive asset & console state
+    val wasmHeap: WasmHeapTrackerState = WasmHeapTrackerState(),
     val interceptedAssets: List<InterceptedAsset> = emptyList(),
     val logs: List<TelemetryLogEntry> = emptyList(),
     val selectedFilter: LogCategory = LogCategory.ALL,
-    // Manual JS Console & Report Exports
     val isJsDrawerOpen: Boolean = false,
     val manualJsInput: String = "",
+    val isConsoleExpanded: Boolean = false,
     val isExporting: Boolean = false,
     val lastExport: ExportReportOutcome? = null,
     val isExportingLogDump: Boolean = false,
-    val lastLogDumpExport: ExportReportOutcome? = null
+    val lastLogDumpExport: ExportReportOutcome? = null,
+    val estimatedFps: Int? = null,
+    val canvasCount: Int = 0
 ) {
+    val pinnedCandidateCount: Int
+        get() = stagingBuffer.count { it.isPinned }
+
     val cachedAssetCount: Int
         get() = interceptedAssets.count { it.captureStatus == AssetCaptureStatus.CAPTURED }
 
     val totalCachedAssetBytes: Long
         get() = interceptedAssets.filter { it.captureStatus == AssetCaptureStatus.CAPTURED }.sumOf { it.byteSize }
 
-    val pinnedEntityCount: Int
-        get() = discoveredEntities.count { it.isPinned }
+    val step1Badge: WizardStepBadge
+        get() = if (step1Completed && (customGlobals.isNotEmpty() || canvasCount > 0)) {
+            WizardStepBadge.CAPTURED
+        } else {
+            WizardStepBadge.READY
+        }
+
+    val step2Badge: WizardStepBadge
+        get() = when {
+            (!discoveredPlayerPath.isNullOrBlank() && livePlayerCoords != null) ||
+                wasmFloatDelta.lockedCoords != null ||
+                (wasmFloatDelta.candidates.isNotEmpty() && (wasmFloatDelta.isLiveWatching || wasmFloatDelta.pinnedIndices.isNotEmpty())) ->
+                WizardStepBadge.CAPTURED
+            step1Completed || baselineCaptured || wasmFloatDelta.baselineCaptured ->
+                WizardStepBadge.READY
+            else -> WizardStepBadge.PENDING
+        }
+
+    val step3Badge: WizardStepBadge
+        get() = when {
+            !discoveredEntityArrayPath.isNullOrBlank() && discoveredEntities.isNotEmpty() -> WizardStepBadge.CAPTURED
+            !discoveredPlayerPath.isNullOrBlank() -> WizardStepBadge.READY
+            else -> WizardStepBadge.PENDING
+        }
+
+    val step4Badge: WizardStepBadge
+        get() = when {
+            lastExport?.success == true -> WizardStepBadge.CAPTURED
+            step2Badge == WizardStepBadge.CAPTURED && step3Badge == WizardStepBadge.CAPTURED -> WizardStepBadge.READY
+            else -> WizardStepBadge.PENDING
+        }
 }
 
 sealed interface UrlValidationResult {

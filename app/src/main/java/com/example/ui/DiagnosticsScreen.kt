@@ -4,7 +4,11 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
+import android.net.Uri
+import android.os.Build
+import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
@@ -15,7 +19,6 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Toast
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -31,42 +34,33 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CameraAlt
-import androidx.compose.material.icons.filled.Computer
-import androidx.compose.material.icons.filled.DirectionsRun
-import androidx.compose.material.icons.filled.Lock
-import androidx.compose.material.icons.filled.LockOpen
-import androidx.compose.material.icons.filled.OpenInFull
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.DesktopWindows
+import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.RestartAlt
-import androidx.compose.material.icons.filled.UnfoldLess
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -76,12 +70,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
-import androidx.compose.ui.platform.rememberNestedScrollInteropConnection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -89,43 +80,22 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.DiagnosticsCommand
-import com.example.DiagnosticsUiState
+import com.example.DiagnosticsEffect
 import com.example.DiagnosticsViewModel
-import com.example.LockStatus
 import com.example.LogCategory
 import com.example.R
 import com.example.TelemetryBridge
-import com.example.ui.theme.AssetAmber
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.JetBrainsMonoFontFamily
 import com.example.ui.theme.ObsidianBg
 import com.example.ui.theme.ObsidianBorder
 import com.example.ui.theme.ObsidianSurface
 import com.example.ui.theme.ObsidianSurfaceElevated
-import com.example.ui.theme.OnElectricCyan
-import com.example.ui.theme.OnSignalEmerald
 import com.example.ui.theme.SignalEmerald
-import com.example.ui.theme.TelemetryViolet
-import kotlinx.coroutines.flow.collectLatest
-import java.util.Locale
 
-/**
- * Main mobile-first adaptive WASM Memory Scanner, Pointer/Signature Analyzer & Persistent Lock UI.
- *
- * Layout hierarchy:
- * 1. Compact URL Navigation Bar
- * 2. Compact, Fixed Live Telemetry Bar pinned at the top:
- *    `LOCKED / UNLOCKED`, `Base Index`, `Hex Address`, and fixed-height 3-decimal `X, Y, Z`
- *    updating every 200ms with ZERO layout shift below it.
- * 3. Smooth NestedScrollView-compatible scrollable diagnostics container (portrait) or
- *    Side-by-Side Split (wide >= 840dp) with clear cards and generous button padding.
- * 4. Fixed, Collapsible Live Telemetry Stream Bar anchored at the bottom.
- */
 @Composable
 fun DiagnosticsScreen(
     viewModel: DiagnosticsViewModel = viewModel()
@@ -133,7 +103,11 @@ fun DiagnosticsScreen(
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
+
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
+    val defaultMobileUa = remember(context) {
+        runCatching { WebSettings.getDefaultUserAgent(context) }.getOrDefault("")
+    }
 
     val telemetryBridge = remember(viewModel) {
         TelemetryBridge(
@@ -144,476 +118,298 @@ fun DiagnosticsScreen(
                 viewModel.onReportPayloadFromBridge(jsonContent)
             },
             onScanStatusChanged = { status, detail ->
-                viewModel.onScanStatusChangedFromBridge(status, detail)
+                viewModel.onScanStatusChanged(status, detail)
             },
-            onDirectHeapCoordsUpdated = { baseIndex, x, y, z, heapByteLength, heapSource ->
-                viewModel.onDirectHeapCoordsUpdatedFromBridge(
-                    baseIndex = baseIndex,
-                    x = x,
-                    y = y,
-                    z = z,
-                    heapByteLength = heapByteLength,
-                    heapSource = heapSource
-                )
+            onPlayerCoordsUpdated = { path, x, y, z ->
+                viewModel.onPlayerCoordsUpdated(path, x, y, z)
             },
-            onFloatDeltaPreviewUpdated = { jsonPayload ->
-                viewModel.onFloatDeltaPreviewFromBridge(jsonPayload)
+            onBatchProgressChanged = { progress ->
+                viewModel.onBatchProgressChanged(progress)
+            },
+            onWasmNeighborsUpdated = { jsonPayload ->
+                viewModel.onWasmNeighborsUpdatedFromBridge(jsonPayload)
+            },
+            onWasmFloatCandidatesUpdated = { jsonPayload ->
+                viewModel.onWasmFloatCandidatesUpdatedFromBridge(jsonPayload)
             }
         )
     }
 
-    LaunchedEffect(viewModel, context) {
-        viewModel.commands.collectLatest { command ->
-            when (command) {
-                is DiagnosticsCommand.LoadUrl -> webViewRef?.loadUrl(command.url)
-                DiagnosticsCommand.Reload -> webViewRef?.reload()
-                is DiagnosticsCommand.EvaluateJs -> webViewRef?.evaluateJavascript(command.script, null)
-                is DiagnosticsCommand.ShowToast -> {
-                    Toast.makeText(context, command.message, Toast.LENGTH_SHORT).show()
+    // Collect one-shot WebView and system effects
+    LaunchedEffect(viewModel) {
+        viewModel.effects.collect { effect ->
+            when (effect) {
+                is DiagnosticsEffect.LoadUrl -> {
+                    webViewRef?.loadUrl(effect.url)
                 }
-                is DiagnosticsCommand.ShareFile -> {
-                    val intent = DiagnosticsViewModel.createShareIntent(
-                        uri = command.uri,
-                        mimeType = command.mimeType,
-                        title = command.title
-                    )
-                    runCatching { context.startActivity(intent) }
-                        .onFailure {
-                            Toast.makeText(
-                                context,
-                                "Unable to open share sheet: ${it.localizedMessage}",
-                                Toast.LENGTH_SHORT
-                            ).show()
+                is DiagnosticsEffect.ReloadWebView -> {
+                    webViewRef?.reload()
+                }
+                is DiagnosticsEffect.ApplyUserAgent -> {
+                    webViewRef?.let { wv ->
+                        wv.settings.userAgentString =
+                            if (effect.desktopMode) DiagnosticsViewModel.DESKTOP_USER_AGENT
+                            else defaultMobileUa
+                        if (effect.reloadAfter) {
+                            wv.reload()
                         }
+                    }
+                }
+                is DiagnosticsEffect.EvaluateJs -> {
+                    val wv = webViewRef
+                    if (wv == null) {
+                        viewModel.onTelemetryFromBridge(
+                            LogCategory.ERROR.tag,
+                            "WebView is not initialized yet."
+                        )
+                    } else {
+                        wv.evaluateJavascript(effect.script, null)
+                    }
+                }
+                is DiagnosticsEffect.ShowToast -> {
+                    Toast.makeText(context, effect.message, Toast.LENGTH_LONG).show()
+                }
+                is DiagnosticsEffect.ShareReport -> {
+                    shareExportedFile(context, effect.uri, effect.fileName, effect.mimeType)
                 }
             }
         }
     }
 
-    BackHandler(enabled = state.isJsDrawerOpen || state.isTelemetryStreamExpanded) {
-        when {
-            state.isJsDrawerOpen -> viewModel.onToggleJsDrawer()
-            state.isTelemetryStreamExpanded -> viewModel.onToggleTelemetryStreamExpanded()
-        }
-    }
-
-    val filteredLogs = remember(state.logs, state.selectedFilter) {
-        if (state.selectedFilter == LogCategory.ALL) {
-            state.logs
-        } else {
-            state.logs.filter { it.category == state.selectedFilter }
-        }
-    }
-
-    val copyToClipboard: (String) -> Unit = remember(context) {
-        { text ->
-            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            clipboard?.setPrimaryClip(ClipData.newPlainText("WebViewTelemetry", text))
-            Toast.makeText(context, context.getString(R.string.toast_log_copied), Toast.LENGTH_SHORT).show()
+    DisposableEffect(Unit) {
+        onDispose {
+            webViewRef?.apply {
+                stopLoading()
+                removeJavascriptInterface(TelemetryBridge.BRIDGE_NAME)
+                destroy()
+            }
+            webViewRef = null
         }
     }
 
     Scaffold(
         containerColor = ObsidianBg,
-        contentWindowInsets = WindowInsets.safeDrawing,
-        bottomBar = {
-            CollapsibleLiveTelemetryStreamCard(
-                state = state,
-                onToggleExpanded = viewModel::onToggleTelemetryStreamExpanded,
-                modifier = Modifier.navigationBarsPadding()
-            )
-        }
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .background(ObsidianBg)
-        ) {
-            // 1. Compact URL Bar
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        topBar = {
             CompactUrlNavigationBar(
                 urlInput = state.urlInput,
                 isDesktopMode = state.isDesktopMode,
                 isLoading = state.isLoading,
                 loadProgress = state.loadProgress,
                 onUrlChanged = viewModel::onUrlInputChanged,
-                onLoadRequested = {
+                onGo = {
                     focusManager.clearFocus()
                     viewModel.onLoadUrlRequested()
                 },
-                onReloadRequested = viewModel::onReloadRequested,
+                onReload = {
+                    focusManager.clearFocus()
+                    viewModel.onReloadRequested()
+                },
                 onToggleDesktopMode = viewModel::onToggleDesktopMode
             )
-
-            // 2. Compact, Fixed Live Telemetry Bar (zero layout shift @ 200ms)
-            FixedLiveTelemetryBar(
-                state = state,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-            )
-
-            HorizontalDivider(
-                color = ObsidianBorder.copy(alpha = 0.85f),
-                thickness = 1.dp
-            )
-
-            // 3. Adaptive Main Body (NestedScrollView-compatible scrollable deck)
-            BoxWithConstraints(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(top = 6.dp)
-            ) {
-                val isWideLayout = maxWidth >= 840.dp
-                val nestedScrollInterop = rememberNestedScrollInteropConnection()
-
-                if (isWideLayout) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(horizontal = 12.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        DiagnosticWebViewCard(
-                            state = state,
-                            telemetryBridge = telemetryBridge,
-                            onWebViewReady = { webViewRef = it },
-                            onPageStarted = viewModel::onPageStarted,
-                            onPageProgressChanged = viewModel::onPageProgressChanged,
-                            onPageFinished = viewModel::onPageFinished,
-                            onWebViewError = viewModel::onWebViewError,
-                            onResourceObserved = viewModel::onResourceRequestObserved,
-                            onConsoleLog = { msg -> viewModel.onTelemetryFromBridge(LogCategory.JS.tag, msg) },
-                            onToggleExpand = viewModel::onToggleWebViewExpanded,
-                            onCaptureBaseline = viewModel::captureStandingBaseline,
-                            onScanMovementDeltas = viewModel::scanMovementDeltas,
-                            onResetFloatScan = viewModel::resetFloatScan,
-                            showHeightToggle = false,
-                            modifier = Modifier
-                                .weight(1.1f)
-                                .fillMaxHeight()
-                        )
-
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .fillMaxHeight()
-                                .nestedScroll(nestedScrollInterop)
-                                .verticalScroll(rememberScrollState()),
-                            verticalArrangement = Arrangement.spacedBy(12.dp)
-                        ) {
-                            PrimaryActionButtonsBar(
-                                state = state,
-                                onAutoRelock = { viewModel.autoRelockCoordinates(isAutomatic = false) },
-                                onToggleAutoRelockOnReload = viewModel::onToggleAutoRelockOnReload,
-                                onStartFeed = viewModel::startDirectHeapFeed,
-                                onPauseFeed = viewModel::pauseDirectHeapFeed,
-                                onScanEntities = viewModel::scanNearbyEntities,
-                                onExportReport = {
-                                    viewModel.requestExportReport(
-                                        armBridge = telemetryBridge::armExport,
-                                        disarmBridge = telemetryBridge::disarmExport
-                                    )
-                                },
-                                onShareLastReport = viewModel::onShareLastReport
-                            )
-
-                            TelemetryConsolePanel(
-                                state = state,
-                                filteredLogs = filteredLogs,
-                                onSelectConsoleTab = viewModel::onSelectConsoleTab,
-                                onCaptureBaseline = viewModel::captureStandingBaseline,
-                                onScanMovementDeltas = viewModel::scanMovementDeltas,
-                                onResetFloatScan = viewModel::resetFloatScan,
-                                onInspectAndLockCandidate = viewModel::inspectAndLockCandidate,
-                                onBaseIndexInputChanged = viewModel::onBaseIndexInputChanged,
-                                onApplyBaseIndex = viewModel::onApplyBaseIndex,
-                                onResetVerifiedIndex = viewModel::onResetToVerifiedBaseIndex,
-                                onAnalyzeCurrentIndex = { viewModel.inspectAndLockCandidate(state.heapFeed.baseIndex) },
-                                onSaveAndLockProfile = viewModel::saveAndLockProfile,
-                                onClearSavedProfile = viewModel::clearSavedProfile,
-                                onTogglePinEntity = viewModel::onTogglePinEntity,
-                                onClearAssetCache = viewModel::onClearAssetCache,
-                                onToggleJsDrawer = viewModel::onToggleJsDrawer,
-                                onManualJsInputChanged = viewModel::onManualJsInputChanged,
-                                onExecuteManualScript = viewModel::onExecuteManualScript,
-                                onSelectFilter = viewModel::onSelectFilter,
-                                onClearLogs = viewModel::onClearLogs,
-                                onExportLogDumpTxt = { viewModel.exportFullLogDump(asJson = false) },
-                                onExportLogDumpJson = { viewModel.exportFullLogDump(asJson = true) },
-                                onShareLastLogDump = viewModel::onShareLastLogDump,
-                                onCopyText = copyToClipboard,
-                                tabListHeight = 380.dp
-                            )
-
-                            Spacer(Modifier.height(12.dp))
-                        }
-                    }
-                } else {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .nestedScroll(nestedScrollInterop)
-                            .verticalScroll(rememberScrollState())
-                            .padding(horizontal = 12.dp, vertical = 4.dp)
-                            .testTag("main_scrollable_container"),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        val webViewHeight = if (state.isWebViewExpanded) 460.dp else 326.dp
-                        DiagnosticWebViewCard(
-                            state = state,
-                            telemetryBridge = telemetryBridge,
-                            onWebViewReady = { webViewRef = it },
-                            onPageStarted = viewModel::onPageStarted,
-                            onPageProgressChanged = viewModel::onPageProgressChanged,
-                            onPageFinished = viewModel::onPageFinished,
-                            onWebViewError = viewModel::onWebViewError,
-                            onResourceObserved = viewModel::onResourceRequestObserved,
-                            onConsoleLog = { msg -> viewModel.onTelemetryFromBridge(LogCategory.JS.tag, msg) },
-                            onToggleExpand = viewModel::onToggleWebViewExpanded,
-                            onCaptureBaseline = viewModel::captureStandingBaseline,
-                            onScanMovementDeltas = viewModel::scanMovementDeltas,
-                            onResetFloatScan = viewModel::resetFloatScan,
-                            showHeightToggle = true,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(webViewHeight)
-                        )
-
-                        PrimaryActionButtonsBar(
-                            state = state,
-                            onAutoRelock = { viewModel.autoRelockCoordinates(isAutomatic = false) },
-                            onToggleAutoRelockOnReload = viewModel::onToggleAutoRelockOnReload,
-                            onStartFeed = viewModel::startDirectHeapFeed,
-                            onPauseFeed = viewModel::pauseDirectHeapFeed,
-                            onScanEntities = viewModel::scanNearbyEntities,
-                            onExportReport = {
-                                viewModel.requestExportReport(
-                                    armBridge = telemetryBridge::armExport,
-                                    disarmBridge = telemetryBridge::disarmExport
-                                )
-                            },
-                            onShareLastReport = viewModel::onShareLastReport
-                        )
-
-                        TelemetryConsolePanel(
-                            state = state,
-                            filteredLogs = filteredLogs,
-                            onSelectConsoleTab = viewModel::onSelectConsoleTab,
-                            onCaptureBaseline = viewModel::captureStandingBaseline,
-                            onScanMovementDeltas = viewModel::scanMovementDeltas,
-                            onResetFloatScan = viewModel::resetFloatScan,
-                            onInspectAndLockCandidate = viewModel::inspectAndLockCandidate,
-                            onBaseIndexInputChanged = viewModel::onBaseIndexInputChanged,
-                            onApplyBaseIndex = viewModel::onApplyBaseIndex,
-                            onResetVerifiedIndex = viewModel::onResetToVerifiedBaseIndex,
-                            onAnalyzeCurrentIndex = { viewModel.inspectAndLockCandidate(state.heapFeed.baseIndex) },
-                            onSaveAndLockProfile = viewModel::saveAndLockProfile,
-                            onClearSavedProfile = viewModel::clearSavedProfile,
-                            onTogglePinEntity = viewModel::onTogglePinEntity,
-                            onClearAssetCache = viewModel::onClearAssetCache,
-                            onToggleJsDrawer = viewModel::onToggleJsDrawer,
-                            onManualJsInputChanged = viewModel::onManualJsInputChanged,
-                            onExecuteManualScript = viewModel::onExecuteManualScript,
-                            onSelectFilter = viewModel::onSelectFilter,
-                            onClearLogs = viewModel::onClearLogs,
-                            onExportLogDumpTxt = { viewModel.exportFullLogDump(asJson = false) },
-                            onExportLogDumpJson = { viewModel.exportFullLogDump(asJson = true) },
-                            onShareLastLogDump = viewModel::onShareLastLogDump,
-                            onCopyText = copyToClipboard,
-                            tabListHeight = 360.dp
-                        )
-
-                        Spacer(Modifier.height(16.dp))
-                    }
-                }
-            }
         }
-    }
-}
-
-/**
- * Compact, fixed-height Live Telemetry Bar pinned at the top.
- * Displays: Lock Status (`LOCKED` / `UNLOCKED` / `RELOCKING…`), `Base Index`, `Hex Address`,
- * and live 3-decimal `X, Y, Z` coordinates updating every 200ms with zero vertical jitter.
- */
-@Composable
-private fun FixedLiveTelemetryBar(
-    state: DiagnosticsUiState,
-    modifier: Modifier = Modifier
-) {
-    val feed = state.heapFeed
-    val hexAddress = remember(feed.byteAddress) {
-        "0x${feed.byteAddress.toString(16).uppercase(Locale.US)}"
-    }
-    val statusColor = when (feed.lockStatus) {
-        LockStatus.LOCKED -> SignalEmerald
-        LockStatus.RELOCKING -> ElectricCyan
-        LockStatus.UNLOCKED -> AssetAmber
-    }
-    val statusLabel = when (feed.lockStatus) {
-        LockStatus.LOCKED -> stringResource(R.string.hud_status_locked)
-        LockStatus.RELOCKING -> stringResource(R.string.hud_status_relocking)
-        LockStatus.UNLOCKED -> stringResource(R.string.hud_status_unlocked)
-    }
-
-    Surface(
-        shape = RoundedCornerShape(12.dp),
-        color = ObsidianSurface,
-        border = BorderStroke(1.2.dp, statusColor.copy(alpha = 0.7f)),
-        modifier = modifier
-            .fillMaxWidth()
-            .height(92.dp) // Fixed height guarantees zero layout shift below during 200ms updates
-            .testTag("top_live_telemetry_bar")
-    ) {
-        Column(
+    ) { innerPadding ->
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 10.dp, vertical = 7.dp),
-            verticalArrangement = Arrangement.SpaceBetween
+                .padding(innerPadding)
+                .navigationBarsPadding()
+                .imePadding()
         ) {
-            // Row 1: Lock Status Pill + Base Index + Hex Address
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Surface(
-                    shape = RoundedCornerShape(999.dp),
-                    color = statusColor.copy(alpha = 0.18f),
-                    border = BorderStroke(1.dp, statusColor.copy(alpha = 0.75f)),
-                    modifier = Modifier.testTag("hud_lock_status_badge")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        when (feed.lockStatus) {
-                            LockStatus.RELOCKING -> CircularProgressIndicator(
-                                modifier = Modifier.size(10.dp),
-                                strokeWidth = 1.6.dp,
-                                color = statusColor
-                            )
-                            LockStatus.LOCKED -> Icon(
-                                imageVector = Icons.Default.Lock,
-                                contentDescription = null,
-                                tint = statusColor,
-                                modifier = Modifier.size(11.dp)
-                            )
-                            LockStatus.UNLOCKED -> Icon(
-                                imageVector = Icons.Default.LockOpen,
-                                contentDescription = null,
-                                tint = statusColor,
-                                modifier = Modifier.size(11.dp)
-                            )
-                        }
-                        Text(
-                            text = statusLabel,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = statusColor,
-                            fontSize = 10.sp
-                        )
-                    }
-                }
+            val isWideScreen = maxWidth >= 840.dp
 
-                Text(
-                    text = "IDX [${feed.baseIndex}] • $hexAddress",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = JetBrainsMonoFontFamily,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Box(
+            if (isWideScreen) {
+                // Expanded / Tablet / Landscape Canonical Side-by-Side Split (60% WebView / 40% Console)
+                Row(modifier = Modifier.fillMaxSize()) {
+                    DiagnosticWebViewContainer(
+                        activeUrl = state.activeUrl,
+                        isDesktopMode = state.isDesktopMode,
+                        defaultMobileUa = defaultMobileUa,
+                        telemetryBridge = telemetryBridge,
+                        onWebViewCreated = { webViewRef = it },
+                        onPageStarted = viewModel::onPageStarted,
+                        onPageFinished = viewModel::onPageFinished,
+                        onProgressChanged = viewModel::onProgressChanged,
+                        onResourceObserved = { req -> viewModel.onResourceRequestObserved(context, req) },
+                        onWebViewError = viewModel::onWebViewError,
+                        onBlockedScheme = viewModel::onBlockedSchemeAttempt,
+                        onConsoleError = { msg ->
+                            viewModel.onTelemetryFromBridge(LogCategory.ERROR.tag, msg)
+                        },
                         modifier = Modifier
-                            .size(6.dp)
-                            .clip(CircleShape)
-                            .background(if (feed.isPolling && feed.isHeapReady) SignalEmerald else AssetAmber)
+                            .weight(if (state.isConsoleExpanded) 0.42f else 0.60f)
+                            .fillMaxHeight()
                     )
-                    Text(
-                        text = if (feed.isPolling && feed.isHeapReady) "200ms" else "IDLE",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = if (feed.isPolling && feed.isHeapReady) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 9.sp
+                    VerticalDivider(color = ObsidianBorder, thickness = 1.dp)
+                    TelemetryConsolePanel(
+                        state = state,
+                        onRunStep1 = viewModel::runStep1InspectScope,
+                        onPauseStep1 = viewModel::pauseStep1BatchScan,
+                        onResumeStep1 = viewModel::resumeStep1BatchScan,
+                        onManualPathInputChanged = viewModel::onManualPathInputChanged,
+                        onQueryManualPath = { override ->
+                            focusManager.clearFocus()
+                            viewModel.onQueryManualPropertyPath(override)
+                        },
+                        onRunStep2A = viewModel::runStep2ACaptureBaseline,
+                        onRunStep2B = viewModel::runStep2BComputeDelta,
+                        onRunStep3 = viewModel::runStep3ScanEntities,
+                        onExportReport = {
+                            viewModel.requestExportReport(
+                                context = context,
+                                armBridge = telemetryBridge::armExport,
+                                disarmBridge = telemetryBridge::disarmExport
+                            )
+                        },
+                        onShareReport = viewModel::onShareLastReport,
+                        onExportLogDumpTxt = { viewModel.exportFullLogDump(context, asJson = false) },
+                        onExportLogDumpJson = { viewModel.exportFullLogDump(context, asJson = true) },
+                        onShareLogDump = viewModel::onShareLastLogDump,
+                        onSelectConsoleTab = viewModel::onSelectConsoleTab,
+                        onSelectFilter = viewModel::onSelectFilter,
+                        onTogglePinCandidate = viewModel::onTogglePinCandidate,
+                        onTogglePinnedOnly = viewModel::onTogglePinnedOnlyFilter,
+                        onStagingSearchQueryChanged = viewModel::onStagingSearchQueryChanged,
+                        onClearUnpinnedCandidates = viewModel::onClearUnpinnedCandidates,
+                        onLockCandidateForLivePolling = viewModel::onLockCandidateForLivePolling,
+                        onPinExternalPath = viewModel::onPinExternalPath,
+                        onToggleJsDrawer = { viewModel.onToggleJsDrawer() },
+                        onManualJsChanged = viewModel::onManualJsInputChanged,
+                        onExecuteManualJs = viewModel::onExecuteManualScript,
+                        onClearAssetCache = { viewModel.onClearAssetCache(context) },
+                        onClearLogs = viewModel::onClearLogs,
+                        onToggleExpanded = viewModel::onToggleConsoleExpanded,
+                        onCopyPayload = { text -> copyToClipboard(context, text) },
+                        onWasmValueChanged = viewModel::onWasmTargetValueChanged,
+                        onRunWasmScan = {
+                            focusManager.clearFocus()
+                            viewModel.runWasmHeapInitialScan()
+                        },
+                        onRunWasmFilter = {
+                            focusManager.clearFocus()
+                            viewModel.runWasmHeapFilterDelta()
+                        },
+                        onInspectWasmCandidate = viewModel::onInspectWasmCandidate,
+                        onStopWasmPoll = viewModel::onStopWasmNeighborPolling,
+                        onResetWasmTracker = viewModel::onResetWasmHeapTracker,
+                        onExportWasmMemoryMap = { viewModel.exportWasmMemoryMapJson(context) },
+                        onShareWasmMemoryMap = viewModel::onShareLastWasmMemoryMap,
+                        onSelectStep2ScanMode = viewModel::onSelectStep2ScanMode,
+                        onRunFloatBaseline = viewModel::runWasmFloatBaselineSnapshot,
+                        onRunFloatDeltaScan = viewModel::runWasmFloatDeltaScan,
+                        onResetFloatDelta = viewModel::onResetWasmFloatDelta,
+                        onToggleFloatWatcherExpanded = viewModel::onToggleFloatWatcherExpanded,
+                        onTogglePinFloatCandidate = viewModel::onTogglePinWasmFloatCandidate,
+                        onPinTopFloatTriplet = viewModel::onPinTopWasmFloatTriplet,
+                        onInspectFloatNeighbors = viewModel::onInspectWasmFloatNeighbors,
+                        onStopFloatWatch = viewModel::onStopWasmFloatWatch,
+                        onLockFloatCoords = viewModel::onLockWasmFloatCoords,
+                        onUnlockFloatCoords = viewModel::onUnlockWasmFloatCoords,
+                        onFindWasmPointers = { viewModel.runWasmPointerScan() },
+                        onVerifyWasmPointers = viewModel::runVerifyWasmPointerChains,
+                        onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
+                        modifier = Modifier
+                            .weight(if (state.isConsoleExpanded) 0.58f else 0.40f)
+                            .fillMaxHeight()
                     )
                 }
-            }
-
-            // Row 2: Fixed 3-Column Tabular X, Y, Z Coordinates (3 decimal places)
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                FixedCoordCell(
-                    axis = "X",
-                    value = feed.x,
-                    accent = SignalEmerald,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("hud_coord_x")
-                )
-                FixedCoordCell(
-                    axis = "Y",
-                    value = feed.y,
-                    accent = ElectricCyan,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("hud_coord_y")
-                )
-                FixedCoordCell(
-                    axis = "Z",
-                    value = feed.z,
-                    accent = TelemetryViolet,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("hud_coord_z")
-                )
+            } else {
+                // Mobile Portrait Split View: Top ~60% WebView / Bottom ~40% Diagnostic Wizard & Console
+                Column(modifier = Modifier.fillMaxSize()) {
+                    DiagnosticWebViewContainer(
+                        activeUrl = state.activeUrl,
+                        isDesktopMode = state.isDesktopMode,
+                        defaultMobileUa = defaultMobileUa,
+                        telemetryBridge = telemetryBridge,
+                        onWebViewCreated = { webViewRef = it },
+                        onPageStarted = viewModel::onPageStarted,
+                        onPageFinished = viewModel::onPageFinished,
+                        onProgressChanged = viewModel::onProgressChanged,
+                        onResourceObserved = { req -> viewModel.onResourceRequestObserved(context, req) },
+                        onWebViewError = viewModel::onWebViewError,
+                        onBlockedScheme = viewModel::onBlockedSchemeAttempt,
+                        onConsoleError = { msg ->
+                            viewModel.onTelemetryFromBridge(LogCategory.ERROR.tag, msg)
+                        },
+                        modifier = Modifier
+                            .weight(if (state.isConsoleExpanded) 0.34f else 0.58f)
+                            .fillMaxWidth()
+                    )
+                    HorizontalDivider(color = ObsidianBorder, thickness = 1.5.dp)
+                    TelemetryConsolePanel(
+                        state = state,
+                        onRunStep1 = viewModel::runStep1InspectScope,
+                        onPauseStep1 = viewModel::pauseStep1BatchScan,
+                        onResumeStep1 = viewModel::resumeStep1BatchScan,
+                        onManualPathInputChanged = viewModel::onManualPathInputChanged,
+                        onQueryManualPath = { override ->
+                            focusManager.clearFocus()
+                            viewModel.onQueryManualPropertyPath(override)
+                        },
+                        onRunStep2A = viewModel::runStep2ACaptureBaseline,
+                        onRunStep2B = viewModel::runStep2BComputeDelta,
+                        onRunStep3 = viewModel::runStep3ScanEntities,
+                        onExportReport = {
+                            viewModel.requestExportReport(
+                                context = context,
+                                armBridge = telemetryBridge::armExport,
+                                disarmBridge = telemetryBridge::disarmExport
+                            )
+                        },
+                        onShareReport = viewModel::onShareLastReport,
+                        onExportLogDumpTxt = { viewModel.exportFullLogDump(context, asJson = false) },
+                        onExportLogDumpJson = { viewModel.exportFullLogDump(context, asJson = true) },
+                        onShareLogDump = viewModel::onShareLastLogDump,
+                        onSelectConsoleTab = viewModel::onSelectConsoleTab,
+                        onSelectFilter = viewModel::onSelectFilter,
+                        onTogglePinCandidate = viewModel::onTogglePinCandidate,
+                        onTogglePinnedOnly = viewModel::onTogglePinnedOnlyFilter,
+                        onStagingSearchQueryChanged = viewModel::onStagingSearchQueryChanged,
+                        onClearUnpinnedCandidates = viewModel::onClearUnpinnedCandidates,
+                        onLockCandidateForLivePolling = viewModel::onLockCandidateForLivePolling,
+                        onPinExternalPath = viewModel::onPinExternalPath,
+                        onToggleJsDrawer = { viewModel.onToggleJsDrawer() },
+                        onManualJsChanged = viewModel::onManualJsInputChanged,
+                        onExecuteManualJs = viewModel::onExecuteManualScript,
+                        onClearAssetCache = { viewModel.onClearAssetCache(context) },
+                        onClearLogs = viewModel::onClearLogs,
+                        onToggleExpanded = viewModel::onToggleConsoleExpanded,
+                        onCopyPayload = { text -> copyToClipboard(context, text) },
+                        onWasmValueChanged = viewModel::onWasmTargetValueChanged,
+                        onRunWasmScan = {
+                            focusManager.clearFocus()
+                            viewModel.runWasmHeapInitialScan()
+                        },
+                        onRunWasmFilter = {
+                            focusManager.clearFocus()
+                            viewModel.runWasmHeapFilterDelta()
+                        },
+                        onInspectWasmCandidate = viewModel::onInspectWasmCandidate,
+                        onStopWasmPoll = viewModel::onStopWasmNeighborPolling,
+                        onResetWasmTracker = viewModel::onResetWasmHeapTracker,
+                        onExportWasmMemoryMap = { viewModel.exportWasmMemoryMapJson(context) },
+                        onShareWasmMemoryMap = viewModel::onShareLastWasmMemoryMap,
+                        onSelectStep2ScanMode = viewModel::onSelectStep2ScanMode,
+                        onRunFloatBaseline = viewModel::runWasmFloatBaselineSnapshot,
+                        onRunFloatDeltaScan = viewModel::runWasmFloatDeltaScan,
+                        onResetFloatDelta = viewModel::onResetWasmFloatDelta,
+                        onToggleFloatWatcherExpanded = viewModel::onToggleFloatWatcherExpanded,
+                        onTogglePinFloatCandidate = viewModel::onTogglePinWasmFloatCandidate,
+                        onPinTopFloatTriplet = viewModel::onPinTopWasmFloatTriplet,
+                        onInspectFloatNeighbors = viewModel::onInspectWasmFloatNeighbors,
+                        onStopFloatWatch = viewModel::onStopWasmFloatWatch,
+                        onLockFloatCoords = viewModel::onLockWasmFloatCoords,
+                        onUnlockFloatCoords = viewModel::onUnlockWasmFloatCoords,
+                        onFindWasmPointers = { viewModel.runWasmPointerScan() },
+                        onVerifyWasmPointers = viewModel::runVerifyWasmPointerChains,
+                        onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
+                        modifier = Modifier
+                            .weight(if (state.isConsoleExpanded) 0.66f else 0.42f)
+                            .fillMaxWidth()
+                    )
+                }
             }
         }
-    }
-}
-
-@Composable
-private fun FixedCoordCell(
-    axis: String,
-    value: Double,
-    accent: Color,
-    modifier: Modifier = Modifier
-) {
-    Row(
-        modifier = modifier
-            .height(38.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(ObsidianBg)
-            .padding(horizontal = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Text(
-            text = axis,
-            style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.Bold,
-            color = accent
-        )
-        Text(
-            text = String.format(Locale.US, "%.3f", value),
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = JetBrainsMonoFontFamily,
-            fontWeight = FontWeight.Bold,
-            color = MaterialTheme.colorScheme.onSurface,
-            maxLines = 1,
-            softWrap = false,
-            overflow = TextOverflow.Clip
-        )
     }
 }
 
@@ -624,418 +420,350 @@ private fun CompactUrlNavigationBar(
     isLoading: Boolean,
     loadProgress: Int,
     onUrlChanged: (String) -> Unit,
-    onLoadRequested: () -> Unit,
-    onReloadRequested: () -> Unit,
+    onGo: () -> Unit,
+    onReload: () -> Unit,
     onToggleDesktopMode: () -> Unit
 ) {
-    Column(
+    Surface(
+        color = ObsidianSurface,
         modifier = Modifier
             .fillMaxWidth()
-            .background(ObsidianSurface)
+            .statusBarsPadding()
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            OutlinedTextField(
-                value = urlInput,
-                onValueChange = onUrlChanged,
-                singleLine = true,
-                placeholder = {
-                    Text(
-                        text = stringResource(R.string.url_input_hint),
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                },
-                textStyle = MaterialTheme.typography.bodySmall.copy(
-                    fontFamily = JetBrainsMonoFontFamily,
-                    color = MaterialTheme.colorScheme.onSurface
-                ),
-                keyboardOptions = KeyboardOptions(
-                    keyboardType = KeyboardType.Uri,
-                    imeAction = ImeAction.Go
-                ),
-                keyboardActions = KeyboardActions(onGo = { onLoadRequested() }),
-                colors = OutlinedTextFieldDefaults.colors(
-                    focusedBorderColor = ElectricCyan,
-                    unfocusedBorderColor = ObsidianBorder,
-                    focusedContainerColor = ObsidianBg,
-                    unfocusedContainerColor = ObsidianBg
-                ),
-                modifier = Modifier
-                    .weight(1f)
-                    .testTag("url_input_field")
-            )
-
-            Button(
-                onClick = onLoadRequested,
-                shape = RoundedCornerShape(10.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = ElectricCyan,
-                    contentColor = OnElectricCyan
-                ),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-                modifier = Modifier
-                    .heightIn(min = 50.dp)
-                    .testTag("load_url_button")
-            ) {
-                Text(
-                    text = stringResource(R.string.action_load),
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-
-            IconButton(
-                onClick = onReloadRequested,
-                modifier = Modifier
-                    .size(48.dp)
-                    .testTag("reload_button")
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Refresh,
-                    contentDescription = stringResource(R.string.cd_reload_page),
-                    tint = MaterialTheme.colorScheme.onSurface,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-
-            IconButton(
-                onClick = onToggleDesktopMode,
-                modifier = Modifier
-                    .size(48.dp)
-                    .testTag("toggle_ua_button")
-            ) {
-                Icon(
-                    imageVector = if (isDesktopMode) Icons.Default.Computer else Icons.Default.PhoneAndroid,
-                    contentDescription = stringResource(R.string.cd_toggle_desktop_ua),
-                    tint = if (isDesktopMode) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-        }
-
-        if (isLoading) {
-            LinearProgressIndicator(
-                progress = { (loadProgress.coerceIn(5, 100)) / 100f },
-                color = ElectricCyan,
-                trackColor = ObsidianBg,
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(2.dp)
-            )
-        } else {
-            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                // Compact URL Input Field
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = ObsidianBg,
+                    border = BorderStroke(1.dp, ObsidianBorder),
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 10.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Language,
+                            contentDescription = null,
+                            tint = ElectricCyan,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Box(
+                            modifier = Modifier.weight(1f),
+                            contentAlignment = Alignment.CenterStart
+                        ) {
+                            if (urlInput.isEmpty()) {
+                                Text(
+                                    text = stringResource(R.string.url_input_hint),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontFamily = JetBrainsMonoFontFamily,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            BasicTextField(
+                                value = urlInput,
+                                onValueChange = onUrlChanged,
+                                singleLine = true,
+                                textStyle = MaterialTheme.typography.bodySmall.copy(
+                                    fontFamily = JetBrainsMonoFontFamily,
+                                    color = MaterialTheme.colorScheme.onSurface
+                                ),
+                                cursorBrush = SolidColor(ElectricCyan),
+                                keyboardOptions = KeyboardOptions(
+                                    keyboardType = KeyboardType.Uri,
+                                    imeAction = ImeAction.Go
+                                ),
+                                keyboardActions = KeyboardActions(onGo = { onGo() }),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("url_input_field")
+                            )
+                        }
+                    }
+                }
+
+                // Go / Load Button
+                Button(
+                    onClick = onGo,
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ElectricCyan,
+                        contentColor = ObsidianBg
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                    modifier = Modifier
+                        .height(48.dp)
+                        .testTag("url_go_button")
+                ) {
+                    Text(
+                        text = stringResource(R.string.action_load),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(Modifier.width(3.dp))
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                        contentDescription = null,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+
+                // Reload Button
+                Surface(
+                    shape = RoundedCornerShape(10.dp),
+                    color = ObsidianSurfaceElevated,
+                    border = BorderStroke(1.dp, ObsidianBorder),
+                    modifier = Modifier.size(48.dp)
+                ) {
+                    IconButton(
+                        onClick = onReload,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .testTag("url_reload_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = stringResource(R.string.cd_reload_page),
+                            tint = MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+
+                // Desktop UA Toggle Button
+                Surface(
+                    onClick = onToggleDesktopMode,
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (isDesktopMode) SignalEmerald.copy(alpha = 0.16f) else ObsidianSurfaceElevated,
+                    border = BorderStroke(
+                        width = 1.dp,
+                        color = if (isDesktopMode) SignalEmerald else ObsidianBorder
+                    ),
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("desktop_ua_toggle")
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = if (isDesktopMode) Icons.Default.DesktopWindows else Icons.Default.PhoneAndroid,
+                            contentDescription = stringResource(R.string.cd_toggle_desktop_ua),
+                            tint = if (isDesktopMode) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
+                }
+            }
+
+            if (isLoading) {
+                LinearProgressIndicator(
+                    progress = { loadProgress / 100f },
+                    color = ElectricCyan,
+                    trackColor = ObsidianSurfaceElevated,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.dp)
+                )
+            } else {
+                HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+            }
         }
     }
 }
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-private fun DiagnosticWebViewCard(
-    state: DiagnosticsUiState,
+private fun DiagnosticWebViewContainer(
+    activeUrl: String,
+    isDesktopMode: Boolean,
+    defaultMobileUa: String,
     telemetryBridge: TelemetryBridge,
-    onWebViewReady: (WebView) -> Unit,
+    onWebViewCreated: (WebView) -> Unit,
     onPageStarted: (String) -> Unit,
-    onPageProgressChanged: (Int) -> Unit,
-    onPageFinished: (String, String) -> Unit,
-    onWebViewError: (String, String) -> Unit,
+    onPageFinished: (String, String?) -> Unit,
+    onProgressChanged: (Int) -> Unit,
     onResourceObserved: (WebResourceRequest) -> Unit,
-    onConsoleLog: (String) -> Unit,
-    onToggleExpand: () -> Unit,
-    onCaptureBaseline: () -> Unit,
-    onScanMovementDeltas: () -> Unit,
-    onResetFloatScan: () -> Unit,
-    showHeightToggle: Boolean,
+    onWebViewError: (String, String?) -> Unit,
+    onBlockedScheme: (String) -> Unit,
+    onConsoleError: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var createdWebView by remember { mutableStateOf<WebView?>(null) }
-
-    DisposableEffect(Unit) {
-        onDispose {
-            createdWebView?.let { wv ->
-                wv.removeJavascriptInterface(TelemetryBridge.BRIDGE_NAME)
-                wv.stopLoading()
-                wv.destroy()
-            }
-            createdWebView = null
-        }
-    }
-
-    Surface(
-        shape = RoundedCornerShape(14.dp),
-        color = ObsidianSurface,
-        border = BorderStroke(1.2.dp, ObsidianBorder),
+    Box(
         modifier = modifier
+            .background(ObsidianBg)
+            .testTag("diagnostic_webview_container")
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(ObsidianSurfaceElevated)
-                    .padding(horizontal = 12.dp, vertical = 4.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = state.pageTitle.ifBlank { "Embedded WebView Viewport" },
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+        AndroidView(
+            modifier = Modifier.fillMaxSize(),
+            factory = { ctx ->
+                // Explicitly enforce remote debugging remains disabled as required.
+                WebView.setWebContentsDebuggingEnabled(false)
+
+                WebView(ctx).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
                     )
-                    Text(
-                        text = if (state.scanStatusDetail.isNotBlank()) state.scanStatusDetail else state.activeUrl,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        fontSize = 10.sp
-                    )
-                }
+                    setLayerType(View.LAYER_TYPE_HARDWARE, null)
 
-                if (showHeightToggle) {
-                    IconButton(
-                        onClick = onToggleExpand,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .testTag("toggle_webview_height_button")
-                    ) {
-                        Icon(
-                            imageVector = if (state.isWebViewExpanded) Icons.Default.UnfoldLess else Icons.Default.OpenInFull,
-                            contentDescription = stringResource(R.string.cd_toggle_webview_height),
-                            tint = ElectricCyan,
-                            modifier = Modifier.size(18.dp)
-                        )
-                    }
-                }
-            }
-
-            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
-
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .background(Color.Black)
-            ) {
-                AndroidView(
-                    factory = { ctx ->
-                        WebView(ctx).apply {
-                            layoutParams = ViewGroup.LayoutParams(
-                                ViewGroup.LayoutParams.MATCH_PARENT,
-                                ViewGroup.LayoutParams.MATCH_PARENT
-                            )
-                            settings.javaScriptEnabled = true
-                            settings.domStorageEnabled = true
-                            settings.databaseEnabled = true
-                            settings.useWideViewPort = true
-                            settings.loadWithOverviewMode = true
-                            settings.builtInZoomControls = true
-                            settings.displayZoomControls = false
-                            settings.allowFileAccess = false
-                            settings.allowContentAccess = false
-                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                            settings.userAgentString = if (state.isDesktopMode) {
-                                DiagnosticsViewModel.DESKTOP_USER_AGENT
-                            } else {
-                                WebSettings.getDefaultUserAgent(ctx)
-                            }
-
-                            addJavascriptInterface(telemetryBridge, TelemetryBridge.BRIDGE_NAME)
-
-                            webViewClient = object : WebViewClient() {
-                                override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
-                                    super.onPageStarted(view, url, favicon)
-                                    onPageStarted(url.orEmpty())
-                                }
-
-                                override fun onPageFinished(view: WebView?, url: String?) {
-                                    super.onPageFinished(view, url)
-                                    onPageFinished(url.orEmpty(), view?.title.orEmpty())
-                                }
-
-                                override fun onReceivedError(
-                                    view: WebView?,
-                                    request: WebResourceRequest?,
-                                    error: WebResourceError?
-                                ) {
-                                    super.onReceivedError(view, request, error)
-                                    if (request?.isForMainFrame == true) {
-                                        onWebViewError(
-                                            error?.description?.toString() ?: "Unknown load error",
-                                            request.url?.toString().orEmpty()
-                                        )
-                                    }
-                                }
-
-                                override fun shouldInterceptRequest(
-                                    view: WebView?,
-                                    request: WebResourceRequest?
-                                ): WebResourceResponse? {
-                                    if (request != null) {
-                                        onResourceObserved(request)
-                                    }
-                                    return super.shouldInterceptRequest(view, request)
-                                }
-                            }
-
-                            webChromeClient = object : WebChromeClient() {
-                                override fun onProgressChanged(view: WebView?, newProgress: Int) {
-                                    super.onProgressChanged(view, newProgress)
-                                    onPageProgressChanged(newProgress)
-                                }
-
-                                override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
-                                    if (consoleMessage != null &&
-                                        consoleMessage.messageLevel() == ConsoleMessage.MessageLevel.ERROR
-                                    ) {
-                                        onConsoleLog("ConsoleError: ${consoleMessage.message()}")
-                                    }
-                                    return super.onConsoleMessage(consoleMessage)
-                                }
-                            }
-
-                            createdWebView = this
-                            onWebViewReady(this)
+                    settings.apply {
+                        javaScriptEnabled = true
+                        domStorageEnabled = true
+                        useWideViewPort = true
+                        loadWithOverviewMode = true
+                        builtInZoomControls = true
+                        displayZoomControls = false
+                        mediaPlaybackRequiresUserGesture = false
+                        // Security hardening: restrict local file/content access and mixed content
+                        allowFileAccess = false
+                        allowContentAccess = false
+                        mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            safeBrowsingEnabled = true
                         }
-                    },
-                    update = { webView ->
-                        val desiredUa = if (state.isDesktopMode) {
+                        userAgentString = if (isDesktopMode) {
                             DiagnosticsViewModel.DESKTOP_USER_AGENT
                         } else {
-                            WebSettings.getDefaultUserAgent(webView.context)
+                            defaultMobileUa
                         }
-                        if (webView.settings.userAgentString != desiredUa) {
-                            webView.settings.userAgentString = desiredUa
+                    }
+
+                    addJavascriptInterface(telemetryBridge, TelemetryBridge.BRIDGE_NAME)
+
+                    webViewClient = object : WebViewClient() {
+                        override fun shouldOverrideUrlLoading(
+                            view: WebView?,
+                            request: WebResourceRequest?
+                        ): Boolean {
+                            val uri = request?.url
+                            if (!DiagnosticsViewModel.isAllowedNavigationUri(uri)) {
+                                onBlockedScheme(uri?.toString().orEmpty())
+                                return true
+                            }
+                            return false
                         }
-                    },
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .testTag("diagnostic_webview")
-                )
+
+                        override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                            super.onPageStarted(view, url, favicon)
+                            if (url != null) onPageStarted(url)
+                        }
+
+                        override fun onPageFinished(view: WebView?, url: String?) {
+                            super.onPageFinished(view, url)
+                            if (url != null) onPageFinished(url, view?.title)
+                        }
+
+                        override fun shouldInterceptRequest(
+                            view: WebView?,
+                            request: WebResourceRequest?
+                        ): WebResourceResponse? {
+                            if (request != null) {
+                                onResourceObserved(request)
+                            }
+                            // Passive telemetry only: never alter or block network traffic.
+                            return super.shouldInterceptRequest(view, request)
+                        }
+
+                        override fun onReceivedError(
+                            view: WebView?,
+                            request: WebResourceRequest?,
+                            error: WebResourceError?
+                        ) {
+                            super.onReceivedError(view, request, error)
+                            if (request?.isForMainFrame == true) {
+                                val desc = error?.description?.toString() ?: "Network error"
+                                onWebViewError(desc, request.url?.toString())
+                            }
+                        }
+                    }
+
+                    webChromeClient = object : WebChromeClient() {
+                        override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                            onProgressChanged(newProgress)
+                        }
+
+                        override fun onConsoleMessage(consoleMessage: ConsoleMessage?): Boolean {
+                            if (consoleMessage?.messageLevel() == ConsoleMessage.MessageLevel.ERROR) {
+                                onConsoleError(
+                                    "Console Error (${consoleMessage.lineNumber()}): ${consoleMessage.message()}"
+                                )
+                            }
+                            return super.onConsoleMessage(consoleMessage)
+                        }
+                    }
+
+                    loadUrl(activeUrl)
+                    onWebViewCreated(this)
+                }
             }
+        )
 
-            // Docked Quick Scanner Bar right inside the WebView window (no scrolling needed to tap Scan Next)
-            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
-            val scanner = state.floatScanner
-            Row(
+        // Subtle viewport badge when standing by on about:blank
+        if (activeUrl == "about:blank") {
+            Surface(
+                color = ObsidianSurface.copy(alpha = 0.92f),
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, ObsidianBorder),
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .background(ObsidianSurfaceElevated)
-                    .padding(horizontal = 8.dp, vertical = 6.dp)
-                    .testTag("webview_quick_scan_bar"),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    .align(Alignment.Center)
+                    .padding(24.dp)
             ) {
-                OutlinedButton(
-                    onClick = onCaptureBaseline,
-                    enabled = !scanner.isBusy,
-                    shape = RoundedCornerShape(8.dp),
-                    border = BorderStroke(
-                        1.dp,
-                        if (scanner.baselineCaptured) SignalEmerald.copy(alpha = 0.7f) else ElectricCyan.copy(alpha = 0.85f)
-                    ),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
-                    modifier = Modifier
-                        .heightIn(min = 48.dp)
-                        .testTag("webview_capture_baseline_button")
+                Column(
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    if (scanner.isBusy && !scanner.baselineCaptured) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(15.dp),
-                            strokeWidth = 2.dp,
-                            color = ElectricCyan
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Default.CameraAlt,
-                            contentDescription = null,
-                            tint = if (scanner.baselineCaptured) SignalEmerald else ElectricCyan,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                    Spacer(Modifier.width(5.dp))
                     Text(
-                        text = stringResource(R.string.action_quick_baseline),
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = if (scanner.baselineCaptured) SignalEmerald else ElectricCyan,
-                        maxLines = 1
+                        text = "WebView Container Ready",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = ElectricCyan
                     )
-                }
-
-                Button(
-                    onClick = onScanMovementDeltas,
-                    enabled = !scanner.isBusy && scanner.baselineCaptured,
-                    shape = RoundedCornerShape(8.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = SignalEmerald,
-                        contentColor = OnSignalEmerald,
-                        disabledContainerColor = SignalEmerald.copy(alpha = 0.22f),
-                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
-                    ),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = 48.dp)
-                        .testTag("webview_scan_next_button")
-                ) {
-                    if (scanner.isBusy && scanner.baselineCaptured) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(15.dp),
-                            strokeWidth = 2.dp,
-                            color = OnSignalEmerald
-                        )
-                    } else {
-                        Icon(
-                            imageVector = Icons.Default.DirectionsRun,
-                            contentDescription = null,
-                            modifier = Modifier.size(17.dp)
-                        )
-                    }
-                    Spacer(Modifier.width(6.dp))
-                    val scanNextLabel = if (scanner.scanRound > 0) {
-                        "${stringResource(R.string.action_quick_scan_next)} (${scanner.totalMatchesFound})"
-                    } else {
-                        stringResource(R.string.action_quick_scan_next)
-                    }
                     Text(
-                        text = scanNextLabel,
-                        style = MaterialTheme.typography.labelLarge,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        text = if (isDesktopMode) "Mode: Desktop UA • Hardware Accelerated • Remote Debug OFF"
+                        else "Mode: Mobile UA • Hardware Accelerated • Remote Debug OFF",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                }
-
-                IconButton(
-                    onClick = onResetFloatScan,
-                    enabled = !scanner.isBusy && (scanner.baselineCaptured || scanner.scanRound > 0),
-                    modifier = Modifier
-                        .size(48.dp)
-                        .testTag("webview_reset_scan_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.RestartAlt,
-                        contentDescription = stringResource(R.string.cd_quick_reset_scan),
-                        tint = if (scanner.baselineCaptured || scanner.scanRound > 0) {
-                            MaterialTheme.colorScheme.onSurface
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
-                        },
-                        modifier = Modifier.size(20.dp)
+                    Text(
+                        text = "Enter any https:// URL in the bar above and tap Go.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                 }
             }
         }
     }
+}
+
+private fun copyToClipboard(context: Context, text: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+    clipboard.setPrimaryClip(ClipData.newPlainText("Telemetry Payload", text))
+    Toast.makeText(context, context.getString(R.string.toast_log_copied), Toast.LENGTH_SHORT).show()
+}
+
+private fun shareExportedFile(context: Context, uri: Uri, fileName: String, mimeType: String) {
+    val shareIntent = Intent(Intent.ACTION_SEND).apply {
+        type = mimeType.ifBlank { "text/plain" }
+        putExtra(Intent.EXTRA_STREAM, uri)
+        putExtra(Intent.EXTRA_SUBJECT, "WebView Diagnostics Export: $fileName")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    val chooser = Intent.createChooser(
+        shareIntent,
+        context.getString(R.string.share_report_chooser_title)
+    )
+    runCatching { context.startActivity(chooser) }
 }

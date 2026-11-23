@@ -1,10 +1,9 @@
 package com.example
 
-import android.app.Application
-import android.content.Intent
+import android.content.Context
 import android.net.Uri
 import android.webkit.WebResourceRequest
-import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -20,73 +19,32 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URI
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
-/**
- * One-shot UI / WebView side effects emitted by [DiagnosticsViewModel].
- */
-sealed interface DiagnosticsCommand {
-    data class LoadUrl(val url: String) : DiagnosticsCommand
-    data object Reload : DiagnosticsCommand
-    data class EvaluateJs(val script: String) : DiagnosticsCommand
-    data class ShowToast(val message: String) : DiagnosticsCommand
-    data class ShareFile(val uri: Uri, val mimeType: String, val title: String) : DiagnosticsCommand
+sealed interface DiagnosticsEffect {
+    data class LoadUrl(val url: String) : DiagnosticsEffect
+    data object ReloadWebView : DiagnosticsEffect
+    data class ApplyUserAgent(val desktopMode: Boolean, val reloadAfter: Boolean) : DiagnosticsEffect
+    data class EvaluateJs(val script: String) : DiagnosticsEffect
+    data class ShowToast(val message: String) : DiagnosticsEffect
+    data class ShareReport(val uri: Uri, val fileName: String, val mimeType: String = "application/json") : DiagnosticsEffect
 }
 
-/**
- * Central MVVM ViewModel coordinating the embedded WebView, 200ms direct `window.HEAPF32`
- * coordinate feed, Step 1 isolated Float32Array Movement Delta Scanner, Step 2 `±16` Pointer &
- * Signature Analyzer, Step 3 persistent `SharedPreferences` Auto-Relock, nearby `±50,000` Entity
- * Struct Scanner, passive Binary Asset Mirror, and JSON / TXT log exports.
- */
-class DiagnosticsViewModel(application: Application) : AndroidViewModel(application) {
+class DiagnosticsViewModel : ViewModel() {
 
-    private val lockProfileStore = LockProfileStore(application)
-    private val nextLogId = AtomicLong(1L)
-    private val observedAssetUrls = ConcurrentHashMap.newKeySet<String>()
-    private val pinnedEntityIndices = mutableSetOf<Int>()
-    private var pendingExportTimeoutJob: Job? = null
-    private var pendingAutoRelockJob: Job? = null
-
-    private val _uiState = MutableStateFlow(buildInitialState())
+    private val _uiState = MutableStateFlow(DiagnosticsUiState())
     val uiState: StateFlow<DiagnosticsUiState> = _uiState.asStateFlow()
 
-    private val _commands = MutableSharedFlow<DiagnosticsCommand>(extraBufferCapacity = 32)
-    val commands: SharedFlow<DiagnosticsCommand> = _commands.asSharedFlow()
+    private val _effects = MutableSharedFlow<DiagnosticsEffect>(extraBufferCapacity = 16)
+    val effects: SharedFlow<DiagnosticsEffect> = _effects.asSharedFlow()
 
-    private fun buildInitialState(): DiagnosticsUiState {
-        val saved = lockProfileStore.loadProfile()
-        val autoRelock = lockProfileStore.isAutoRelockEnabled()
-        val initialBase = saved?.baseIndex ?: VERIFIED_PLAYER_BASE_INDEX
-        val initialFeed = DirectHeapFeedState(
-            baseIndex = initialBase,
-            baseIndexInput = initialBase.toString(),
-            lockStatus = LockStatus.UNLOCKED,
-            hasSignature = saved != null,
-            signatureAnchorCount = saved?.anchorCount ?: 0,
-            signatureCapturedAtIndex = saved?.baseIndex,
-            signatureJson = saved?.signatureJson,
-            autoRelockOnReload = autoRelock,
-            statusMessage = if (saved != null) {
-                "Loaded saved lock profile for HEAPF32[${saved.baseIndex}] (${saved.anchorCount} anchors)."
-            } else {
-                "Ready to scan window.HEAPF32 or lock directly onto [$VERIFIED_PLAYER_BASE_INDEX]."
-            }
-        )
-        return DiagnosticsUiState(
-            heapFeed = initialFeed,
-            savedProfile = saved
-        )
-    }
-
-    // -------------------------------------------------------------------------
-    // URL Navigation & WebView Lifecycle
-    // -------------------------------------------------------------------------
+    private val logIdGenerator = AtomicLong(1L)
+    private val seenAssetUrls = LinkedHashSet<String>()
+    private var pendingExportJob: Job? = null
+    private var pendingExportContext: Context? = null
 
     fun onUrlInputChanged(input: String) {
         _uiState.update { it.copy(urlInput = input) }
@@ -94,529 +52,1353 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
 
     fun onLoadUrlRequested() {
         val raw = _uiState.value.urlInput
-        when (val result = normalizeAndValidateUrl(raw)) {
+        when (val validation = normalizeAndValidateUrl(raw)) {
             is UrlValidationResult.Valid -> {
-                _uiState.update { it.copy(urlInput = result.normalizedUrl) }
-                appendLog(LogCategory.SYSTEM, "Loading ${result.normalizedUrl}", result.normalizedUrl)
-                _commands.tryEmit(DiagnosticsCommand.LoadUrl(result.normalizedUrl))
+                val targetUrl = validation.normalizedUrl
+                seenAssetUrls.clear()
+                _uiState.update {
+                    it.copy(
+                        urlInput = if (targetUrl == "about:blank") "" else targetUrl,
+                        activeUrl = targetUrl,
+                        scanStatus = AsyncScanStatus.IDLE,
+                        scanStatusDetail = "",
+                        step1Completed = false,
+                        customGlobals = emptyList(),
+                        detectedGameNamespaces = emptyList(),
+                        step1DurationMs = null,
+                        scopeBatchProgress = ScopeBatchProgress(),
+                        lastManualQuerySummary = "",
+                        baselineCaptured = false,
+                        baselineMetricCount = 0,
+                        isolatedPaths = emptyList(),
+                        discoveredPlayerPath = null,
+                        playerPropertyKeys = "",
+                        livePlayerCoords = null,
+                        livePollActive = false,
+                        livePollTickCount = 0,
+                        discoveredEntityArrayPath = null,
+                        entityProjectionMode = "",
+                        entityViewportWidth = 0,
+                        entityViewportHeight = 0,
+                        discoveredEntities = emptyList(),
+                        lastEntityCount = 0,
+                        wasmHeap = WasmHeapTrackerState(),
+                        wasmFloatDelta = WasmFloatDeltaState(),
+                        interceptedAssets = emptyList(),
+                        estimatedFps = null,
+                        canvasCount = 0
+                    )
+                }
+                appendLog(LogCategory.SYSTEM, "Navigating to $targetUrl", targetUrl)
+                _effects.tryEmit(DiagnosticsEffect.LoadUrl(targetUrl))
             }
             is UrlValidationResult.Invalid -> {
-                appendLog(LogCategory.ERROR, "Invalid URL: ${result.reason}", raw)
-                _commands.tryEmit(DiagnosticsCommand.ShowToast(result.reason))
+                appendLog(LogCategory.ERROR, "Blocked invalid URL", validation.reason)
+                _effects.tryEmit(DiagnosticsEffect.ShowToast(validation.reason))
             }
         }
     }
 
     fun onReloadRequested() {
-        pendingAutoRelockJob?.cancel()
-        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildResetFloatScanScript()))
-        _uiState.update { current ->
-            current.copy(
-                floatScanner = FloatDeltaScannerState(
-                    statusMessage = "Page reloading — stand still and capture a fresh isolated baseline once loaded."
-                ),
-                heapFeed = current.heapFeed.copy(
-                    lockStatus = LockStatus.UNLOCKED,
-                    isPolling = false,
-                    isHeapReady = false,
-                    isRelocking = false
+        val current = _uiState.value.activeUrl
+        _uiState.update {
+            it.copy(
+                livePollActive = false,
+                wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false),
+                wasmFloatDelta = it.wasmFloatDelta.copy(
+                    isLiveWatching = false,
+                    isSamplingBaseline = false,
+                    isScanningDeltas = false,
+                    isScanningPointers = false,
+                    lockedCoords = it.wasmFloatDelta.lockedCoords?.copy(isLivePolling = false)
                 )
             )
         }
-        appendLog(LogCategory.SYSTEM, "Reloading WebView and clearing float baseline", _uiState.value.activeUrl)
-        _commands.tryEmit(DiagnosticsCommand.Reload)
+        appendLog(LogCategory.SYSTEM, "Reloading $current", current)
+        _effects.tryEmit(DiagnosticsEffect.ReloadWebView)
     }
 
     fun onToggleDesktopMode() {
-        val next = !_uiState.value.isDesktopMode
-        _uiState.update { it.copy(isDesktopMode = next) }
-        val modeLabel = if (next) "Desktop User-Agent" else "Mobile User-Agent"
-        appendLog(LogCategory.SYSTEM, "Switched to $modeLabel", "Reload page to apply updated User-Agent.")
-        _commands.tryEmit(DiagnosticsCommand.ShowToast("$modeLabel enabled — tap Reload to apply"))
-    }
-
-    fun onPageStarted(url: String) {
-        pendingAutoRelockJob?.cancel()
-        _uiState.update { current ->
-            current.copy(
-                activeUrl = url.ifBlank { current.activeUrl },
-                urlInput = if (url.startsWith("http", ignoreCase = true)) url else current.urlInput,
-                isLoading = true,
-                loadProgress = 10,
-                floatScanner = FloatDeltaScannerState(
-                    statusMessage = "Stand still, tap '1. Capture Standing Baseline', move in-game, stop, then tap '2. Scan Movement Deltas'."
-                ),
-                heapFeed = current.heapFeed.copy(
-                    lockStatus = LockStatus.UNLOCKED,
-                    isPolling = false,
-                    isHeapReady = false,
-                    isRelocking = false
-                )
-            )
-        }
-    }
-
-    fun onPageProgressChanged(progress: Int) {
-        _uiState.update { current ->
-            current.copy(
-                loadProgress = progress.coerceIn(0, 100),
-                isLoading = progress < 100
-            )
-        }
-    }
-
-    fun onPageFinished(url: String, title: String) {
-        _uiState.update { current ->
-            current.copy(
-                activeUrl = url.ifBlank { current.activeUrl },
-                pageTitle = title,
-                isLoading = false,
-                loadProgress = 100
-            )
-        }
-        if (url.isBlank() || url.equals("about:blank", ignoreCase = true)) return
-
-        appendLog(LogCategory.SYSTEM, "Page loaded: ${title.ifBlank { url }}", url)
-
-        val state = _uiState.value
-        val saved = state.savedProfile
-        if (saved != null && state.heapFeed.autoRelockOnReload) {
-            pendingAutoRelockJob?.cancel()
-            pendingAutoRelockJob = viewModelScope.launch {
-                delay(1_200L)
-                autoRelockCoordinates(isAutomatic = true)
-            }
-        }
-    }
-
-    fun onWebViewError(description: String, failingUrl: String) {
-        _uiState.update { it.copy(isLoading = false) }
-        appendLog(LogCategory.ERROR, "WebView error: $description", failingUrl)
-    }
-
-    // -------------------------------------------------------------------------
-    // Direct 200ms WASM Heap Feed & Step 3 Auto-Relock
-    // -------------------------------------------------------------------------
-
-    fun startDirectHeapFeed() {
-        val base = _uiState.value.heapFeed.baseIndex
-        _uiState.update { current ->
-            current.copy(
-                heapFeed = current.heapFeed.copy(
-                    isPolling = true,
-                    statusMessage = "Connecting 200ms direct feed to HEAPF32[$base]…"
-                )
-            )
-        }
-        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildStartDirectHeapFeedScript(base)))
-    }
-
-    fun pauseDirectHeapFeed() {
-        _uiState.update { current ->
-            current.copy(
-                heapFeed = current.heapFeed.copy(
-                    isPolling = false,
-                    statusMessage = "Direct 200ms feed paused."
-                )
-            )
-        }
-        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildPauseDirectHeapFeedScript()))
-    }
-
-    fun onToggleAutoRelockOnReload() {
-        val next = !_uiState.value.heapFeed.autoRelockOnReload
-        lockProfileStore.setAutoRelockEnabled(next)
-        _uiState.update { current ->
-            val updatedSaved = current.savedProfile?.copy(autoRelockOnReload = next)
-            if (updatedSaved != null) {
-                lockProfileStore.saveProfile(updatedSaved)
-            }
-            current.copy(
-                savedProfile = updatedSaved,
-                heapFeed = current.heapFeed.copy(autoRelockOnReload = next)
-            )
-        }
-        appendLog(
-            LogCategory.RELOCK,
-            "Auto-Relock on reload ${if (next) "enabled" else "disabled"}",
-            "autoRelockOnReload=$next"
-        )
-    }
-
-    fun autoRelockCoordinates(isAutomatic: Boolean = false) {
-        val state = _uiState.value
-        val saved = state.savedProfile
-        val signatureJson = saved?.signatureJson
-            ?: state.pointerAnalysis.signatureJson
-            ?: state.heapFeed.signatureJson
-
-        if (signatureJson.isNullOrBlank()) {
-            val msg = "No saved struct signature yet. Run Step 1 Scanner & Step 2 Save & Lock Profile first."
-            appendLog(LogCategory.RELOCK, "Auto-Relock skipped (no saved signature)", msg)
-            if (!isAutomatic) {
-                _commands.tryEmit(DiagnosticsCommand.ShowToast(msg))
-            }
-            return
-        }
-
-        val preferredIndex = saved?.baseIndex ?: state.heapFeed.baseIndex
-        val pointers = saved?.parentPointers ?: state.pointerAnalysis.parentPointers
-        val pointersJson = serializeParentPointers(pointers)
-
-        _uiState.update { current ->
-            current.copy(
-                scanStatus = AsyncScanStatus.RUNNING,
-                scanStatusDetail = if (isAutomatic) "Auto-relocking after reload…" else "Relocking saved signature…",
-                heapFeed = current.heapFeed.copy(
-                    lockStatus = LockStatus.RELOCKING,
-                    isRelocking = true,
-                    statusMessage = "Scanning HEAPU32 / HEAPF32 for saved struct signature…"
-                )
-            )
-        }
-
-        appendLog(
-            LogCategory.RELOCK,
-            if (isAutomatic) "Triggered automatic relock on page load" else "Triggered manual Auto-Relock",
-            "preferredIndex=$preferredIndex, savedPointers=${pointers.size}"
-        )
-
-        _commands.tryEmit(
-            DiagnosticsCommand.EvaluateJs(
-                WasmHeapScripts.buildAutoRelockScript(
-                    signatureJson = signatureJson,
-                    preferredBaseIndex = preferredIndex,
-                    parentPointersJson = pointersJson
-                )
+        val nextDesktop = !_uiState.value.isDesktopMode
+        _uiState.update { it.copy(isDesktopMode = nextDesktop) }
+        val modeLabel = if (nextDesktop) "Desktop User-Agent" else "Mobile User-Agent"
+        appendLog(LogCategory.SYSTEM, "Switched to $modeLabel", modeLabel)
+        _effects.tryEmit(
+            DiagnosticsEffect.ApplyUserAgent(
+                desktopMode = nextDesktop,
+                reloadAfter = _uiState.value.activeUrl != "about:blank"
             )
         )
     }
-
-    // -------------------------------------------------------------------------
-    // Step 1: Movement Float Delta Scanner
-    // -------------------------------------------------------------------------
-
-    fun captureStandingBaseline() {
-        _uiState.update { current ->
-            current.copy(
-                scanStatus = AsyncScanStatus.RUNNING,
-                scanStatusDetail = "Cloning isolated Float32Array baseline…",
-                floatScanner = current.floatScanner.copy(
-                    isBusy = true,
-                    statusMessage = "Cloning isolated window.HEAPF32 snapshot (read-only)…"
-                )
-            )
-        }
-        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildCaptureFloatBaselineScript()))
-    }
-
-    fun scanMovementDeltas() {
-        if (!_uiState.value.floatScanner.baselineCaptured) {
-            _commands.tryEmit(DiagnosticsCommand.ShowToast("Capture Standing Baseline first."))
-            return
-        }
-        _uiState.update { current ->
-            current.copy(
-                scanStatus = AsyncScanStatus.RUNNING,
-                scanStatusDetail = "Scanning movement deltas (0.02..500.0)…",
-                floatScanner = current.floatScanner.copy(
-                    isBusy = true,
-                    statusMessage = "Comparing live HEAPF32 against isolated baseline clone…"
-                )
-            )
-        }
-        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildScanMovementDeltasScript()))
-    }
-
-    fun resetFloatScan() {
-        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildResetFloatScanScript()))
-        _uiState.update { current ->
-            current.copy(
-                floatScanner = FloatDeltaScannerState()
-            )
-        }
-        appendLog(LogCategory.SCAN, "Reset float delta scanner", "Cleared isolated baseline clone and candidate list.")
-    }
-
-    fun inspectAndLockCandidate(baseIndex: Int) {
-        val safeBase = baseIndex.coerceAtLeast(0)
-        _uiState.update { current ->
-            current.copy(
-                activeConsoleTab = ConsoleTab.ANALYZER,
-                scanStatus = AsyncScanStatus.RUNNING,
-                scanStatusDetail = "Inspecting ±16 block @ [$safeBase]…",
-                heapFeed = current.heapFeed.copy(
-                    baseIndex = safeBase,
-                    baseIndexInput = safeBase.toString(),
-                    lockStatus = LockStatus.LOCKED,
-                    isPolling = true,
-                    statusMessage = "Locked onto window.HEAPF32[$safeBase..${safeBase + 2}]"
-                ),
-                pointerAnalysis = current.pointerAnalysis.copy(
-                    inspectedBaseIndex = safeBase,
-                    inspectedByteAddress = safeBase.toLong() * 4L,
-                    isAnalyzing = true,
-                    errorMessage = null
-                )
-            )
-        }
-        appendLog(
-            LogCategory.PTR,
-            "Inspecting & locking HEAPF32[$safeBase] (${formatHexAddress(safeBase.toLong() * 4L)})",
-            "baseIndex=$safeBase"
-        )
-        _commands.tryEmit(
-            DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildAnalyzePointerSignatureScript(safeBase))
-        )
-    }
-
-    // -------------------------------------------------------------------------
-    // Step 2: Manual Base Index, Pointer & Signature Lock Profile
-    // -------------------------------------------------------------------------
-
-    fun onBaseIndexInputChanged(input: String) {
-        val digitsOnly = input.filter { it.isDigit() }.take(10)
-        _uiState.update { current ->
-            current.copy(heapFeed = current.heapFeed.copy(baseIndexInput = digitsOnly))
-        }
-    }
-
-    fun onApplyBaseIndex() {
-        val parsed = _uiState.value.heapFeed.baseIndexInput.trim().toIntOrNull()
-        if (parsed == null || parsed < 0) {
-            _commands.tryEmit(DiagnosticsCommand.ShowToast("Enter a valid non-negative HEAPF32 index."))
-            return
-        }
-        _uiState.update { current ->
-            current.copy(
-                heapFeed = current.heapFeed.copy(
-                    baseIndex = parsed,
-                    baseIndexInput = parsed.toString(),
-                    lockStatus = LockStatus.LOCKED,
-                    isPolling = true
-                )
-            )
-        }
-        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildStartDirectHeapFeedScript(parsed)))
-    }
-
-    fun onResetToVerifiedBaseIndex() {
-        _uiState.update { current ->
-            current.copy(
-                heapFeed = current.heapFeed.copy(
-                    baseIndex = VERIFIED_PLAYER_BASE_INDEX,
-                    baseIndexInput = VERIFIED_PLAYER_BASE_INDEX.toString(),
-                    isPolling = true
-                )
-            )
-        }
-        _commands.tryEmit(
-            DiagnosticsCommand.EvaluateJs(
-                WasmHeapScripts.buildStartDirectHeapFeedScript(VERIFIED_PLAYER_BASE_INDEX)
-            )
-        )
-    }
-
-    fun saveAndLockProfile() {
-        val state = _uiState.value
-        val analysis = state.pointerAnalysis
-        val sigJson = analysis.signatureJson ?: state.heapFeed.signatureJson
-        if (sigJson.isNullOrBlank()) {
-            _commands.tryEmit(DiagnosticsCommand.ShowToast("Analyze a ±16 block first to capture a signature."))
-            return
-        }
-        val baseIdx = analysis.inspectedBaseIndex ?: state.heapFeed.baseIndex
-        val host = extractHost(state.activeUrl)
-        val profile = SavedLockProfile(
-            baseIndex = baseIdx,
-            host = host,
-            aobPatternHex = analysis.aobPatternHex,
-            floatPatternSummary = analysis.floatPatternSummary,
-            anchorCount = analysis.anchorCount.coerceAtLeast(state.heapFeed.signatureAnchorCount),
-            signatureJson = sigJson,
-            parentPointers = analysis.parentPointers,
-            autoRelockOnReload = state.heapFeed.autoRelockOnReload,
-            savedAtEpochMs = System.currentTimeMillis()
-        )
-        lockProfileStore.saveProfile(profile)
-
-        _uiState.update { current ->
-            current.copy(
-                savedProfile = profile,
-                heapFeed = current.heapFeed.copy(
-                    baseIndex = baseIdx,
-                    baseIndexInput = baseIdx.toString(),
-                    lockStatus = LockStatus.LOCKED,
-                    hasSignature = true,
-                    signatureAnchorCount = profile.anchorCount,
-                    signatureCapturedAtIndex = baseIdx,
-                    signatureJson = sigJson,
-                    statusMessage = "Profile saved & locked @ HEAPF32[$baseIdx] (${profile.anchorCount} anchors)."
-                )
-            )
-        }
-        appendLog(
-            LogCategory.PTR,
-            "Saved persistent lock profile @ [$baseIdx] (${profile.anchorCount} anchors, ${profile.parentPointers.size} ptrs)",
-            "host=$host\nAOB=${profile.aobPatternHex}"
-        )
-        _commands.tryEmit(DiagnosticsCommand.ShowToast("Lock profile saved for auto-relock across reloads"))
-    }
-
-    fun clearSavedProfile() {
-        lockProfileStore.clearProfile()
-        _uiState.update { current ->
-            current.copy(
-                savedProfile = null,
-                heapFeed = current.heapFeed.copy(
-                    lockStatus = LockStatus.UNLOCKED,
-                    hasSignature = false,
-                    signatureAnchorCount = 0,
-                    signatureCapturedAtIndex = null,
-                    signatureJson = null,
-                    lastRelockSummary = "",
-                    relockConfidencePercent = 0,
-                    relockMethodUsed = "",
-                    statusMessage = "Cleared saved lock profile."
-                )
-            )
-        }
-        appendLog(LogCategory.PTR, "Cleared saved lock profile from SharedPreferences", "")
-        _commands.tryEmit(DiagnosticsCommand.ShowToast("Saved lock profile cleared"))
-    }
-
-    // -------------------------------------------------------------------------
-    // Nearby Entity Struct Scanner
-    // -------------------------------------------------------------------------
-
-    fun scanNearbyEntities() {
-        val state = _uiState.value
-        val baseIdx = state.heapFeed.baseIndex
-        val radius = state.entityScanRadius
-        _uiState.update { current ->
-            current.copy(
-                activeConsoleTab = ConsoleTab.ENTITIES,
-                isScanningEntities = true,
-                scanStatus = AsyncScanStatus.RUNNING,
-                scanStatusDetail = "Scanning ±$radius around [$baseIdx]…"
-            )
-        }
-        _commands.tryEmit(
-            DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildScanNearbyEntitiesScript(baseIdx, radius))
-        )
-    }
-
-    fun onTogglePinEntity(baseIndex: Int) {
-        if (!pinnedEntityIndices.add(baseIndex)) {
-            pinnedEntityIndices.remove(baseIndex)
-        }
-        _uiState.update { current ->
-            val updated = current.discoveredEntities.map { entity ->
-                if (entity.baseIndex == baseIndex) {
-                    entity.copy(isPinned = baseIndex in pinnedEntityIndices)
-                } else {
-                    entity
-                }
-            }.sortedWith(
-                compareByDescending<NearbyEntityStruct> { it.isPinned }
-                    .thenByDescending { it.confidenceScore }
-                    .thenBy { it.distanceToPlayer }
-            )
-            current.copy(discoveredEntities = updated)
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Passive Binary Asset Interception & Local Inspection
-    // -------------------------------------------------------------------------
-
-    fun onResourceRequestObserved(request: WebResourceRequest) {
-        val uri = request.url ?: return
-        val fullUrl = uri.toString()
-        val pathLower = uri.path?.lowercase(Locale.US).orEmpty()
-        val ext = matchTrackedAssetExtension(pathLower) ?: return
-        if (!observedAssetUrls.add(fullUrl)) return
-
-        val fileName = BinaryAssetInspector.extractFileName(fullUrl, ext)
-        val shouldMirror = BinaryAssetInspector.shouldCaptureLocally(ext)
-        val initialAsset = InterceptedAsset(
-            url = fullUrl,
-            extension = ext,
-            method = request.method ?: "GET",
-            timestamp = nowTimeLabel(),
-            isForMainFrame = request.isForMainFrame,
-            fileName = fileName,
-            captureStatus = if (shouldMirror) AssetCaptureStatus.CACHING else AssetCaptureStatus.OBSERVED
-        )
-
-        _uiState.update { current ->
-            val nextAssets = (listOf(initialAsset) + current.interceptedAssets).take(MAX_TRACKED_ASSETS)
-            current.copy(interceptedAssets = nextAssets)
-        }
-        appendLog(LogCategory.ASSET, "Observed $ext asset: $fileName", fullUrl)
-
-        if (shouldMirror) {
-            val appCtx = getApplication<Application>()
-            val ua = if (_uiState.value.isDesktopMode) DESKTOP_USER_AGENT else "WebViewDiagnosticsApp/1.0"
-            val referer = _uiState.value.activeUrl
-            viewModelScope.launch(Dispatchers.IO) {
-                val inspected = BinaryAssetInspector.fetchSaveAndInspect(
-                    context = appCtx,
-                    asset = initialAsset,
-                    userAgent = ua,
-                    refererUrl = referer
-                )
-                withContext(Dispatchers.Main) {
-                    _uiState.update { current ->
-                        current.copy(
-                            interceptedAssets = current.interceptedAssets.map { item ->
-                                if (item.url == inspected.url) inspected else item
-                            }
-                        )
-                    }
-                    if (inspected.captureStatus == AssetCaptureStatus.CAPTURED) {
-                        appendLog(
-                            LogCategory.ASSET,
-                            "Cached $fileName (${BinaryAssetInspector.formatBytes(inspected.byteSize)})",
-                            inspected.structuralSummary
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    fun onClearAssetCache() {
-        val appCtx = getApplication<Application>()
-        viewModelScope.launch(Dispatchers.IO) {
-            val deleted = BinaryAssetInspector.clearLocalCache(appCtx)
-            withContext(Dispatchers.Main) {
-                observedAssetUrls.clear()
-                _uiState.update { it.copy(interceptedAssets = emptyList()) }
-                appendLog(LogCategory.ASSET, "Cleared local asset cache ($deleted files)", "")
-                _commands.tryEmit(DiagnosticsCommand.ShowToast("Cleared $deleted cached assets"))
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Console Tabs, UI Toggles, Manual JS & Rolling Logs
-    // -------------------------------------------------------------------------
 
     fun onSelectConsoleTab(tab: ConsoleTab) {
         _uiState.update { it.copy(activeConsoleTab = tab) }
     }
 
-    fun onToggleJsDrawer() {
-        _uiState.update { it.copy(isJsDrawerOpen = !it.isJsDrawerOpen) }
+    fun onPageStarted(url: String) {
+        _uiState.update {
+            it.copy(
+                activeUrl = url,
+                urlInput = if (url == "about:blank") it.urlInput else url,
+                isLoading = true,
+                loadProgress = 10,
+                livePollActive = false,
+                wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false),
+                wasmFloatDelta = it.wasmFloatDelta.copy(
+                    isLiveWatching = false,
+                    isSamplingBaseline = false,
+                    isScanningDeltas = false,
+                    isScanningPointers = false,
+                    lockedCoords = it.wasmFloatDelta.lockedCoords?.copy(isLivePolling = false)
+                )
+            )
+        }
     }
 
-    fun onToggleTelemetryStreamExpanded() {
-        _uiState.update { it.copy(isTelemetryStreamExpanded = !it.isTelemetryStreamExpanded) }
+    fun onPageFinished(url: String, title: String?) {
+        _uiState.update {
+            it.copy(
+                activeUrl = url,
+                pageTitle = title.orEmpty(),
+                isLoading = false,
+                loadProgress = 100
+            )
+        }
+        if (url != "about:blank") {
+            appendLog(
+                LogCategory.SYSTEM,
+                "Page ready: ${title?.takeIf { it.isNotBlank() } ?: url}",
+                url
+            )
+        }
     }
 
-    fun onToggleWebViewExpanded() {
-        _uiState.update { it.copy(isWebViewExpanded = !it.isWebViewExpanded) }
+    fun onProgressChanged(progress: Int) {
+        _uiState.update {
+            it.copy(
+                loadProgress = progress.coerceIn(0, 100),
+                isLoading = progress in 1..99
+            )
+        }
+    }
+
+    fun onWebViewError(description: String, failingUrl: String?) {
+        appendLog(
+            LogCategory.ERROR,
+            "WebView load error: $description",
+            failingUrl ?: _uiState.value.activeUrl
+        )
+    }
+
+    fun onBlockedSchemeAttempt(url: String) {
+        appendLog(LogCategory.ERROR, "Blocked disallowed URI scheme navigation", url)
+    }
+
+    fun onScanStatusChanged(status: AsyncScanStatus, detail: String) {
+        _uiState.update {
+            it.copy(
+                scanStatus = status,
+                scanStatusDetail = detail
+            )
+        }
+    }
+
+    fun onBatchProgressChanged(progress: ScopeBatchProgress) {
+        _uiState.update { state ->
+            val nextStatus = when {
+                progress.isPaused -> AsyncScanStatus.PAUSED
+                progress.isActive -> AsyncScanStatus.RUNNING
+                progress.totalBatches > 0 && progress.currentBatch >= progress.totalBatches -> AsyncScanStatus.COMPLETED
+                else -> state.scanStatus
+            }
+            state.copy(
+                scopeBatchProgress = progress,
+                scanStatus = nextStatus,
+                scanStatusDetail = progress.statusText.ifBlank { state.scanStatusDetail }
+            )
+        }
+    }
+
+    fun onPlayerCoordsUpdated(path: String, x: Double, y: Double, z: Double) {
+        _uiState.update { state ->
+            state.copy(
+                discoveredPlayerPath = state.discoveredPlayerPath ?: path,
+                livePollActive = true,
+                livePollTickCount = state.livePollTickCount + 1,
+                livePlayerCoords = PlayerCoordinates(
+                    path = path,
+                    x = x,
+                    y = y,
+                    z = z,
+                    updatedAtMs = System.currentTimeMillis()
+                )
+            )
+        }
+    }
+
+    // Multi-Scan Candidate Staging Buffer Actions
+    fun onTogglePinCandidate(path: String) {
+        _uiState.update { state ->
+            val updated = state.stagingBuffer.map { item ->
+                if (item.path == path) item.copy(isPinned = !item.isPinned) else item
+            }
+            state.copy(stagingBuffer = sortStagingBuffer(updated))
+        }
+    }
+
+    fun onTogglePinnedOnlyFilter() {
+        _uiState.update { it.copy(showPinnedOnly = !it.showPinnedOnly) }
+    }
+
+    fun onStagingSearchQueryChanged(query: String) {
+        _uiState.update { it.copy(stagingSearchQuery = query) }
+    }
+
+    fun onClearUnpinnedCandidates() {
+        _uiState.update { state ->
+            state.copy(stagingBuffer = state.stagingBuffer.filter { it.isPinned })
+        }
+    }
+
+    fun onPinExternalPath(path: String, sourceStep: String, detail: String) {
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        _uiState.update { state ->
+            val nextScan = state.scanCounter.coerceAtLeast(1)
+            val merged = mergeIntoStagingBuffer(
+                existing = state.stagingBuffer,
+                incoming = listOf(path to detail),
+                sourceStep = sourceStep,
+                scanNumber = nextScan,
+                timestamp = nowTs,
+                forcePin = true
+            )
+            state.copy(stagingBuffer = merged)
+        }
+        _effects.tryEmit(DiagnosticsEffect.ShowToast("Pinned to Staging: $path"))
+    }
+
+    fun onLockCandidateForLivePolling(candidatePath: String) {
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Binding live 200ms ref: $candidatePath")
+        appendLog(
+            LogCategory.DELTA,
+            "Binding live 200ms reference to $candidatePath…",
+            candidatePath
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildLockCandidateRefScript(candidatePath)))
+    }
+
+    // Step 1: Non-Blocking 100-Item Batched Global Variable Inspection (with Pause / Resume)
+    fun runStep1InspectScope() {
+        _uiState.update {
+            it.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Starting batched global scan (100/batch)…",
+                scopeBatchProgress = ScopeBatchProgress(
+                    isActive = true,
+                    isPaused = false,
+                    currentBatch = 1,
+                    totalBatches = 1,
+                    itemStart = 1,
+                    itemEnd = 100,
+                    totalItems = 100,
+                    foundCount = 0
+                )
+            )
+        }
+        appendLog(
+            LogCategory.SCOPE,
+            "Step 1: Starting batched global scan (100 items/batch)…",
+            "Processing window keys in staggered async batches of 100 items; custom globals stream live into Staging"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildInspectGlobalScopeScript()))
+    }
+
+    fun pauseStep1BatchScan() {
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.PAUSED,
+                scopeBatchProgress = state.scopeBatchProgress.copy(isPaused = true)
+            )
+        }
+        appendLog(LogCategory.SCOPE, "Step 1: Paused batched scan", "You can search/pin staged items and resume anytime.")
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildPauseScopeScanScript()))
+    }
+
+    fun resumeStep1BatchScan() {
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scopeBatchProgress = state.scopeBatchProgress.copy(isPaused = false)
+            )
+        }
+        appendLog(LogCategory.SCOPE, "Step 1: Resumed batched scan", "Continuing remaining 100-item batches…")
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildResumeScopeScanScript()))
+    }
+
+    // Step 1 Manual Property Inspector (fallback for closure-scoped or known custom paths)
+    fun onManualPathInputChanged(input: String) {
+        _uiState.update { it.copy(manualPropertyPathInput = input) }
+    }
+
+    fun onQueryManualPropertyPath(overridePath: String? = null) {
+        val targetPath = (overridePath ?: _uiState.value.manualPropertyPathInput).trim()
+        if (targetPath.isEmpty()) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Enter a path like game.player or window.AppInstance"))
+            return
+        }
+        if (overridePath != null) {
+            _uiState.update { it.copy(manualPropertyPathInput = targetPath) }
+        }
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Querying path: $targetPath…")
+        appendLog(
+            LogCategory.SCOPE,
+            "Manual Path Query: $targetPath",
+            "Inspecting property path directly on window and staging if resolved"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildQueryPropertyPathScript(targetPath)))
+    }
+
+    // Step 2A: Capture Standing Baseline
+    fun runStep2ACaptureBaseline() {
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2A: Capturing standing baseline…")
+        appendLog(
+            LogCategory.DELTA,
+            "Step 2A: Capturing standing baseline…",
+            "Snapshotting numeric properties across filtered custom globals"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildCaptureBaselineScript()))
+    }
+
+    // Step 2B: Isolate Player Coords + start 200ms direct object-reference polling
+    fun runStep2BComputeDelta() {
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 2B: Isolating live reference…")
+        appendLog(
+            LogCategory.DELTA,
+            "Step 2B: Isolating live player object reference…",
+            "Comparing live runtime state against standing baseline and starting 200ms direct-reference polling"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildComputeDeltaScript()))
+    }
+
+    // Step 3: Player-Anchored Visual Entity Discovery
+    fun runStep3ScanEntities() {
+        val anchor = _uiState.value.discoveredPlayerPath
+        if (anchor.isNullOrBlank()) {
+            val msg = "Complete Step 2B first (or lock a Staging candidate) so Step 3 can anchor to your player coordinates."
+            appendLog(LogCategory.ENTITY, msg, msg)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 3: Climbing parent tree from $anchor…")
+        appendLog(
+            LogCategory.ENTITY,
+            "Step 3: Scanning sibling entity collections anchored to $anchor…",
+            "Climbing 1–3 parent levels up from $anchor to inspect sibling Arrays/Maps/Sets & project to 2D canvas"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildScanEntitiesScript(anchor)))
+    }
+
+    // Targeted WebAssembly Heap Value-Tracker (Read-Only HP / Stat Scanner & ±16B Neighbor Inspector)
+    fun onWasmTargetValueChanged(input: String) {
+        val sanitized = input.filter { it.isDigit() || it == '.' || it == '-' }.take(18)
+        _uiState.update { state ->
+            state.copy(wasmHeap = state.wasmHeap.copy(targetValueInput = sanitized))
+        }
+    }
+
+    fun runWasmHeapInitialScan() {
+        val raw = _uiState.value.wasmHeap.targetValueInput.trim()
+        val parsed = raw.toDoubleOrNull()
+        if (parsed == null || !parsed.isFinite()) {
+            val msg = "Enter a valid current HP / stat number (e.g. 4338) first."
+            appendLog(LogCategory.WASM, msg, raw)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Scanning HEAP32 / HEAPF32 for $raw…",
+                wasmHeap = state.wasmHeap.copy(
+                    isScanning = true,
+                    initialSearchValue = parsed,
+                    lastFilterValue = null,
+                    filterRound = 0,
+                    isolatedHeapType = null,
+                    isolatedIndex = null,
+                    isolatedByteAddress = null,
+                    isolatedCurrentValue = "",
+                    isNeighborPolling = false,
+                    neighborPollTickCount = 0,
+                    neighborFloats = emptyList(),
+                    statusMessage = "Scanning HEAP32 / HEAPF32 in non-blocking 1 MB chunks for $raw…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "WASM Heap Scan: Searching HEAP32 & HEAPF32 for $raw…",
+            "Target value: $parsed"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildInitialScanScript(parsed)))
+    }
+
+    fun runWasmHeapFilterDelta() {
+        val raw = _uiState.value.wasmHeap.targetValueInput.trim()
+        val parsed = raw.toDoubleOrNull()
+        if (parsed == null || !parsed.isFinite()) {
+            val msg = "Enter your updated HP value after taking damage or healing, then tap Filter."
+            appendLog(LogCategory.WASM, msg, raw)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        if (_uiState.value.wasmHeap.totalMatches <= 0) {
+            val msg = "Run '1. Scan HEAP32 / F32' with your initial HP value first."
+            appendLog(LogCategory.WASM, msg, msg)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Filtering WASM matches for new value $raw…",
+                wasmHeap = state.wasmHeap.copy(
+                    isScanning = true,
+                    lastFilterValue = parsed,
+                    statusMessage = "Filtering ${_uiState.value.wasmHeap.totalMatches} stored addresses for new value $raw…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "WASM Value-Delta Filter: Narrowing matches to $raw…",
+            "Updated target value: $parsed"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildFilterDeltaScript(parsed)))
+    }
+
+    fun onInspectWasmCandidate(heapType: String, index: Int) {
+        val hexAddr = formatHexAddress(index.toLong() * 4L)
+        _uiState.update { state ->
+            state.copy(
+                wasmHeap = state.wasmHeap.copy(
+                    isolatedHeapType = heapType,
+                    isolatedIndex = index,
+                    isolatedByteAddress = index.toLong() * 4L,
+                    isNeighborPolling = true,
+                    neighborPollTickCount = 0,
+                    neighborFloats = emptyList(),
+                    statusMessage = "Polling ±16B around $heapType[$index] ($hexAddr) every 200ms…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "Locked WASM Neighbor Inspector on $heapType[$index] ($hexAddr)",
+            "Reading ±4 to ±16 byte floats every 200ms"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildInspectNeighborsScript(heapType, index)))
+    }
+
+    fun onStopWasmNeighborPolling() {
+        _uiState.update { state ->
+            state.copy(
+                wasmHeap = state.wasmHeap.copy(
+                    isNeighborPolling = false,
+                    statusMessage = "Paused neighbor polling (memory map still ready to export)."
+                )
+            )
+        }
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildStopNeighborPollScript()))
+    }
+
+    fun onResetWasmHeapTracker() {
+        _uiState.update { state ->
+            state.copy(wasmHeap = WasmHeapTrackerState())
+        }
+        appendLog(LogCategory.WASM, "Reset WASM Heap Value-Tracker", "Cleared stored candidate indices and stopped neighbor polling")
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildResetTrackerScript()))
+    }
+
+    fun onWasmNeighborsUpdatedFromBridge(jsonPayload: String) {
+        val json = try {
+            JSONObject(jsonPayload)
+        } catch (_: Exception) {
+            return
+        }
+        if (json.optString("stage", "") != "WASM_NEIGHBORS_TICK") return
+
+        val heapType = json.optString("heapType", "HEAP32")
+        val isolatedIndex = json.optInt("isolatedIndex", -1)
+        if (isolatedIndex < 0) return
+        val isolatedByteAddress = json.optLong("isolatedByteAddress", isolatedIndex.toLong() * 4L)
+        val currentVal = json.optString("currentValue", "")
+        val tick = json.optInt("tick", 1)
+        val sourceLabel = json.optString("heapSourceLabel", "")
+        val byteLen = json.optLong("heapByteLength", 0L)
+        val neighborsArr = json.optJSONArray("neighbors") ?: JSONArray()
+
+        _uiState.update { state ->
+            val prevWasm = state.wasmHeap
+            val isSameAnchor = prevWasm.isolatedIndex == isolatedIndex && prevWasm.isolatedHeapType == heapType
+            val prevByOffset = if (isSameAnchor) {
+                prevWasm.neighborFloats.associateBy { it.byteOffset }
+            } else {
+                emptyMap()
+            }
+
+            val updatedNeighbors = buildList {
+                for (i in 0 until neighborsArr.length()) {
+                    val obj = neighborsArr.optJSONObject(i) ?: continue
+                    val offset = obj.optInt("byteOffset", 0)
+                    val idx = obj.optInt("heapIndex", isolatedIndex + (offset / 4))
+                    val addr = obj.optLong("byteAddress", idx.toLong() * 4L)
+                    val fv = obj.optDouble("floatValue", 0.0)
+                    val iv = obj.optInt("intValue", 0)
+                    val prev = prevByOffset[offset]
+                    val changed = prev != null && (
+                        kotlin.math.abs(fv - prev.floatValue) > 0.0001 || iv != prev.intValue
+                    )
+                    val nextCount = when {
+                        prev == null -> 0
+                        changed -> prev.changeCount + 1
+                        else -> prev.changeCount
+                    }
+                    add(
+                        WasmNeighborFloat(
+                            byteOffset = offset,
+                            heapIndex = idx,
+                            byteAddress = addr,
+                            floatValue = fv,
+                            intValue = iv,
+                            changedFromPrev = changed,
+                            changeCount = nextCount
+                        )
+                    )
+                }
+            }
+
+            state.copy(
+                wasmHeap = prevWasm.copy(
+                    heapSourceLabel = sourceLabel.ifBlank { prevWasm.heapSourceLabel },
+                    heapByteLength = if (byteLen > 0L) byteLen else prevWasm.heapByteLength,
+                    isolatedHeapType = heapType,
+                    isolatedIndex = isolatedIndex,
+                    isolatedByteAddress = isolatedByteAddress,
+                    isolatedCurrentValue = currentVal,
+                    isNeighborPolling = true,
+                    neighborPollTickCount = tick,
+                    neighborFloats = updatedNeighbors
+                )
+            )
+        }
+    }
+
+    fun exportWasmMemoryMapJson(context: Context) {
+        val snapshot = _uiState.value
+        if (snapshot.wasmHeap.isExportingMemoryMap) return
+        val hasWasmData = snapshot.wasmHeap.isolatedIndex != null ||
+            snapshot.wasmHeap.totalMatches > 0 ||
+            snapshot.wasmFloatDelta.lockedCoords != null ||
+            snapshot.wasmFloatDelta.pointerChains.isNotEmpty() ||
+            snapshot.wasmFloatDelta.candidates.isNotEmpty()
+        if (!hasWasmData) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Scan and isolate a WASM address or lock coordinates first."))
+            return
+        }
+        val appContext = context.applicationContext
+        _uiState.update { state ->
+            state.copy(wasmHeap = state.wasmHeap.copy(isExportingMemoryMap = true))
+        }
+
+        viewModelScope.launch {
+            val mapJson = withContext(Dispatchers.Default) {
+                buildWasmMemoryMapJson(snapshot)
+            }
+            val outcome = withContext(Dispatchers.IO) {
+                ReportExporter.exportJsonToDownloads(
+                    context = appContext,
+                    jsonContent = mapJson,
+                    filePrefix = "wasm_memory_map"
+                )
+            }
+            _uiState.update { state ->
+                state.copy(
+                    wasmHeap = state.wasmHeap.copy(
+                        isExportingMemoryMap = false,
+                        lastMemoryMapExport = outcome
+                    )
+                )
+            }
+            if (outcome.success) {
+                appendLog(
+                    LogCategory.WASM,
+                    "Exported WASM Memory Map -> ${outcome.displayPath}",
+                    "Saved ${mapJson.length} bytes (${snapshot.wasmHeap.isolatedHeapType ?: "HEAP"}[${snapshot.wasmHeap.isolatedIndex ?: -1}]) to ${outcome.displayPath}"
+                )
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_wasm_map_saved, outcome.fileName)
+                    )
+                )
+            } else {
+                val err = outcome.errorMessage ?: "Unknown error"
+                appendLog(LogCategory.ERROR, "WASM Memory Map export failed", err)
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_report_failed, err)
+                    )
+                )
+            }
+        }
+    }
+
+    fun onShareLastWasmMemoryMap() {
+        val export = _uiState.value.wasmHeap.lastMemoryMapExport
+        if (export != null && export.success && export.contentUri != null) {
+            _effects.tryEmit(DiagnosticsEffect.ShareReport(export.contentUri, export.fileName, export.mimeType))
+        }
+    }
+
+    // Step 2A / 2B (Float Mode) — WebAssembly Float Heap Delta Scanner targeting window.HEAPF32
+    fun onSelectStep2ScanMode(mode: Step2ScanMode) {
+        _uiState.update { it.copy(step2ScanMode = mode) }
+    }
+
+    fun runWasmFloatBaselineSnapshot() {
+        if (_uiState.value.wasmFloatDelta.isSamplingBaseline) return
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Step 2A (Float): Sampling window.HEAPF32 baseline…",
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    isSamplingBaseline = true,
+                    isScanningDeltas = false,
+                    baselineCaptured = false,
+                    totalDeltaMatches = 0,
+                    scanRound = 0,
+                    isLiveWatching = false,
+                    liveWatchTickCount = 0,
+                    statusMessage = "Sampling window.HEAPF32 in non-blocking 1 MB slices & pruning standing jitter…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "Step 2A (Float Mode): Capturing window.HEAPF32 standing baseline…",
+            "Skipping low guard/out-of-bounds slots and pruning ticking timers while standing still"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildFloatBaselineSnapshotScript()))
+    }
+
+    fun runWasmFloatDeltaScan() {
+        val fd = _uiState.value.wasmFloatDelta
+        if (fd.isSamplingBaseline || fd.isScanningDeltas) return
+        if (!fd.baselineCaptured) {
+            val msg = "Stand still and tap 2A. Capture Float Baseline first."
+            appendLog(LogCategory.WASM, msg, msg)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Step 2B (Float): Scanning HEAPF32 movement deltas…",
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    isScanningDeltas = true,
+                    statusMessage = "Comparing live window.HEAPF32 against baseline for positional deltas…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "Step 2B (Float Mode): Scanning HEAPF32 movement deltas (round #${fd.scanRound + 1})…",
+            "Isolating floats that changed by a positional delta range (0.05..250.0) and clustering X/Y/Z neighbors"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildFloatDeltaScanScript()))
+    }
+
+    fun onTogglePinWasmFloatCandidate(heapIndex: Int) {
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        var nowPinned = false
+        var updatedPinnedSet: Set<Int> = emptySet()
+
+        _uiState.update { state ->
+            val currentPinned = state.wasmFloatDelta.pinnedIndices
+            val nextPinned = if (currentPinned.contains(heapIndex)) {
+                nowPinned = false
+                currentPinned - heapIndex
+            } else {
+                nowPinned = true
+                currentPinned + heapIndex
+            }
+            updatedPinnedSet = nextPinned
+
+            val candidate = state.wasmFloatDelta.candidates.firstOrNull { it.heapIndex == heapIndex }
+            val updatedCandidates = state.wasmFloatDelta.candidates.map { item ->
+                if (item.heapIndex == heapIndex) item.copy(isPinned = nowPinned) else item
+            }
+
+            val path = "window.HEAPF32[$heapIndex]"
+            val hex = formatHexAddress(heapIndex.toLong() * 4L)
+            val detail = if (candidate != null) {
+                val hint = if (candidate.axisHint.isNotBlank()) "${candidate.axisHint} • " else ""
+                "${hint}$hex • val=${String.format(Locale.US, "%.4f", candidate.currentValue)} (Δ ${String.format(Locale.US, "%+.3f", candidate.delta)})"
+            } else {
+                "$hex • Pinned WASM float"
+            }
+
+            val mergedStaging = if (nowPinned) {
+                mergeIntoStagingBuffer(
+                    existing = state.stagingBuffer,
+                    incoming = listOf(path to detail),
+                    sourceStep = "Float Delta",
+                    scanNumber = state.scanCounter.coerceAtLeast(1),
+                    timestamp = nowTs,
+                    forcePin = true
+                )
+            } else {
+                state.stagingBuffer.map { item ->
+                    if (item.path == path) item.copy(isPinned = false) else item
+                }
+            }
+
+            state.copy(
+                stagingBuffer = sortStagingBuffer(mergedStaging),
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    pinnedIndices = nextPinned,
+                    candidates = updatedCandidates
+                )
+            )
+        }
+
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildSyncPinnedFloatsScript(updatedPinnedSet)))
+        val toastMsg = if (nowPinned) "Pinned HEAPF32[$heapIndex] to Live Watcher & Staging" else "Unpinned HEAPF32[$heapIndex]"
+        _effects.tryEmit(DiagnosticsEffect.ShowToast(toastMsg))
+    }
+
+    fun onPinTopWasmFloatTriplet() {
+        val topThree = _uiState.value.wasmFloatDelta.candidates.take(3)
+        if (topThree.isEmpty()) return
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        var updatedPinnedSet: Set<Int> = emptySet()
+
+        _uiState.update { state ->
+            val topIndices = topThree.map { it.heapIndex }.toSet()
+            val nextPinned = state.wasmFloatDelta.pinnedIndices + topIndices
+            updatedPinnedSet = nextPinned
+
+            val incoming = topThree.mapIndexed { idx, c ->
+                val axis = c.axisHint.ifBlank { listOf("X", "Y", "Z").getOrElse(idx) { "F" } }
+                val hex = formatHexAddress(c.byteAddress)
+                "window.HEAPF32[${c.heapIndex}]" to "[$axis] $hex • val=${String.format(Locale.US, "%.4f", c.currentValue)}"
+            }
+            val mergedStaging = mergeIntoStagingBuffer(
+                existing = state.stagingBuffer,
+                incoming = incoming,
+                sourceStep = "Float Delta",
+                scanNumber = state.scanCounter.coerceAtLeast(1),
+                timestamp = nowTs,
+                forcePin = true
+            )
+            val updatedCandidates = state.wasmFloatDelta.candidates.map { item ->
+                if (nextPinned.contains(item.heapIndex)) item.copy(isPinned = true) else item
+            }
+            state.copy(
+                stagingBuffer = mergedStaging,
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    pinnedIndices = nextPinned,
+                    candidates = updatedCandidates
+                )
+            )
+        }
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildSyncPinnedFloatsScript(updatedPinnedSet)))
+        _effects.tryEmit(DiagnosticsEffect.ShowToast("Pinned top ${topThree.size} X/Y/Z float offsets to Staging"))
+    }
+
+    fun onToggleFloatWatcherExpanded() {
+        _uiState.update { state ->
+            state.copy(
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    isWatcherExpanded = !state.wasmFloatDelta.isWatcherExpanded
+                )
+            )
+        }
+    }
+
+    fun onStopWasmFloatWatch() {
+        _uiState.update { state ->
+            state.copy(
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    isLiveWatching = false,
+                    statusMessage = "Paused Live Float Watcher (pinned offsets preserved)."
+                )
+            )
+        }
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildStopFloatWatchScript()))
+    }
+
+    fun onResetWasmFloatDelta() {
+        _uiState.update { state ->
+            state.copy(wasmFloatDelta = WasmFloatDeltaState())
+        }
+        appendLog(LogCategory.WASM, "Reset WASM Float Heap Delta Scanner", "Released HEAPF32 baseline snapshot and stopped Live Float Watcher")
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildResetFloatDeltaScript()))
+    }
+
+    fun onInspectWasmFloatNeighbors(heapIndex: Int) {
+        _uiState.update { it.copy(activeConsoleTab = ConsoleTab.WASM_HEAP) }
+        onInspectWasmCandidate("HEAPF32", heapIndex)
+    }
+
+    fun onLockWasmFloatCoords(anchorIndex: Int? = null) {
+        val state = _uiState.value
+        val fd = state.wasmFloatDelta
+        val byIndex = fd.candidates.associateBy { it.heapIndex }
+
+        val resolvedTriple: Triple<Int, Int?, Int?>? = when {
+            anchorIndex != null && anchorIndex >= 0 -> {
+                Triple(anchorIndex, anchorIndex + 1, anchorIndex + 2)
+            }
+            fd.pinnedIndices.isNotEmpty() -> {
+                val orderedPins = fd.pinnedIndices.sorted()
+                val x = orderedPins[0]
+                val y = orderedPins.getOrNull(1) ?: (x + 1)
+                val z = orderedPins.getOrNull(2) ?: (y + 1)
+                Triple(x, y, z)
+            }
+            fd.candidates.isNotEmpty() -> {
+                val top = fd.candidates.take(3)
+                val x = top[0].heapIndex
+                val y = top.getOrNull(1)?.heapIndex ?: (x + 1)
+                val z = top.getOrNull(2)?.heapIndex ?: (y + 1)
+                Triple(x, y, z)
+            }
+            else -> null
+        }
+
+        if (resolvedTriple == null) {
+            val msg = "Run 'Scan Float Heap Deltas' first to find movement coordinates to lock."
+            appendLog(LogCategory.WASM, msg, msg)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+
+        val (xIdx, yIdx, zIdx) = resolvedTriple
+        val xVal = byIndex[xIdx]?.currentValue ?: 0.0
+        val yVal = yIdx?.let { byIndex[it]?.currentValue } ?: 0.0
+        val zVal = zIdx?.let { byIndex[it]?.currentValue } ?: 0.0
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+
+        val locked = LockedWasmCoords(
+            xIndex = xIdx,
+            yIndex = yIdx,
+            zIndex = zIdx,
+            xByteAddress = xIdx.toLong() * 4L,
+            yByteAddress = yIdx?.let { it.toLong() * 4L },
+            zByteAddress = zIdx?.let { it.toLong() * 4L },
+            xValue = xVal,
+            yValue = yVal,
+            zValue = zVal,
+            lockedAtTimestamp = nowTs,
+            liveTickCount = 0,
+            isLivePolling = true
+        )
+
+        val indicesText = listOfNotNull(xIdx, yIdx, zIdx).joinToString(",")
+        val lockedPath = "window.HEAPF32[$indicesText]"
+        val hexAddr = formatHexAddress(locked.xByteAddress)
+        val detail = "Locked X/Y/Z @ $hexAddr • (${String.format(Locale.US, "%.3f", xVal)}, ${String.format(Locale.US, "%.3f", yVal)}, ${String.format(Locale.US, "%.3f", zVal)})"
+
+        _uiState.update { current ->
+            val newPins = current.wasmFloatDelta.pinnedIndices + listOfNotNull(xIdx, yIdx, zIdx)
+            val mergedStaging = mergeIntoStagingBuffer(
+                existing = current.stagingBuffer,
+                incoming = listOf(lockedPath to detail),
+                sourceStep = "Locked WASM Coords",
+                scanNumber = current.scanCounter.coerceAtLeast(1),
+                timestamp = nowTs,
+                forcePin = true
+            )
+            val updatedCandidates = current.wasmFloatDelta.candidates.map { c ->
+                if (newPins.contains(c.heapIndex)) c.copy(isPinned = true) else c
+            }
+            current.copy(
+                discoveredPlayerPath = lockedPath,
+                playerPropertyKeys = "HEAPF32[$indicesText]",
+                livePlayerCoords = PlayerCoordinates(
+                    path = lockedPath,
+                    x = xVal,
+                    y = yVal,
+                    z = zVal
+                ),
+                livePollActive = true,
+                stagingBuffer = mergedStaging,
+                scanStatus = AsyncScanStatus.COMPLETED,
+                scanStatusDetail = "Locked $lockedPath ($hexAddr)",
+                wasmFloatDelta = current.wasmFloatDelta.copy(
+                    lockedCoords = locked,
+                    pinnedIndices = newPins,
+                    candidates = updatedCandidates,
+                    isLiveWatching = true,
+                    statusMessage = "Locked $lockedPath ($hexAddr). Tap 'Find Pointers' to locate persistent pointer chains."
+                )
+            )
+        }
+
+        appendLog(
+            LogCategory.WASM,
+            "Locked WASM Coords -> $lockedPath ($hexAddr)",
+            detail
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildLockFloatCoordsScript(xIdx, yIdx, zIdx)))
+        _effects.tryEmit(DiagnosticsEffect.ShowToast("Locked $lockedPath — ready to Find Pointers"))
+    }
+
+    fun onUnlockWasmFloatCoords() {
+        _uiState.update { current ->
+            current.copy(
+                wasmFloatDelta = current.wasmFloatDelta.copy(
+                    lockedCoords = null,
+                    statusMessage = "Unlocked WASM coordinates (Live Float Watcher preserved)."
+                )
+            )
+        }
+        appendLog(LogCategory.WASM, "Unlocked WASM Float Coordinates", "Cleared active coordinate lock")
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildUnlockFloatCoordsScript()))
+    }
+
+    fun runWasmPointerScan(overrideByteAddress: Long? = null) {
+        val state = _uiState.value
+        if (state.wasmFloatDelta.isScanningPointers) return
+        val targetAddr = overrideByteAddress
+            ?: state.wasmFloatDelta.lockedCoords?.xByteAddress
+            ?: state.wasmHeap.isolatedByteAddress
+
+        if (targetAddr == null || targetAddr <= 0L) {
+            val msg = "Lock coordinates from the movement scan first before scanning for pointers."
+            appendLog(LogCategory.WASM, msg, msg)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+
+        val hexTarget = formatHexAddress(targetAddr)
+        _uiState.update { current ->
+            current.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Scanning HEAPU32 pointers to $hexTarget…",
+                wasmFloatDelta = current.wasmFloatDelta.copy(
+                    isScanningPointers = true,
+                    pointerStatusMessage = "Scanning HEAPU32 in 1 MB async slices for Level-1 & Level-2 pointers to $hexTarget…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "Pointer Scan: Searching HEAPU32 for Level-1 & Level-2 chains -> $hexTarget",
+            "Max struct offset: 256B (read-only Uint32Array scan)"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildPointerScanScript(targetAddr)))
+    }
+
+    fun runVerifyWasmPointerChains() {
+        val chains = _uiState.value.wasmFloatDelta.pointerChains
+        if (chains.isEmpty()) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Run 'Find Pointers' first to discover pointer chains to verify."))
+            return
+        }
+        val payloadArr = JSONArray()
+        chains.forEach { c ->
+            val offArr = JSONArray()
+            c.offsets.forEach { offArr.put(it) }
+            payloadArr.put(
+                JSONObject()
+                    .put("id", c.id)
+                    .put("basePointerAddress", c.basePointerAddress)
+                    .put("offsets", offArr)
+            )
+        }
+        _uiState.update { current ->
+            current.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Verifying ${chains.size} pointer chains live…",
+                wasmFloatDelta = current.wasmFloatDelta.copy(
+                    pointerStatusMessage = "Re-dereferencing ${chains.size} pointer chains against live HEAPU32 / HEAPF32…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "Verifying ${chains.size} persistent pointer chains live…",
+            "Dereferencing base pointer + offsets against current WASM linear memory"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildVerifyPointerChainsScript(payloadArr.toString())))
+    }
+
+    fun onTogglePinWasmPointerChain(chainId: String) {
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        var toggledChain: WasmPointerChain? = null
+        var nowPinned = false
+
+        _uiState.update { state ->
+            val updatedChains = state.wasmFloatDelta.pointerChains.map { chain ->
+                if (chain.id == chainId) {
+                    nowPinned = !chain.isPinned
+                    val next = chain.copy(isPinned = nowPinned)
+                    toggledChain = next
+                    next
+                } else {
+                    chain
+                }
+            }
+            val chain = toggledChain
+            val mergedStaging = if (chain != null) {
+                val stagingKey = "WASM_PTR: ${chain.expression}"
+                val regionTag = if (chain.isLikelyStatic) "STATIC" else "HEAP"
+                val detail = "[L${chain.depth} $regionTag] -> ${formatHexAddress(chain.resolvedTargetAddress)} • (${String.format(Locale.US, "%.2f", chain.resolvedX)}, ${String.format(Locale.US, "%.2f", chain.resolvedY)}, ${String.format(Locale.US, "%.2f", chain.resolvedZ)})"
+                if (nowPinned) {
+                    mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = listOf(stagingKey to detail),
+                        sourceStep = "Pointer Chain",
+                        scanNumber = state.scanCounter.coerceAtLeast(1),
+                        timestamp = nowTs,
+                        forcePin = true
+                    )
+                } else {
+                    state.stagingBuffer.map { item ->
+                        if (item.path == stagingKey) item.copy(isPinned = false) else item
+                    }
+                }
+            } else {
+                state.stagingBuffer
+            }
+
+            state.copy(
+                stagingBuffer = sortStagingBuffer(mergedStaging),
+                wasmFloatDelta = state.wasmFloatDelta.copy(pointerChains = updatedChains)
+            )
+        }
+
+        toggledChain?.let { chain ->
+            val toast = if (nowPinned) "Pinned pointer chain ${chain.expression} to Staging" else "Unpinned pointer chain"
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(toast))
+        }
+    }
+
+    fun onWasmFloatCandidatesUpdatedFromBridge(jsonPayload: String) {
+        val json = try {
+            JSONObject(jsonPayload)
+        } catch (_: Exception) {
+            return
+        }
+        if (json.optString("stage", "") != "WASM_FLOAT_WATCH_TICK") return
+
+        val tick = json.optInt("tick", 1)
+        val sourceLabel = json.optString("heapSourceLabel", "")
+        val byteLen = json.optLong("heapByteLength", 0L)
+        val arr = json.optJSONArray("candidates") ?: JSONArray()
+        val lockedObj = json.optJSONObject("locked")
+
+        _uiState.update { state ->
+            val prevState = state.wasmFloatDelta
+            val prevByIdx = prevState.candidates.associateBy { it.heapIndex }
+            val pinnedSet = prevState.pinnedIndices
+
+            val parsed = buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val idx = obj.optInt("heapIndex", -1)
+                    if (idx < 0) continue
+                    val byteAddr = obj.optLong("byteAddress", idx.toLong() * 4L)
+                    val baseVal = obj.optDouble("baselineValue", 0.0)
+                    val curVal = obj.optDouble("currentValue", 0.0)
+                    val deltaVal = obj.optDouble("delta", curVal - baseVal)
+                    val cluster = obj.optInt("clusterSize", 1)
+                    val axis = obj.optString("axisHint", "")
+                    val isPinned = pinnedSet.contains(idx) || obj.optBoolean("isPinned", false)
+                    val prev = prevByIdx[idx]
+                    val changed = prev != null && kotlin.math.abs(curVal - prev.currentValue) > 0.0005
+                    val nextCount = when {
+                        prev == null -> 0
+                        changed -> prev.changeCount + 1
+                        else -> prev.changeCount
+                    }
+                    add(
+                        WasmFloatDeltaCandidate(
+                            heapIndex = idx,
+                            byteAddress = byteAddr,
+                            baselineValue = baseVal,
+                            currentValue = curVal,
+                            delta = deltaVal,
+                            clusterSize = cluster,
+                            axisHint = axis,
+                            isPinned = isPinned,
+                            changedFromPrev = changed,
+                            changeCount = nextCount
+                        )
+                    )
+                }
+            }
+
+            val updatedLocked = if (lockedObj != null && prevState.lockedCoords != null) {
+                prevState.lockedCoords.copy(
+                    xValue = lockedObj.optDouble("xValue", prevState.lockedCoords.xValue),
+                    yValue = lockedObj.optDouble("yValue", prevState.lockedCoords.yValue),
+                    zValue = lockedObj.optDouble("zValue", prevState.lockedCoords.zValue),
+                    liveTickCount = tick,
+                    isLivePolling = true
+                )
+            } else {
+                prevState.lockedCoords
+            }
+
+            state.copy(
+                wasmFloatDelta = prevState.copy(
+                    heapSourceLabel = sourceLabel.ifBlank { prevState.heapSourceLabel },
+                    heapByteLength = if (byteLen > 0L) byteLen else prevState.heapByteLength,
+                    isLiveWatching = parsed.isNotEmpty() || updatedLocked != null,
+                    liveWatchTickCount = tick,
+                    candidates = parsed,
+                    lockedCoords = updatedLocked
+                )
+            )
+        }
+    }
+
+    // Passive Resource & Asset Request Monitor (called from WebViewClient.shouldInterceptRequest)
+    // Never modifies or blocks WebView traffic; asynchronously mirrors .bin/.wasm/.json to filesDir for ByteBuffer audit.
+    fun onResourceRequestObserved(context: Context, request: WebResourceRequest) {
+        val uri = request.url ?: return
+        val fullUrl = uri.toString()
+        val pathLower = (uri.path ?: fullUrl).lowercase(Locale.US)
+        val matchedExt = matchTrackedAssetExtension(pathLower) ?: return
+        val fileName = BinaryAssetInspector.extractFileName(fullUrl, matchedExt)
+        val shouldCache = BinaryAssetInspector.shouldCaptureLocally(matchedExt)
+        val appContext = context.applicationContext
+
+        val initialRecord = InterceptedAsset(
+            url = fullUrl,
+            extension = matchedExt,
+            method = request.method ?: "GET",
+            timestamp = formatTimestamp(System.currentTimeMillis()),
+            isForMainFrame = request.isForMainFrame,
+            fileName = fileName,
+            captureStatus = if (shouldCache) AssetCaptureStatus.CACHING else AssetCaptureStatus.OBSERVED,
+            structuralSummary = if (shouldCache) "Mirroring to filesDir for ByteBuffer audit…" else "Observed network request"
+        )
+
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            if (!seenAssetUrls.add(fullUrl)) return@launch
+            if (seenAssetUrls.size > MAX_TRACKED_ASSETS) {
+                val oldest = seenAssetUrls.firstOrNull()
+                if (oldest != null) seenAssetUrls.remove(oldest)
+            }
+            _uiState.update { state ->
+                val updated = (state.interceptedAssets + initialRecord).takeLast(MAX_TRACKED_ASSETS)
+                state.copy(interceptedAssets = updated)
+            }
+            appendLog(
+                category = LogCategory.ASSET,
+                summary = "Intercepted [$matchedExt] $fileName",
+                payload = "${initialRecord.method} $fullUrl"
+            )
+
+            if (shouldCache) {
+                val activeReferer = _uiState.value.activeUrl
+                val userAgent = if (_uiState.value.isDesktopMode) DESKTOP_USER_AGENT else "Mozilla/5.0 (Linux; Android)"
+                val audited = withContext(Dispatchers.IO) {
+                    BinaryAssetInspector.fetchSaveAndInspect(
+                        context = appContext,
+                        asset = initialRecord,
+                        userAgent = userAgent,
+                        refererUrl = activeReferer
+                    )
+                }
+                _uiState.update { state ->
+                    val updatedList = state.interceptedAssets.map { item ->
+                        if (item.url == fullUrl) audited else item
+                    }
+                    state.copy(interceptedAssets = updatedList)
+                }
+                if (audited.captureStatus == AssetCaptureStatus.CAPTURED) {
+                    appendLog(
+                        category = LogCategory.ASSET,
+                        summary = "Audited [$matchedExt] $fileName (${BinaryAssetInspector.formatBytes(audited.byteSize)}) • ${audited.magicSignature}",
+                        payload = buildString {
+                            appendLine("URL: ${audited.url}")
+                            appendLine("Local: filesDir/${audited.localRelativePath}")
+                            appendLine("SHA-256: ${audited.sha256Prefix}…")
+                            appendLine(audited.structuralDetails)
+                        }.trimEnd()
+                    )
+                }
+            }
+        }
+    }
+
+    fun onClearAssetCache(context: Context) {
+        val appContext = context.applicationContext
+        viewModelScope.launch {
+            val removedCount = withContext(Dispatchers.IO) {
+                BinaryAssetInspector.clearLocalCache(appContext)
+            }
+            seenAssetUrls.clear()
+            _uiState.update { it.copy(interceptedAssets = emptyList()) }
+            appendLog(
+                LogCategory.ASSET,
+                "Cleared local binary asset cache ($removedCount files removed)",
+                "Cleared filesDir/captured_assets"
+            )
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Cleared $removedCount cached asset files"))
+        }
+    }
+
+    // Step 4 / 5: Export Complete Telemetry Handoff JSON Report
+    fun requestExportReport(context: Context, armBridge: () -> Unit, disarmBridge: () -> Boolean) {
+        if (_uiState.value.isExporting) return
+        val appContext = context.applicationContext
+        pendingExportContext = appContext
+        _uiState.update { it.copy(isExporting = true) }
+        armBridge()
+        appendLog(
+            LogCategory.SYSTEM,
+            "Exporting full telemetry report (pinned candidates, live coords, entities, logs)…",
+            "Invoking TelemetryBridge.exportReport()"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildCollectViewportMetricsScript()))
+
+        pendingExportJob?.cancel()
+        pendingExportJob = viewModelScope.launch {
+            delay(1_200L)
+            if (disarmBridge()) {
+                val fallbackViewportJson = JSONObject()
+                    .put("url", _uiState.value.activeUrl)
+                    .put("note", "Viewport metrics collected natively (WebView JS callback timed out)")
+                    .toString()
+                finalizeReportExport(appContext, fallbackViewportJson)
+            }
+        }
+    }
+
+    fun onReportPayloadFromBridge(viewportJson: String) {
+        pendingExportJob?.cancel()
+        val appContext = pendingExportContext ?: return
+        finalizeReportExport(appContext, viewportJson)
+    }
+
+    private fun finalizeReportExport(appContext: Context, viewportJson: String) {
+        val snapshot = _uiState.value
+        viewModelScope.launch {
+            val fullReportJson = withContext(Dispatchers.Default) {
+                buildFullReportJson(snapshot, viewportJson)
+            }
+            val outcome = withContext(Dispatchers.IO) {
+                ReportExporter.exportJsonToDownloads(appContext, fullReportJson)
+            }
+            _uiState.update {
+                it.copy(
+                    isExporting = false,
+                    lastExport = outcome
+                )
+            }
+            if (outcome.success) {
+                appendLog(
+                    LogCategory.SYSTEM,
+                    "Exported JSON report -> ${outcome.displayPath}",
+                    "Saved ${fullReportJson.length} bytes to ${outcome.displayPath}"
+                )
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_report_saved, outcome.fileName)
+                    )
+                )
+            } else {
+                val err = outcome.errorMessage ?: "Unknown error"
+                appendLog(LogCategory.ERROR, "Report export failed", err)
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_report_failed, err)
+                    )
+                )
+            }
+        }
+    }
+
+    fun onShareLastReport() {
+        val export = _uiState.value.lastExport
+        if (export != null && export.success && export.contentUri != null) {
+            _effects.tryEmit(DiagnosticsEffect.ShareReport(export.contentUri, export.fileName, export.mimeType))
+        }
+    }
+
+    // Complete Log Dump Export (.txt or .json) from Logs tab
+    fun exportFullLogDump(context: Context, asJson: Boolean = false) {
+        if (_uiState.value.isExportingLogDump) return
+        val appContext = context.applicationContext
+        val snapshot = _uiState.value
+        _uiState.update { it.copy(isExportingLogDump = true) }
+
+        viewModelScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                if (asJson) {
+                    val fallbackViewport = JSONObject()
+                        .put("url", snapshot.activeUrl)
+                        .put("width", snapshot.entityViewportWidth)
+                        .put("height", snapshot.entityViewportHeight)
+                        .toString()
+                    val jsonContent = buildFullReportJson(snapshot, fallbackViewport)
+                    ReportExporter.exportJsonToDownloads(
+                        context = appContext,
+                        jsonContent = jsonContent,
+                        filePrefix = "webview_log_dump"
+                    )
+                } else {
+                    val textDump = buildFullLogDumpText(snapshot)
+                    ReportExporter.exportTextLogDumpToDownloads(appContext, textDump)
+                }
+            }
+
+            _uiState.update {
+                it.copy(
+                    isExportingLogDump = false,
+                    lastLogDumpExport = outcome
+                )
+            }
+
+            if (outcome.success) {
+                appendLog(
+                    LogCategory.SYSTEM,
+                    "Exported full log dump -> ${outcome.displayPath}",
+                    "Saved ${snapshot.logs.size} logs, ${snapshot.stagingBuffer.size} staged variables, ${snapshot.discoveredEntities.size} entities, and ${snapshot.interceptedAssets.size} asset requests to ${outcome.displayPath}"
+                )
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_log_dump_saved, outcome.fileName)
+                    )
+                )
+            } else {
+                val err = outcome.errorMessage ?: "Unknown error"
+                appendLog(LogCategory.ERROR, "Log dump export failed", err)
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_report_failed, err)
+                    )
+                )
+            }
+        }
+    }
+
+    fun onShareLastLogDump() {
+        val export = _uiState.value.lastLogDumpExport
+        if (export != null && export.success && export.contentUri != null) {
+            _effects.tryEmit(DiagnosticsEffect.ShareReport(export.contentUri, export.fileName, export.mimeType))
+        }
+    }
+
+    // Manual JavaScript Execution Drawer
+    fun onToggleJsDrawer(open: Boolean? = null) {
+        _uiState.update { it.copy(isJsDrawerOpen = open ?: !it.isJsDrawerOpen) }
     }
 
     fun onManualJsInputChanged(script: String) {
@@ -624,878 +1406,1617 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun onExecuteManualScript() {
-        val snippet = _uiState.value.manualJsInput.trim()
-        if (snippet.isBlank()) {
-            _commands.tryEmit(DiagnosticsCommand.ShowToast("Enter a read-only JS expression to evaluate."))
-            return
-        }
-        appendLog(LogCategory.JS, "Evaluating manual expression", snippet)
-        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildManualJsEvalScript(snippet)))
+        val code = _uiState.value.manualJsInput.trim()
+        if (code.isEmpty()) return
+        onScanStatusChanged(AsyncScanStatus.RUNNING, "Evaluating manual JS…")
+        appendLog(LogCategory.JS, "Exec> ${code.take(90)}", code)
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildManualEvalScript(code)))
     }
 
     fun onSelectFilter(category: LogCategory) {
         _uiState.update { it.copy(selectedFilter = category) }
     }
 
+    fun onToggleConsoleExpanded() {
+        _uiState.update { it.copy(isConsoleExpanded = !it.isConsoleExpanded) }
+    }
+
     fun onClearLogs() {
-        _uiState.update { it.copy(logs = emptyList(), liveStreamHistory = emptyList()) }
+        _uiState.update { it.copy(logs = emptyList()) }
     }
 
-    // -------------------------------------------------------------------------
-    // Bridge Callbacks (Main Thread)
-    // -------------------------------------------------------------------------
+    fun onTelemetryFromBridge(rawCategory: String, payload: String) {
+        val category = LogCategory.fromRaw(rawCategory)
+        val parsedSummary = parseStructuredTelemetry(category, payload)
+        appendLog(category, parsedSummary, prettyFormatIfJson(payload))
+    }
 
-    fun onScanStatusChangedFromBridge(status: AsyncScanStatus, detail: String) {
-        _uiState.update { current ->
-            current.copy(scanStatus = status, scanStatusDetail = detail)
+    private fun parseStructuredTelemetry(category: LogCategory, payload: String): String {
+        val json = try {
+            JSONObject(payload)
+        } catch (_: Exception) {
+            return payload.lineSequence().firstOrNull()?.take(110) ?: category.label
         }
-    }
 
-    fun onDirectHeapCoordsUpdatedFromBridge(
-        baseIndex: Int,
-        x: Double,
-        y: Double,
-        z: Double,
-        heapByteLength: Long,
-        heapSource: String
-    ) {
-        val line = String.format(
-            Locale.US,
-            "[%s] [%d] X=%+.3f  Y=%+.3f  Z=%+.3f",
-            nowTimeLabel(),
-            baseIndex,
-            x,
-            y,
-            z
-        )
-        _uiState.update { current ->
-            val updatedHistory = (listOf(line) + current.liveStreamHistory).take(MAX_LIVE_STREAM_LINES)
-            val resolvedLockStatus = when (current.heapFeed.lockStatus) {
-                LockStatus.RELOCKING -> LockStatus.LOCKED
-                else -> current.heapFeed.lockStatus
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        val stage = json.optString("stage", "")
+
+        return when (stage) {
+            "GAME_NAMESPACE_DETECTED" -> {
+                val nsArray = json.optJSONArray("detectedNamespaces") ?: JSONArray()
+                val detectedNs = extractStringArray(nsArray)
+                val entriesArr = json.optJSONArray("detectedEntries") ?: JSONArray()
+                val rootKeys = mutableListOf<String>()
+                val stagingPairs = mutableListOf<Pair<String, String>>()
+
+                for (i in 0 until entriesArr.length()) {
+                    val obj = entriesArr.optJSONObject(i) ?: continue
+                    val key = obj.optString("key", "").trim()
+                    val path = obj.optString("path", if (key.isNotEmpty()) "window.$key" else "").trim()
+                    if (path.isEmpty()) continue
+                    if (key.isNotEmpty() && !key.contains(".")) {
+                        rootKeys.add(key)
+                    }
+                    val ctor = obj.optString("constructor", obj.optString("type", "Object"))
+                    val keyCount = obj.optInt("keyCount", 0)
+                    val previewList = extractStringArray(obj.optJSONArray("previewKeys")).take(4)
+                    val previewSuffix = if (previewList.isNotEmpty()) " • ${previewList.joinToString(", ")}" else ""
+                    stagingPairs.add(path to "[Auto-Root] $ctor ($keyCount keys$previewSuffix)")
+                }
+
+                _uiState.update { state ->
+                    val currentScan = state.scanCounter.coerceAtLeast(1)
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Auto-Root",
+                        scanNumber = currentScan,
+                        timestamp = nowTs
+                    )
+                    state.copy(
+                        customGlobals = (detectedNs.map { it.removePrefix("window.") } + rootKeys + state.customGlobals).distinct(),
+                        detectedGameNamespaces = (state.detectedGameNamespaces + detectedNs).distinct(),
+                        stagingBuffer = mergedStaging
+                    )
+                }
+                "Auto-detected ${detectedNs.size} game namespace(s): ${detectedNs.joinToString(", ")} • Staged immediately"
             }
-            current.copy(
-                liveStreamHistory = updatedHistory,
-                heapFeed = current.heapFeed.copy(
-                    baseIndex = baseIndex,
-                    heapSourceLabel = heapSource,
-                    heapByteLength = heapByteLength,
-                    lockStatus = resolvedLockStatus,
-                    isPolling = true,
-                    isHeapReady = true,
-                    x = x,
-                    y = y,
-                    z = z,
-                    tickCount = current.heapFeed.tickCount + 1,
-                    lastUpdatedMs = System.currentTimeMillis()
-                )
-            )
-        }
-    }
 
-    fun onFloatDeltaPreviewFromBridge(jsonPayload: String) {
-        val updatesMap = parsePreviewUpdates(jsonPayload)
-        if (updatesMap.isEmpty()) return
-        _uiState.update { current ->
-            if (current.floatScanner.candidates.isEmpty()) return@update current
-            val updatedCandidates = current.floatScanner.candidates.map { candidate ->
-                val upd = updatesMap[candidate.heapIndex] ?: return@map candidate
-                candidate.copy(
-                    currentValue = upd.currentValue,
-                    delta = upd.delta,
-                    previewY = upd.previewY,
-                    previewZ = upd.previewZ,
-                    isStillNow = upd.isStillNow,
-                    liveChangeCount = upd.liveChangeCount
-                )
+            "MANUAL_PATH_QUERY" -> {
+                val found = json.optBoolean("found", false)
+                val normalizedPath = json.optString("normalizedPath", json.optString("requestedPath", "")).trim()
+                if (!found) {
+                    val msg = json.optString("message", "Property path not found on window.")
+                    _uiState.update {
+                        it.copy(
+                            scanStatus = AsyncScanStatus.IDLE,
+                            scanStatusDetail = "Not found: $normalizedPath",
+                            lastManualQuerySummary = "Not found: $msg"
+                        )
+                    }
+                    _effects.tryEmit(DiagnosticsEffect.ShowToast("Not found: $normalizedPath"))
+                    "Manual Query failed: $msg"
+                } else {
+                    val rootKey = json.optString("rootKey", "").trim()
+                    val detail = json.optString("detail", json.optString("type", "Object"))
+                    val childArr = json.optJSONArray("childEntries") ?: JSONArray()
+                    val childPairs = buildList {
+                        for (i in 0 until childArr.length()) {
+                            val obj = childArr.optJSONObject(i) ?: continue
+                            val cp = obj.optString("path", "").trim()
+                            val cd = obj.optString("detail", "Object")
+                            if (cp.isNotEmpty()) add(cp to cd)
+                        }
+                    }
+
+                    _uiState.update { state ->
+                        val nextScan = state.scanCounter.coerceAtLeast(1)
+                        val withMain = mergeIntoStagingBuffer(
+                            existing = state.stagingBuffer,
+                            incoming = listOf(normalizedPath to detail),
+                            sourceStep = "Manual Query",
+                            scanNumber = nextScan,
+                            timestamp = nowTs,
+                            forcePin = true
+                        )
+                        val withChildren = if (childPairs.isNotEmpty()) {
+                            mergeIntoStagingBuffer(
+                                existing = withMain,
+                                incoming = childPairs,
+                                sourceStep = "Manual Query",
+                                scanNumber = nextScan,
+                                timestamp = nowTs,
+                                forcePin = false
+                            )
+                        } else withMain
+
+                        state.copy(
+                            step1Completed = true,
+                            customGlobals = if (rootKey.isNotEmpty()) {
+                                (listOf(rootKey) + state.customGlobals).distinct()
+                            } else state.customGlobals,
+                            stagingBuffer = withChildren,
+                            lastManualQuerySummary = "Staged & pinned $normalizedPath → $detail",
+                            scanStatus = AsyncScanStatus.COMPLETED,
+                            scanStatusDetail = "Staged $normalizedPath"
+                        )
+                    }
+                    _effects.tryEmit(DiagnosticsEffect.ShowToast("Staged & pinned: $normalizedPath"))
+                    "Manual Query staged $normalizedPath ($detail)" +
+                        if (childPairs.isNotEmpty()) " + ${childPairs.size} child hints" else ""
+                }
             }
-            current.copy(
-                floatScanner = current.floatScanner.copy(
-                    isLivePreviewing = true,
-                    candidates = updatedCandidates
-                )
-            )
-        }
-    }
 
-    fun onTelemetryFromBridge(category: String, payload: String) {
-        val parsedCategory = LogCategory.fromRaw(category)
-        val trimmed = payload.trim()
-        if (trimmed.startsWith("{")) {
-            val handled = runCatching { handleStructuredBridgeJson(parsedCategory, JSONObject(trimmed)) }
-                .getOrDefault(false)
-            if (handled) return
-        }
-        appendLog(parsedCategory, trimmed.lineSequence().firstOrNull().orEmpty().take(90), trimmed)
-    }
+            "GLOBAL_SCOPE_BATCH" -> {
+                val batchIndex = json.optInt("batchIndex", 1)
+                val totalBatches = json.optInt("totalBatches", 1)
+                val itemStart = json.optInt("itemStart", 1)
+                val itemEnd = json.optInt("itemEnd", 100)
+                val totalItems = json.optInt("totalItems", itemEnd)
+                val foundCount = json.optInt("foundCount", 0)
+                val batchArray = json.optJSONArray("batchCustomGlobals") ?: JSONArray()
+                val batchKeys = mutableListOf<String>()
+                val stagingPairs = mutableListOf<Pair<String, String>>()
 
-    private fun handleStructuredBridgeJson(category: LogCategory, obj: JSONObject): Boolean {
-        return when (obj.optString("type")) {
-            "FEED_STATUS" -> {
-                val active = obj.optBoolean("active", false)
-                val ready = obj.optBoolean("heapReady", false)
-                val baseIdx = obj.optInt("baseIndex", _uiState.value.heapFeed.baseIndex)
-                val msg = obj.optString("message", "")
-                val heapSource = obj.optString("heapSource", _uiState.value.heapFeed.heapSourceLabel)
-                val byteLen = obj.optLong("heapByteLength", _uiState.value.heapFeed.heapByteLength)
-                _uiState.update { current ->
-                    current.copy(
-                        heapFeed = current.heapFeed.copy(
-                            baseIndex = baseIdx,
-                            heapSourceLabel = heapSource,
-                            heapByteLength = byteLen,
-                            isPolling = active,
-                            isHeapReady = ready,
-                            statusMessage = msg.ifBlank { current.heapFeed.statusMessage }
+                for (i in 0 until batchArray.length()) {
+                    val obj = batchArray.optJSONObject(i) ?: continue
+                    val key = obj.optString("key", "").trim()
+                    if (key.isEmpty()) continue
+                    batchKeys.add(key)
+                    val path = obj.optString("path", "window.$key")
+                    val ctor = obj.optString("constructor", obj.optString("type", "Object"))
+                    val keyCount = obj.optInt("keyCount", 0)
+                    val previewArr = obj.optJSONArray("previewKeys")
+                    val previewList = buildList {
+                        if (previewArr != null) {
+                            for (pi in 0 until minOf(previewArr.length(), 4)) {
+                                val pk = previewArr.optString(pi, "").trim()
+                                if (pk.isNotEmpty()) add(pk)
+                            }
+                        }
+                    }
+                    val previewSuffix = if (previewList.isNotEmpty()) " • ${previewList.joinToString(", ")}" else ""
+                    stagingPairs.add(path to "$ctor ($keyCount keys$previewSuffix)")
+                }
+
+                _uiState.update { state ->
+                    val currentScan = state.scanCounter.coerceAtLeast(1)
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Step 1 B$batchIndex",
+                        scanNumber = currentScan,
+                        timestamp = nowTs
+                    )
+                    state.copy(
+                        customGlobals = (state.customGlobals + batchKeys).distinct(),
+                        stagingBuffer = mergedStaging,
+                        scopeBatchProgress = ScopeBatchProgress(
+                            isActive = batchIndex < totalBatches,
+                            isPaused = false,
+                            currentBatch = batchIndex,
+                            totalBatches = totalBatches,
+                            itemStart = itemStart,
+                            itemEnd = itemEnd,
+                            totalItems = totalItems,
+                            foundCount = foundCount
                         )
                     )
                 }
-                appendLog(LogCategory.FEED, msg.ifBlank { "Feed state updated" }, obj.toString())
-                true
+                "Batch $batchIndex/$totalBatches ($itemStart–$itemEnd): +${batchKeys.size} custom globals staged (${batchKeys.take(4).joinToString(", ")})"
             }
 
-            "FLOAT_BASELINE_CAPTURED" -> {
-                val success = obj.optBoolean("success", false)
-                if (!success) {
-                    val err = obj.optString("error", "Baseline capture failed")
-                    _uiState.update { current ->
-                        current.copy(
-                            floatScanner = current.floatScanner.copy(
-                                isBusy = false,
-                                baselineCaptured = false,
-                                statusMessage = err
-                            )
-                        )
+            "GLOBAL_SCOPE_INSPECTED" -> {
+                val canvases = json.optInt("canvasCount", 0)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val batchesExecuted = json.optInt("batchesExecuted", 1)
+                val totalFiltered = json.optInt("totalWindowKeysFiltered", 0)
+                val customArray = json.optJSONArray("customGlobals") ?: JSONArray()
+                val globalKeys = mutableListOf<String>()
+                val stagingPairs = mutableListOf<Pair<String, String>>()
+
+                for (i in 0 until customArray.length()) {
+                    val obj = customArray.optJSONObject(i) ?: continue
+                    val key = obj.optString("key", "").trim()
+                    if (key.isEmpty()) continue
+                    globalKeys.add(key)
+                    val path = obj.optString("path", "window.$key")
+                    val ctor = obj.optString("constructor", obj.optString("type", "Object"))
+                    val keyCount = obj.optInt("keyCount", 0)
+                    val previewArr = obj.optJSONArray("previewKeys")
+                    val previewList = buildList {
+                        if (previewArr != null) {
+                            for (pi in 0 until minOf(previewArr.length(), 4)) {
+                                val pk = previewArr.optString(pi, "").trim()
+                                if (pk.isNotEmpty()) add(pk)
+                            }
+                        }
                     }
-                    appendLog(LogCategory.ERROR, "Baseline failed: $err", obj.toString())
-                    _commands.tryEmit(DiagnosticsCommand.ShowToast(err))
-                } else {
-                    val sampled = obj.optInt("sampledCount", 0)
-                    val jitter = obj.optInt("prunedJitterCount", 0)
-                    val method = obj.optString("cloneMethod", "buffer.slice")
-                    val isolated = obj.optBoolean("isIsolatedClone", true)
-                    val durationMs = obj.optDouble("durationMs", 0.0)
-                    val msg = "Isolated baseline cloned ($sampled floats via $method, ${String.format(Locale.US, "%.0f", durationMs)}ms). Walk 5+ steps, stop, then tap '2. Scan Movement Deltas'."
-                    _uiState.update { current ->
-                        current.copy(
-                            floatScanner = current.floatScanner.copy(
-                                isBusy = false,
-                                baselineCaptured = true,
-                                baselineSampleCount = sampled,
-                                prunedJitterCount = jitter,
-                                scanRound = 0,
-                                totalMatchesFound = 0,
-                                isLivePreviewing = false,
-                                candidates = emptyList(),
-                                statusMessage = msg
-                            )
-                        )
-                    }
-                    appendLog(
-                        LogCategory.SCAN,
-                        "Captured isolated baseline ($sampled floats, isolated=$isolated)",
-                        obj.toString()
+                    val previewSuffix = if (previewList.isNotEmpty()) " • ${previewList.joinToString(", ")}" else ""
+                    stagingPairs.add(path to "$ctor ($keyCount keys$previewSuffix)")
+                }
+
+                val detectedNs = extractStringArray(json.optJSONArray("detectedNamespaces"))
+                _uiState.update { state ->
+                    val nextScan = state.scanCounter + 1
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Step 1",
+                        scanNumber = nextScan,
+                        timestamp = nowTs
+                    )
+                    state.copy(
+                        scanCounter = nextScan,
+                        step1Completed = true,
+                        customGlobals = (state.customGlobals + globalKeys).distinct(),
+                        detectedGameNamespaces = (state.detectedGameNamespaces + detectedNs).distinct(),
+                        step1DurationMs = durationMs,
+                        canvasCount = canvases,
+                        stagingBuffer = mergedStaging,
+                        scopeBatchProgress = ScopeBatchProgress(
+                            isActive = false,
+                            isPaused = false,
+                            currentBatch = batchesExecuted,
+                            totalBatches = batchesExecuted,
+                            itemStart = 1,
+                            itemEnd = totalFiltered,
+                            totalItems = totalFiltered,
+                            foundCount = globalKeys.size
+                        ),
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Scan #$nextScan: ${globalKeys.size} globals ($batchesExecuted/$batchesExecuted batches)"
                     )
                 }
-                true
+                "Step 1 ($batchesExecuted/$batchesExecuted batches, ${durationMs}ms): Found ${globalKeys.size} custom globals across $totalFiltered keys • Staged"
             }
 
-            "FLOAT_DELTA_SCANNED" -> {
-                val success = obj.optBoolean("success", false)
-                if (!success) {
-                    val err = obj.optString("error", "Delta scan failed")
-                    _uiState.update { current ->
-                        current.copy(
-                            floatScanner = current.floatScanner.copy(isBusy = false, statusMessage = err)
-                        )
-                    }
-                    appendLog(LogCategory.ERROR, "Movement delta scan error: $err", obj.toString())
-                } else {
-                    val totalFound = obj.optInt("totalMatchesFound", 0)
-                    val round = obj.optInt("scanRound", 1)
-                    val durationMs = obj.optDouble("durationMs", 0.0)
-                    val livePreview = obj.optBoolean("isLivePreviewing", false)
-                    val preserved = obj.optBoolean("preservedDueToZeroDelta", false)
-                    val prunedMoving = obj.optInt("prunedMovingCount", 0)
-                    val arr = obj.optJSONArray("candidates") ?: JSONArray()
-                    val parsed = buildList {
-                        for (i in 0 until arr.length()) {
-                            val item = arr.optJSONObject(i) ?: continue
-                            val idx = item.optInt("heapIndex", -1)
-                            if (idx < 0) continue
-                            add(
-                                FloatDeltaCandidate(
-                                    heapIndex = idx,
-                                    byteAddress = item.optLong("byteAddress", idx.toLong() * 4L),
-                                    baselineValue = item.optDouble("baselineValue", 0.0),
-                                    currentValue = item.optDouble("currentValue", 0.0),
-                                    delta = item.optDouble("delta", 0.0),
-                                    previewY = item.optDouble("previewY", 0.0),
-                                    previewZ = item.optDouble("previewZ", 0.0),
-                                    isStillNow = item.optBoolean("isStillNow", true),
-                                    clusterSize = item.optInt("clusterSize", 1),
-                                    axisHint = item.optString("axisHint", "X"),
-                                    liveChangeCount = item.optInt("liveChangeCount", 0)
-                                )
-                            )
-                        }
-                    }
-                    if (preserved) {
-                        val keptMsg = "0 of $totalFound candidates moved since last scan. Walk further in-game, stop, then tap Scan Next (kept $totalFound candidates)."
-                        _uiState.update { current ->
-                            current.copy(
-                                floatScanner = current.floatScanner.copy(
-                                    isBusy = false,
-                                    scanDurationMs = durationMs,
-                                    statusMessage = keptMsg
-                                )
-                            )
-                        }
-                        appendLog(LogCategory.SCAN, "Kept $totalFound candidates (no delta)", keptMsg)
-                    } else {
-                        val statusMsg = if (parsed.isEmpty()) {
-                            "0 deltas in range 0.02..500.0. Walk further in-game or capture a fresh Standing Baseline."
-                        } else {
-                            "Round #$round: $totalFound matches (${parsed.size} shown" +
-                                (if (prunedMoving > 0) ", pruned $prunedMoving moving" else "") +
-                                ", ${String.format(Locale.US, "%.0f", durationMs)}ms). Move again & tap Scan Next to narrow further."
-                        }
-                        _uiState.update { current ->
-                            current.copy(
-                                floatScanner = current.floatScanner.copy(
-                                    isBusy = false,
-                                    scanRound = round,
-                                    totalMatchesFound = totalFound,
-                                    scanDurationMs = durationMs,
-                                    isLivePreviewing = livePreview,
-                                    candidates = parsed,
-                                    statusMessage = statusMsg
-                                )
-                            )
-                        }
-                        appendLog(
-                            LogCategory.SCAN,
-                            "Delta scan #$round: $totalFound matches (${parsed.size} ranked, pruned $prunedMoving moving)",
-                            statusMsg
-                        )
+            "BASELINE_CAPTURED" -> {
+                val metrics = json.optInt("metricCount", 0)
+                val roots = json.optInt("rootObjectCount", 0)
+                val durationMs = json.optDouble("durationMs", -1.0)
+                val skippedBinary = json.optInt("skippedBinaryOrWasm", 0)
+                val containersArr = json.optJSONArray("candidateContainers") ?: JSONArray()
+                val stagingPairs = buildList {
+                    for (i in 0 until containersArr.length()) {
+                        val obj = containersArr.optJSONObject(i) ?: continue
+                        val p = obj.optString("path", "").trim()
+                        val d = obj.optString("detail", "Coordinate container")
+                        if (p.isNotEmpty()) add(p to d)
                     }
                 }
-                true
-            }
+                val timingLabel = if (durationMs >= 0.0) "${String.format(Locale.US, "%.2f", durationMs)}ms" else "fast"
 
-            "POINTER_SIGNATURE_ANALYZED" -> {
-                val success = obj.optBoolean("success", false)
-                if (!success) {
-                    val err = obj.optString("error", "Signature analysis failed")
-                    _uiState.update { current ->
-                        current.copy(
-                            pointerAnalysis = current.pointerAnalysis.copy(
-                                isAnalyzing = false,
-                                errorMessage = err
-                            )
-                        )
-                    }
-                    appendLog(LogCategory.ERROR, "Pointer/Signature error: $err", obj.toString())
-                } else {
-                    val baseIdx = obj.optInt("baseIndex", _uiState.value.heapFeed.baseIndex)
-                    val byteAddr = obj.optLong("byteAddress", baseIdx.toLong() * 4L)
-                    val aobHex = obj.optString("aobPatternHex", "")
-                    val floatSummary = obj.optString("floatPatternSummary", "")
-                    val anchorCount = obj.optInt("anchorCount", 0)
-                    val sigJson = obj.optString("signatureJson", "").ifBlank { null }
-                    val durationMs = obj.optDouble("analysisDurationMs", 0.0)
-
-                    val ptrArr = obj.optJSONArray("parentPointers") ?: JSONArray()
-                    val pointers = buildList {
-                        for (i in 0 until ptrArr.length()) {
-                            val p = ptrArr.optJSONObject(i) ?: continue
-                            val pIdx = p.optInt("pointerHeapIndex", -1)
-                            if (pIdx < 0) continue
-                            add(
-                                ParentPointerMatch(
-                                    pointerHeapIndex = pIdx,
-                                    pointerByteAddress = p.optLong("pointerByteAddress", pIdx.toLong() * 4L),
-                                    targetByteAddress = p.optLong("targetByteAddress", 0L),
-                                    fieldOffsetBytes = p.optInt("fieldOffsetBytes", 0),
-                                    isExactMatch = p.optBoolean("isExactMatch", false)
-                                )
-                            )
-                        }
-                    }
-
-                    val slotArr = obj.optJSONArray("surroundingSlots") ?: JSONArray()
-                    val slots = buildList {
-                        for (i in 0 until slotArr.length()) {
-                            val s = slotArr.optJSONObject(i) ?: continue
-                            add(
-                                MemorySlotPreview(
-                                    offset = s.optInt("offset", 0),
-                                    heapIndex = s.optInt("heapIndex", 0),
-                                    byteAddress = s.optLong("byteAddress", 0L),
-                                    floatValue = s.optDouble("floatValue", 0.0),
-                                    uint32Hex = s.optString("uint32Hex", "0x00000000"),
-                                    isCoordAxis = s.optBoolean("isCoordAxis", false),
-                                    isAnchor = s.optBoolean("isAnchor", false)
-                                )
-                            )
-                        }
-                    }
-
-                    _uiState.update { current ->
-                        current.copy(
-                            pointerAnalysis = PointerSignatureAnalysis(
-                                inspectedBaseIndex = baseIdx,
-                                inspectedByteAddress = byteAddr,
-                                isAnalyzing = false,
-                                aobPatternHex = aobHex,
-                                floatPatternSummary = floatSummary,
-                                anchorCount = anchorCount,
-                                signatureJson = sigJson,
-                                parentPointers = pointers,
-                                surroundingSlots = slots,
-                                analysisDurationMs = durationMs,
-                                errorMessage = null
-                            ),
-                            heapFeed = current.heapFeed.copy(
-                                baseIndex = baseIdx,
-                                baseIndexInput = baseIdx.toString(),
-                                lockStatus = LockStatus.LOCKED,
-                                isPolling = true,
-                                hasSignature = sigJson != null,
-                                signatureAnchorCount = anchorCount,
-                                signatureCapturedAtIndex = baseIdx,
-                                signatureJson = sigJson
-                            )
-                        )
-                    }
-                    appendLog(
-                        LogCategory.PTR,
-                        "Analyzed [$baseIdx]: $anchorCount anchors, ${pointers.size} parent ptrs (${String.format(Locale.US, "%.0f", durationMs)}ms)",
-                        "AOB: $aobHex\nFloats: $floatSummary"
+                _uiState.update { state ->
+                    val nextScan = state.scanCounter + 1
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Step 2A",
+                        scanNumber = nextScan,
+                        timestamp = nowTs
+                    )
+                    state.copy(
+                        scanCounter = nextScan,
+                        baselineCaptured = true,
+                        baselineMetricCount = metrics,
+                        stagingBuffer = mergedStaging,
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "2A Captured ($metrics nums in $timingLabel)"
                     )
                 }
-                true
+                "Step 2A ($timingLabel): Captured $metrics primitive numbers across $roots globals (skipped $skippedBinary WASM/buffer objects)"
             }
 
-            "AUTO_RELOCK_RESULT" -> {
-                val success = obj.optBoolean("success", false)
-                val confidence = obj.optInt("confidencePercent", 0)
-                val durationMs = obj.optDouble("durationMs", 0.0)
-                if (!success) {
-                    val err = obj.optString("error", "Auto-relock did not find a match.")
-                    _uiState.update { current ->
-                        current.copy(
-                            heapFeed = current.heapFeed.copy(
-                                lockStatus = LockStatus.UNLOCKED,
-                                isRelocking = false,
-                                relockConfidencePercent = confidence,
-                                lastRelockSummary = err,
-                                statusMessage = err
-                            )
-                        )
-                    }
-                    appendLog(LogCategory.RELOCK, "Auto-Relock missed ($confidence%)", err)
-                } else {
-                    val matchedBase = obj.optInt("matchedBaseIndex", _uiState.value.heapFeed.baseIndex)
-                    val method = obj.optString("methodUsed", "Signature Scan")
-                    val x = obj.optDouble("x", 0.0)
-                    val y = obj.optDouble("y", 0.0)
-                    val z = obj.optDouble("z", 0.0)
-                    val byteLen = obj.optLong("heapByteLength", _uiState.value.heapFeed.heapByteLength)
-                    val source = obj.optString("heapSource", _uiState.value.heapFeed.heapSourceLabel)
-                    val summary = "Relocked [$matchedBase] via $method ($confidence% in ${String.format(Locale.US, "%.0f", durationMs)}ms)"
-                    _uiState.update { current ->
-                        current.copy(
-                            heapFeed = current.heapFeed.copy(
-                                baseIndex = matchedBase,
-                                baseIndexInput = matchedBase.toString(),
-                                heapSourceLabel = source,
-                                heapByteLength = byteLen,
-                                lockStatus = LockStatus.LOCKED,
-                                isPolling = true,
-                                isHeapReady = true,
-                                isRelocking = false,
-                                x = x,
-                                y = y,
-                                z = z,
-                                lastRelockSummary = summary,
-                                relockConfidencePercent = confidence,
-                                relockMethodUsed = method,
-                                statusMessage = summary
-                            )
-                        )
-                    }
-                    appendLog(LogCategory.RELOCK, summary, obj.toString())
-                    _commands.tryEmit(DiagnosticsCommand.ShowToast("Relocked @ HEAPF32[$matchedBase] ($confidence%)"))
+            "BASELINE_MISSING" -> {
+                _uiState.update {
+                    it.copy(
+                        scanStatus = AsyncScanStatus.IDLE,
+                        scanStatusDetail = "Capture 2A while standing still first"
+                    )
                 }
-                true
+                json.optString("message", "Stand still and capture 2A baseline first.")
             }
 
-            "NEARBY_ENTITIES_SCANNED" -> {
-                val success = obj.optBoolean("success", false)
-                if (!success) {
-                    val err = obj.optString("error", "Entity scan failed")
-                    _uiState.update { it.copy(isScanningEntities = false) }
-                    appendLog(LogCategory.ERROR, "Entity scan error: $err", obj.toString())
-                } else {
-                    val durationMs = obj.optDouble("durationMs", 0.0)
-                    val stride = if (obj.isNull("detectedStride")) null else obj.optInt("detectedStride", 0).takeIf { it > 0 }
-                    val arr = obj.optJSONArray("entities") ?: JSONArray()
-                    val entities = buildList {
-                        for (i in 0 until arr.length()) {
-                            val e = arr.optJSONObject(i) ?: continue
-                            val idx = e.optInt("baseIndex", -1)
-                            if (idx < 0) continue
-                            add(
-                                NearbyEntityStruct(
-                                    baseIndex = idx,
-                                    byteAddress = e.optLong("byteAddress", idx.toLong() * 4L),
-                                    offsetFromPlayer = e.optInt("offsetFromPlayer", 0),
-                                    x = e.optDouble("x", 0.0),
-                                    y = e.optDouble("y", 0.0),
-                                    z = e.optDouble("z", 0.0),
-                                    distanceToPlayer = e.optDouble("distanceToPlayer", 0.0),
-                                    strideGroup = e.optInt("strideGroup", 0),
-                                    confidenceScore = e.optInt("confidenceScore", 0),
-                                    isPinned = idx in pinnedEntityIndices
-                                )
+            "DELTA_COMPUTED" -> {
+                val deltasArray = json.optJSONArray("deltas") ?: JSONArray()
+                val isolatedList = buildList {
+                    for (i in 0 until deltasArray.length()) {
+                        val obj = deltasArray.optJSONObject(i) ?: continue
+                        add(
+                            IsolatedCoordinatePath(
+                                path = obj.optString("path", ""),
+                                baselineValue = obj.optDouble("baseline", 0.0),
+                                currentValue = obj.optDouble("current", 0.0),
+                                delta = obj.optDouble("delta", 0.0)
                             )
+                        )
+                    }
+                }
+                val playerPath = json.optString("discoveredPlayerPath", "").takeIf { it.isNotBlank() && it != "null" }
+                val propKeys = json.optString("propertyKeys", "")
+                val liveObj = json.optJSONObject("liveSample")
+                val liveCoords = if (playerPath != null && liveObj != null) {
+                    PlayerCoordinates(
+                        path = playerPath,
+                        x = liveObj.optDouble("x", 0.0),
+                        y = liveObj.optDouble("y", 0.0),
+                        z = liveObj.optDouble("z", 0.0)
+                    )
+                } else null
+
+                val stagingPairs = buildList {
+                    if (playerPath != null) {
+                        val keySummary = if (propKeys.isNotBlank()) "Live ref [$propKeys]" else "Live player container"
+                        add(playerPath to keySummary)
+                    }
+                    isolatedList.take(15).forEach { item ->
+                        if (item.path.isNotBlank()) {
+                            val sign = if (item.delta >= 0) "+" else ""
+                            add(item.path to "Δ $sign${String.format(Locale.US, "%.2f", item.delta)} (cur: ${String.format(Locale.US, "%.2f", item.currentValue)})")
                         }
-                    }.sortedWith(
-                        compareByDescending<NearbyEntityStruct> { it.isPinned }
-                            .thenByDescending { it.confidenceScore }
-                            .thenBy { it.distanceToPlayer }
-                    )
-
-                    _uiState.update { current ->
-                        current.copy(
-                            isScanningEntities = false,
-                            entityScanDurationMs = durationMs,
-                            entityDetectedStride = stride,
-                            discoveredEntities = entities
-                        )
                     }
-                    appendLog(
-                        LogCategory.ENTITY,
-                        "Scanned ${entities.size} nearby structs" + (stride?.let { " (stride=$it)" } ?: ""),
-                        "duration=${String.format(Locale.US, "%.0f", durationMs)}ms"
+                }
+
+                _uiState.update { state ->
+                    val nextScan = state.scanCounter + 1
+                    val mergedStaging = mergeIntoStagingBuffer(
+                        existing = state.stagingBuffer,
+                        incoming = stagingPairs,
+                        sourceStep = "Step 2B",
+                        scanNumber = nextScan,
+                        timestamp = nowTs
+                    )
+                    state.copy(
+                        scanCounter = nextScan,
+                        isolatedPaths = isolatedList,
+                        discoveredPlayerPath = playerPath ?: state.discoveredPlayerPath,
+                        playerPropertyKeys = if (propKeys.isNotBlank()) propKeys else state.playerPropertyKeys,
+                        livePlayerCoords = liveCoords ?: state.livePlayerCoords,
+                        livePollActive = playerPath != null || state.livePollActive,
+                        stagingBuffer = mergedStaging,
+                        scanStatus = if (playerPath != null) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = playerPath?.let { "Live 200ms: $it" } ?: "No movement detected"
                     )
                 }
-                true
+                val elapsedMs = json.optInt("elapsedMs", 0)
+                if (playerPath == null) {
+                    "Step 2B (${elapsedMs}ms): No player movement detected — walk 5–10 steps and retry."
+                } else {
+                    "Step 2B (${elapsedMs}ms): Live 200ms lock on $playerPath [$propKeys] (${isolatedList.size} deltas staged)"
+                }
+            }
+
+            "LIVE_REF_LOCKED" -> {
+                val playerPath = json.optString("discoveredPlayerPath", "").takeIf { it.isNotBlank() && it != "null" }
+                val propKeys = json.optString("propertyKeys", "")
+                val liveObj = json.optJSONObject("liveSample")
+                val liveCoords = if (playerPath != null && liveObj != null) {
+                    PlayerCoordinates(
+                        path = playerPath,
+                        x = liveObj.optDouble("x", 0.0),
+                        y = liveObj.optDouble("y", 0.0),
+                        z = liveObj.optDouble("z", 0.0)
+                    )
+                } else null
+                _uiState.update { state ->
+                    state.copy(
+                        discoveredPlayerPath = playerPath ?: state.discoveredPlayerPath,
+                        playerPropertyKeys = propKeys,
+                        livePlayerCoords = liveCoords ?: state.livePlayerCoords,
+                        livePollActive = playerPath != null,
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = playerPath?.let { "Live 200ms: $it" } ?: state.scanStatusDetail
+                    )
+                }
+                "Locked live 200ms reference on ${playerPath ?: "candidate"} [$propKeys]"
+            }
+
+            "LIVE_REF_FAILED" -> {
+                val msg = json.optString("message", "Could not bind candidate reference.")
+                _uiState.update { it.copy(scanStatus = AsyncScanStatus.ERROR, scanStatusDetail = "Live bind failed") }
+                msg
+            }
+
+            "ANCHOR_MISSING" -> {
+                _uiState.update {
+                    it.copy(
+                        scanStatus = AsyncScanStatus.IDLE,
+                        scanStatusDetail = "Complete Step 2B first"
+                    )
+                }
+                json.optString("message", "Complete Step 2B first.")
+            }
+
+            "ENTITIES_SCANNED" -> {
+                val count = json.optInt("entityCount", 0)
+                val arrayPath = json.optString("entityArrayPath", "").takeIf { it.isNotBlank() && it != "null" }
+                val mode = json.optString("projectionMode", "pinhole_viewport_fallback")
+                val vpObj = json.optJSONObject("viewport")
+                val vpW = vpObj?.optInt("width", 0) ?: 0
+                val vpH = vpObj?.optInt("height", 0) ?: 0
+                val entitiesArr = json.optJSONArray("entities") ?: JSONArray()
+                val parsedEntities = buildList {
+                    for (i in 0 until entitiesArr.length()) {
+                        val obj = entitiesArr.optJSONObject(i) ?: continue
+                        val world = obj.optJSONObject("world")
+                        add(
+                            DiscoveredEntitySample(
+                                name = obj.optString("name", "Entity"),
+                                id = obj.optString("id", ""),
+                                path = obj.optString("path", ""),
+                                worldX = world?.optDouble("x", 0.0) ?: 0.0,
+                                worldY = world?.optDouble("y", 0.0) ?: 0.0,
+                                worldZ = world?.optDouble("z", 0.0) ?: 0.0,
+                                distanceToPlayer = obj.optDouble("distanceToPlayer", 0.0),
+                                screenX = obj.optDouble("screenX", 0.0),
+                                screenY = obj.optDouble("screenY", 0.0),
+                                inViewport = obj.optBoolean("inViewport", false),
+                                sampleKeys = extractStringArray(obj.optJSONArray("sampleKeys"))
+                            )
+                        )
+                    }
+                }
+                _uiState.update { state ->
+                    val mergedStaging = if (arrayPath != null) {
+                        mergeIntoStagingBuffer(
+                            existing = state.stagingBuffer,
+                            incoming = listOf(arrayPath to "Entity collection ($count detected)"),
+                            sourceStep = "Step 3",
+                            scanNumber = state.scanCounter + 1,
+                            timestamp = nowTs
+                        )
+                    } else state.stagingBuffer
+
+                    state.copy(
+                        scanCounter = state.scanCounter + 1,
+                        discoveredEntityArrayPath = arrayPath,
+                        entityProjectionMode = mode,
+                        entityViewportWidth = vpW,
+                        entityViewportHeight = vpH,
+                        discoveredEntities = parsedEntities,
+                        lastEntityCount = count,
+                        stagingBuffer = mergedStaging,
+                        scanStatus = if (count > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = if (arrayPath != null) "$count entities in $arrayPath" else "0 sibling entities"
+                    )
+                }
+                if (arrayPath != null) {
+                    "Step 3: Found $count entities in $arrayPath (projection: $mode)"
+                } else {
+                    "Step 3: 0 sibling entity collections found near ${_uiState.value.discoveredPlayerPath}"
+                }
             }
 
             "MANUAL_EVAL" -> {
-                val success = obj.optBoolean("success", false)
-                if (success) {
-                    val res = obj.optString("result", "")
-                    appendLog(LogCategory.JS, "Eval => ${res.lineSequence().firstOrNull().orEmpty().take(72)}", res)
-                } else {
-                    val err = obj.optString("error", "Unknown JS eval error")
-                    appendLog(LogCategory.ERROR, "Eval error: $err", err)
+                val type = json.optString("resultType", "unknown")
+                val ms = json.optDouble("durationMs", 0.0)
+                val preview = json.optString("result", "").replace('\n', ' ').take(72)
+                _uiState.update {
+                    it.copy(
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "JS eval (${ms}ms)"
+                    )
                 }
-                true
+                "Result ($type, ${ms}ms): $preview"
             }
 
-            else -> {
-                appendLog(category, obj.optString("message", obj.toString().take(90)), obj.toString())
-                true
-            }
-        }
-    }
+            "WASM_HEAP_SCAN_COMPLETE" -> {
+                val totalMatches = json.optInt("totalMatches", 0)
+                val count32 = json.optInt("heap32MatchCount", 0)
+                val countF32 = json.optInt("heapF32MatchCount", 0)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val sourceLabel = json.optString("heapSourceLabel", "window.HEAP32 / HEAPF32")
+                val byteLength = json.optLong("heapByteLength", 0L)
+                val targetVal = json.optDouble("targetValue", 0.0)
+                val samples = parseWasmCandidates(json.optJSONArray("samples"))
+                val autoObj = json.optJSONObject("autoIsolated")
+                val autoType = autoObj?.optString("heapType", "")?.takeIf { it.isNotBlank() }
+                val autoIdx = autoObj?.optInt("index", -1)?.takeIf { it >= 0 }
+                val autoByteAddr = autoObj?.optLong("byteAddress", (autoIdx ?: 0).toLong() * 4L)
+                val autoVal = autoObj?.optString("currentValue", "").orEmpty()
 
-    // -------------------------------------------------------------------------
-    // Export Reports & Full Log Dumps
-    // -------------------------------------------------------------------------
+                val statusMsg = when {
+                    totalMatches == 0 ->
+                        "0 matches for $targetVal in $sourceLabel. Double-check your exact stat value."
+                    autoIdx != null && autoType != null ->
+                        "Exact match isolated: $autoType[$autoIdx] (${formatHexAddress(autoByteAddr ?: 0L)})! Streaming ±16B neighbors."
+                    else ->
+                        "Found $totalMatches matches (HEAP32: $count32, HEAPF32: $countF32) in ${durationMs}ms. Take damage/heal, enter new HP, and tap Filter."
+                }
 
-    fun requestExportReport(
-        armBridge: () -> Unit,
-        disarmBridge: () -> Boolean
-    ) {
-        if (_uiState.value.isExporting) return
-        _uiState.update { it.copy(isExporting = true) }
-        armBridge()
-        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildCollectViewportMetricsScript()))
-
-        pendingExportTimeoutJob?.cancel()
-        pendingExportTimeoutJob = viewModelScope.launch {
-            delay(2_500L)
-            if (disarmBridge()) {
-                val fallbackMetrics = JSONObject().put("note", "WebView did not respond within timeout; exported native state only.").toString()
-                onReportPayloadFromBridge(fallbackMetrics)
-            }
-        }
-    }
-
-    fun onReportPayloadFromBridge(jsonContent: String) {
-        pendingExportTimeoutJob?.cancel()
-        val snapshot = _uiState.value
-        val appCtx = getApplication<Application>()
-
-        viewModelScope.launch(Dispatchers.IO) {
-            val fullReport = buildDiagnosticReportJson(snapshot, jsonContent)
-            val outcome = ReportExporter.exportJsonToDownloads(
-                context = appCtx,
-                jsonContent = fullReport,
-                filePrefix = "webview_diagnostics"
-            )
-            withContext(Dispatchers.Main) {
-                _uiState.update { it.copy(isExporting = false, lastExport = outcome) }
-                if (outcome.success) {
-                    appendLog(LogCategory.SYSTEM, "Exported report: ${outcome.displayPath}", outcome.fileName)
-                    _commands.tryEmit(
-                        DiagnosticsCommand.ShowToast(
-                            appCtx.getString(R.string.toast_report_saved, outcome.displayPath)
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = if (totalMatches > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = "WASM Scan: $totalMatches matches (${durationMs}ms)",
+                        wasmHeap = state.wasmHeap.copy(
+                            isScanning = false,
+                            heapSourceLabel = sourceLabel,
+                            heapByteLength = byteLength,
+                            initialSearchValue = targetVal,
+                            totalMatches = totalMatches,
+                            heap32MatchCount = count32,
+                            heapF32MatchCount = countF32,
+                            filterRound = 0,
+                            survivingCandidates = samples,
+                            isolatedHeapType = autoType,
+                            isolatedIndex = autoIdx,
+                            isolatedByteAddress = if (autoIdx != null) autoByteAddr else null,
+                            isolatedCurrentValue = autoVal,
+                            isNeighborPolling = autoIdx != null,
+                            statusMessage = statusMsg
                         )
                     )
-                } else {
-                    val err = outcome.errorMessage ?: "Export error"
-                    appendLog(LogCategory.ERROR, "Report export failed", err)
-                    _commands.tryEmit(
-                        DiagnosticsCommand.ShowToast(appCtx.getString(R.string.toast_report_failed, err))
-                    )
                 }
-            }
-        }
-    }
-
-    fun onShareLastReport() {
-        val export = _uiState.value.lastExport ?: return
-        val uri = export.contentUri ?: return
-        val title = getApplication<Application>().getString(R.string.share_report_chooser_title)
-        _commands.tryEmit(DiagnosticsCommand.ShareFile(uri, export.mimeType, title))
-    }
-
-    fun exportFullLogDump(asJson: Boolean) {
-        if (_uiState.value.isExportingLogDump) return
-        val snapshot = _uiState.value
-        val appCtx = getApplication<Application>()
-        _uiState.update { it.copy(isExportingLogDump = true) }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            val outcome = if (asJson) {
-                val jsonDump = buildDiagnosticReportJson(snapshot, null)
-                ReportExporter.exportJsonToDownloads(
-                    context = appCtx,
-                    jsonContent = jsonDump,
-                    filePrefix = "webview_log_dump"
-                )
-            } else {
-                val textDump = buildFullLogDumpText(snapshot)
-                ReportExporter.exportTextLogDumpToDownloads(
-                    context = appCtx,
-                    textContent = textDump
-                )
+                "WASM Scan (${durationMs}ms): Found $totalMatches addresses for $targetVal (HEAP32: $count32, HEAPF32: $countF32) in $sourceLabel"
             }
 
-            withContext(Dispatchers.Main) {
-                _uiState.update { it.copy(isExportingLogDump = false, lastLogDumpExport = outcome) }
-                if (outcome.success) {
-                    appendLog(LogCategory.SYSTEM, "Exported log dump: ${outcome.displayPath}", outcome.fileName)
-                    _commands.tryEmit(
-                        DiagnosticsCommand.ShowToast(
-                            appCtx.getString(R.string.toast_log_dump_saved, outcome.displayPath)
+            "WASM_HEAP_DELTA_FILTERED" -> {
+                val totalMatches = json.optInt("totalMatches", 0)
+                val prevCount = json.optInt("previousCount", 0)
+                val count32 = json.optInt("heap32MatchCount", 0)
+                val countF32 = json.optInt("heapF32MatchCount", 0)
+                val filterRound = json.optInt("filterRound", 1)
+                val newVal = json.optDouble("newValue", 0.0)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val sourceLabel = json.optString("heapSourceLabel", "")
+                val byteLength = json.optLong("heapByteLength", 0L)
+                val samples = parseWasmCandidates(json.optJSONArray("samples"))
+                val autoObj = json.optJSONObject("autoIsolated")
+                val autoType = autoObj?.optString("heapType", "")?.takeIf { it.isNotBlank() }
+                val autoIdx = autoObj?.optInt("index", -1)?.takeIf { it >= 0 }
+                val autoByteAddr = autoObj?.optLong("byteAddress", (autoIdx ?: 0).toLong() * 4L)
+                val autoVal = autoObj?.optString("currentValue", "").orEmpty()
+
+                val statusMsg = when {
+                    autoIdx != null && autoType != null ->
+                        "Isolated $autoType[$autoIdx] (${formatHexAddress(autoByteAddr ?: 0L)})! Live ±16B neighbor polling started."
+                    totalMatches == 0 ->
+                        "0 matches left after filtering for $newVal (from $prevCount). Tap Reset and run a fresh Step 1 scan."
+                    else ->
+                        "Filter #$filterRound narrowed $prevCount → $totalMatches matches. Change HP again or tap a candidate below to inspect ±16B."
+                }
+
+                _uiState.update { state ->
+                    val mergedStaging = if (autoIdx != null && autoType != null) {
+                        mergeIntoStagingBuffer(
+                            existing = state.stagingBuffer,
+                            incoming = listOf("$autoType[$autoIdx]" to "Isolated WASM stat (${formatHexAddress(autoByteAddr ?: 0L)}) = $autoVal"),
+                            sourceStep = "WASM Heap",
+                            scanNumber = state.scanCounter.coerceAtLeast(1),
+                            timestamp = nowTs,
+                            forcePin = true
+                        )
+                    } else state.stagingBuffer
+
+                    state.copy(
+                        stagingBuffer = mergedStaging,
+                        scanStatus = if (totalMatches > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = if (autoIdx != null && autoType != null) {
+                            "Isolated $autoType[$autoIdx] • Polling ±16B"
+                        } else {
+                            "WASM Filter #$filterRound: $totalMatches remaining"
+                        },
+                        wasmHeap = state.wasmHeap.copy(
+                            isScanning = false,
+                            heapSourceLabel = sourceLabel.ifBlank { state.wasmHeap.heapSourceLabel },
+                            heapByteLength = if (byteLength > 0L) byteLength else state.wasmHeap.heapByteLength,
+                            lastFilterValue = newVal,
+                            totalMatches = totalMatches,
+                            heap32MatchCount = count32,
+                            heapF32MatchCount = countF32,
+                            filterRound = filterRound,
+                            survivingCandidates = samples,
+                            isolatedHeapType = autoType ?: state.wasmHeap.isolatedHeapType,
+                            isolatedIndex = autoIdx ?: state.wasmHeap.isolatedIndex,
+                            isolatedByteAddress = if (autoIdx != null) autoByteAddr else state.wasmHeap.isolatedByteAddress,
+                            isolatedCurrentValue = if (autoIdx != null) autoVal else state.wasmHeap.isolatedCurrentValue,
+                            isNeighborPolling = autoIdx != null || state.wasmHeap.isNeighborPolling,
+                            statusMessage = statusMsg
                         )
                     )
-                } else {
-                    val err = outcome.errorMessage ?: "Export error"
-                    appendLog(LogCategory.ERROR, "Log dump export failed", err)
-                    _commands.tryEmit(
-                        DiagnosticsCommand.ShowToast(appCtx.getString(R.string.toast_report_failed, err))
+                }
+                "WASM Filter #$filterRound (${durationMs}ms): $prevCount → $totalMatches matches for $newVal" +
+                    if (autoIdx != null && autoType != null) " • Isolated $autoType[$autoIdx] (${formatHexAddress(autoByteAddr ?: 0L)})" else ""
+            }
+
+            "WASM_HEAP_ERROR" -> {
+                val msg = json.optString("message", "WASM heap operation failed.")
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.ERROR,
+                        scanStatusDetail = msg.take(60),
+                        wasmHeap = state.wasmHeap.copy(
+                            isScanning = false,
+                            statusMessage = msg
+                        )
                     )
                 }
+                _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+                "WASM Tracker: $msg"
+            }
+
+            "WASM_FLOAT_BASELINE_CAPTURED" -> {
+                val sampledCount = json.optInt("sampledCount", 0)
+                val prunedJitter = json.optInt("prunedJitterCount", 0)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val sourceLabel = json.optString("heapSourceLabel", "window.HEAPF32")
+                val byteLen = json.optLong("heapByteLength", 0L)
+
+                val msg = "Captured $sampledCount stable floats in ${durationMs}ms (pruned $prunedJitter ticking timers). Walk 5 steps forward, then tap 'Scan Float Heap Deltas'."
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Float Baseline: $sampledCount stable floats (${durationMs}ms)",
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            isSamplingBaseline = false,
+                            baselineCaptured = sampledCount > 0,
+                            baselineSampleCount = sampledCount,
+                            baselinePrunedJitterCount = prunedJitter,
+                            heapSourceLabel = sourceLabel,
+                            heapByteLength = byteLen,
+                            statusMessage = msg
+                        )
+                    )
+                }
+                "Step 2A (Float Mode, ${durationMs}ms): Sampled $sampledCount stable floats in $sourceLabel (pruned $prunedJitter jitter slots)"
+            }
+
+            "WASM_FLOAT_DELTA_SCANNED" -> {
+                val totalMatches = json.optInt("totalMatches", 0)
+                val scanRound = json.optInt("scanRound", 1)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val sourceLabel = json.optString("heapSourceLabel", "window.HEAPF32")
+                val byteLen = json.optLong("heapByteLength", 0L)
+                val parsedCandidates = parseWasmFloatDeltaCandidates(
+                    array = json.optJSONArray("candidates"),
+                    pinnedIndices = _uiState.value.wasmFloatDelta.pinnedIndices
+                )
+
+                val stagingPairs = parsedCandidates.take(6).map { c ->
+                    val axisTag = if (c.axisHint.isNotBlank()) "[${c.axisHint}] " else ""
+                    val hex = formatHexAddress(c.byteAddress)
+                    "window.HEAPF32[${c.heapIndex}]" to "${axisTag}$hex • cur=${String.format(Locale.US, "%.3f", c.currentValue)} (Δ ${String.format(Locale.US, "%+.3f", c.delta)})"
+                }
+
+                val statusMsg = if (totalMatches > 0) {
+                    "Round #$scanRound: Found $totalMatches moving floats (${durationMs}ms). Streaming top ${parsedCandidates.size} live below — walk again & re-tap to refine!"
+                } else {
+                    "Round #$scanRound: 0 floats moved in positional range (0.05..250). Walk further or recapture Baseline."
+                }
+
+                _uiState.update { state ->
+                    val nextScan = state.scanCounter + 1
+                    val mergedStaging = if (stagingPairs.isNotEmpty()) {
+                        mergeIntoStagingBuffer(
+                            existing = state.stagingBuffer,
+                            incoming = stagingPairs,
+                            sourceStep = "Float Delta #$scanRound",
+                            scanNumber = nextScan,
+                            timestamp = nowTs
+                        )
+                    } else state.stagingBuffer
+
+                    state.copy(
+                        scanCounter = nextScan,
+                        stagingBuffer = mergedStaging,
+                        scanStatus = if (totalMatches > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = if (totalMatches > 0) {
+                            "Float Deltas #$scanRound: $totalMatches matches • Live 200ms"
+                        } else {
+                            "Float Deltas #$scanRound: 0 matches"
+                        },
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            isScanningDeltas = false,
+                            heapSourceLabel = sourceLabel.ifBlank { state.wasmFloatDelta.heapSourceLabel },
+                            heapByteLength = if (byteLen > 0L) byteLen else state.wasmFloatDelta.heapByteLength,
+                            totalDeltaMatches = totalMatches,
+                            scanRound = scanRound,
+                            isLiveWatching = parsedCandidates.isNotEmpty(),
+                            candidates = parsedCandidates,
+                            isWatcherExpanded = true,
+                            statusMessage = statusMsg
+                        )
+                    )
+                }
+                "Step 2B (Float Mode #$scanRound, ${durationMs}ms): Isolated $totalMatches moving floats in $sourceLabel • Watching top ${parsedCandidates.size}"
+            }
+
+            "WASM_FLOAT_ERROR" -> {
+                val msg = json.optString("message", "WASM Float Heap scan failed.")
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.ERROR,
+                        scanStatusDetail = msg.take(60),
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            isSamplingBaseline = false,
+                            isScanningDeltas = false,
+                            isScanningPointers = false,
+                            statusMessage = msg
+                        )
+                    )
+                }
+                _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+                "WASM Float Delta: $msg"
+            }
+
+            "WASM_POINTER_SCAN_COMPLETE" -> {
+                val totalL1 = json.optInt("totalL1", 0)
+                val totalL2 = json.optInt("totalL2", 0)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val targetAddr = json.optLong("targetByteAddress", 0L)
+                val pinnedExisting = _uiState.value.wasmFloatDelta.pointerChains.filter { it.isPinned }
+                val pinnedIds = pinnedExisting.map { it.id }.toSet()
+                val parsedChains = parseWasmPointerChains(json.optJSONArray("chains"), pinnedIds)
+
+                // Merge newly discovered chains while preserving any previously pinned chains
+                val mergedChains = buildList {
+                    val seen = LinkedHashSet<String>()
+                    parsedChains.forEach { c ->
+                        if (seen.add(c.id)) add(c)
+                    }
+                    pinnedExisting.forEach { c ->
+                        if (seen.add(c.id)) add(c)
+                    }
+                }
+
+                val staticCount = parsedChains.count { it.isLikelyStatic }
+                val pointerMsg = if (parsedChains.isNotEmpty()) {
+                    "Found L1=$totalL1, L2=$totalL2 pointers ($staticCount in static <2MB region) in ${durationMs}ms. Reload & tap 'Verify Live' to confirm persistence."
+                } else {
+                    "0 direct L1/L2 pointers found within 256B of ${formatHexAddress(targetAddr)} (${durationMs}ms). Try locking an adjacent Vec3 slot or checking ±16B neighbors."
+                }
+
+                val stagingPairs = parsedChains.filter { it.isLikelyStatic }.ifEmpty { parsedChains }.take(3).map { c ->
+                    val tag = if (c.isLikelyStatic) "STATIC" else "HEAP"
+                    "WASM_PTR: ${c.expression}" to "[L${c.depth} $tag] -> ${formatHexAddress(c.resolvedTargetAddress)}"
+                }
+
+                _uiState.update { state ->
+                    val nextScan = state.scanCounter + 1
+                    val mergedStaging = if (stagingPairs.isNotEmpty()) {
+                        mergeIntoStagingBuffer(
+                            existing = state.stagingBuffer,
+                            incoming = stagingPairs,
+                            sourceStep = "Pointer Scan",
+                            scanNumber = nextScan,
+                            timestamp = nowTs
+                        )
+                    } else state.stagingBuffer
+
+                    state.copy(
+                        scanCounter = nextScan,
+                        stagingBuffer = mergedStaging,
+                        scanStatus = if (parsedChains.isNotEmpty()) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = "Pointers: L1=$totalL1, L2=$totalL2 (${durationMs}ms)",
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            isScanningPointers = false,
+                            pointerScanTotalL1 = totalL1,
+                            pointerScanTotalL2 = totalL2,
+                            pointerChains = mergedChains,
+                            pointerStatusMessage = pointerMsg
+                        )
+                    )
+                }
+                "Pointer Scan (${durationMs}ms): L1=$totalL1, L2=$totalL2 chains to ${formatHexAddress(targetAddr)} ($staticCount static)"
+            }
+
+            "WASM_POINTER_CHAINS_VERIFIED" -> {
+                val validCount = json.optInt("validCount", 0)
+                val totalCount = json.optInt("totalCount", 0)
+                val resultsArr = json.optJSONArray("results") ?: JSONArray()
+                val byId = HashMap<String, JSONObject>(resultsArr.length())
+                for (i in 0 until resultsArr.length()) {
+                    val obj = resultsArr.optJSONObject(i) ?: continue
+                    val id = obj.optString("id", "")
+                    if (id.isNotBlank()) byId[id] = obj
+                }
+
+                val verifyMsg = "Live verification: $validCount/$totalCount pointer chains resolved to valid coordinates."
+                _uiState.update { state ->
+                    val updatedChains = state.wasmFloatDelta.pointerChains.map { chain ->
+                        val res = byId[chain.id]
+                        if (res != null) {
+                            val ok = res.optBoolean("isVerifiedLive", false)
+                            chain.copy(
+                                resolvedTargetAddress = if (ok) res.optLong("resolvedTargetAddress", chain.resolvedTargetAddress) else 0L,
+                                resolvedX = if (ok) res.optDouble("resolvedX", chain.resolvedX) else 0.0,
+                                resolvedY = if (ok) res.optDouble("resolvedY", chain.resolvedY) else 0.0,
+                                resolvedZ = if (ok) res.optDouble("resolvedZ", chain.resolvedZ) else 0.0,
+                                isVerifiedLive = ok
+                            )
+                        } else {
+                            chain
+                        }
+                    }
+                    state.copy(
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Verified $validCount/$totalCount pointers",
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            pointerChains = updatedChains,
+                            pointerStatusMessage = verifyMsg
+                        )
+                    )
+                }
+                _effects.tryEmit(DiagnosticsEffect.ShowToast(verifyMsg))
+                "Pointer Verify: $validCount/$totalCount chains resolved live"
+            }
+
+            "WASM_POINTER_ERROR" -> {
+                val msg = json.optString("message", "WASM pointer scan failed.")
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.ERROR,
+                        scanStatusDetail = msg.take(60),
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            isScanningPointers = false,
+                            pointerStatusMessage = msg
+                        )
+                    )
+                }
+                _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+                "Pointer Scan Error: $msg"
+            }
+
+            else -> payload.take(110)
+        }
+    }
+
+    private fun parseWasmPointerChains(
+        array: JSONArray?,
+        pinnedIds: Set<String>
+    ): List<WasmPointerChain> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val id = obj.optString("id", "").trim()
+                if (id.isEmpty()) continue
+                val depth = obj.optInt("depth", 1)
+                val baseAddr = obj.optLong("basePointerAddress", 0L)
+                val offArr = obj.optJSONArray("offsets")
+                val offsets = buildList {
+                    if (offArr != null) {
+                        for (j in 0 until offArr.length()) {
+                            add(offArr.optInt(j, 0))
+                        }
+                    }
+                }
+                val resolvedTarget = obj.optLong("resolvedTargetAddress", 0L)
+                val rx = obj.optDouble("resolvedX", 0.0)
+                val ry = obj.optDouble("resolvedY", 0.0)
+                val rz = obj.optDouble("resolvedZ", 0.0)
+                val isStatic = obj.optBoolean("isLikelyStatic", false)
+                val isVerified = obj.optBoolean("isVerifiedLive", true)
+                val expr = obj.optString("expression", "")
+                add(
+                    WasmPointerChain(
+                        id = id,
+                        depth = depth,
+                        basePointerAddress = baseAddr,
+                        offsets = offsets,
+                        resolvedTargetAddress = resolvedTarget,
+                        resolvedX = rx,
+                        resolvedY = ry,
+                        resolvedZ = rz,
+                        isLikelyStatic = isStatic,
+                        isVerifiedLive = isVerified,
+                        expression = expr,
+                        isPinned = pinnedIds.contains(id)
+                    )
+                )
             }
         }
     }
 
-    fun onShareLastLogDump() {
-        val export = _uiState.value.lastLogDumpExport ?: return
-        val uri = export.contentUri ?: return
-        val title = getApplication<Application>().getString(R.string.share_report_chooser_title)
-        _commands.tryEmit(DiagnosticsCommand.ShareFile(uri, export.mimeType, title))
-    }
-
-    // -------------------------------------------------------------------------
-    // Internal Helpers
-    // -------------------------------------------------------------------------
-
-    private data class CandidatePreviewUpdate(
-        val currentValue: Double,
-        val delta: Double,
-        val previewY: Double,
-        val previewZ: Double,
-        val isStillNow: Boolean,
-        val liveChangeCount: Int
-    )
-
-    private fun parsePreviewUpdates(jsonPayload: String): Map<Int, CandidatePreviewUpdate> {
-        return runCatching {
-            val root = JSONObject(jsonPayload)
-            val arr = root.optJSONArray("updates") ?: return emptyMap()
-            val map = HashMap<Int, CandidatePreviewUpdate>(arr.length())
-            for (i in 0 until arr.length()) {
-                val u = arr.optJSONObject(i) ?: continue
-                val idx = u.optInt("heapIndex", -1)
+    private fun parseWasmFloatDeltaCandidates(
+        array: JSONArray?,
+        pinnedIndices: Set<Int>
+    ): List<WasmFloatDeltaCandidate> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val idx = obj.optInt("heapIndex", -1)
                 if (idx < 0) continue
-                map[idx] = CandidatePreviewUpdate(
-                    currentValue = u.optDouble("currentValue", 0.0),
-                    delta = u.optDouble("delta", 0.0),
-                    previewY = u.optDouble("previewY", 0.0),
-                    previewZ = u.optDouble("previewZ", 0.0),
-                    isStillNow = u.optBoolean("isStillNow", true),
-                    liveChangeCount = u.optInt("liveChangeCount", 0)
+                val byteAddr = obj.optLong("byteAddress", idx.toLong() * 4L)
+                val baseVal = obj.optDouble("baselineValue", 0.0)
+                val curVal = obj.optDouble("currentValue", 0.0)
+                val deltaVal = obj.optDouble("delta", curVal - baseVal)
+                val cluster = obj.optInt("clusterSize", 1)
+                val axis = obj.optString("axisHint", "")
+                add(
+                    WasmFloatDeltaCandidate(
+                        heapIndex = idx,
+                        byteAddress = byteAddr,
+                        baselineValue = baseVal,
+                        currentValue = curVal,
+                        delta = deltaVal,
+                        clusterSize = cluster,
+                        axisHint = axis,
+                        isPinned = pinnedIndices.contains(idx)
+                    )
                 )
             }
-            map
-        }.getOrDefault(emptyMap())
+        }
     }
 
-    private fun serializeParentPointers(pointers: List<ParentPointerMatch>): String {
-        val arr = JSONArray()
-        pointers.forEach { ptr ->
-            arr.put(
-                JSONObject().apply {
-                    put("pointerHeapIndex", ptr.pointerHeapIndex)
-                    put("pointerByteAddress", ptr.pointerByteAddress)
-                    put("targetByteAddress", ptr.targetByteAddress)
-                    put("fieldOffsetBytes", ptr.fieldOffsetBytes)
-                    put("isExactMatch", ptr.isExactMatch)
-                }
-            )
+    private fun parseWasmCandidates(array: JSONArray?): List<WasmCandidateAddress> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val heapType = obj.optString("heapType", "HEAP32")
+                val index = obj.optInt("index", -1)
+                if (index < 0) continue
+                val byteAddr = obj.optLong("byteAddress", index.toLong() * 4L)
+                val curVal = obj.optString("currentValue", "")
+                add(
+                    WasmCandidateAddress(
+                        heapType = heapType,
+                        index = index,
+                        byteAddress = byteAddr,
+                        currentValue = curVal
+                    )
+                )
+            }
         }
-        return arr.toString()
     }
 
-    private fun buildDiagnosticReportJson(
-        state: DiagnosticsUiState,
-        webViewMetricsJson: String?
-    ): String {
-        val root = JSONObject()
-        root.put("exportedAtEpochMs", System.currentTimeMillis())
-        root.put("activeUrl", state.activeUrl)
-        root.put("pageTitle", state.pageTitle)
-        root.put("desktopMode", state.isDesktopMode)
-
-        if (!webViewMetricsJson.isNullOrBlank()) {
-            runCatching { root.put("webViewMetrics", JSONObject(webViewMetricsJson)) }
-        }
-
-        val feed = state.heapFeed
-        root.put(
-            "directHeapFeed",
-            JSONObject().apply {
-                put("baseIndex", feed.baseIndex)
-                put("byteAddressHex", formatHexAddress(feed.byteAddress))
-                put("heapSource", feed.heapSourceLabel)
-                put("heapByteLength", feed.heapByteLength)
-                put("lockStatus", feed.lockStatus.name)
-                put("x", feed.x)
-                put("y", feed.y)
-                put("z", feed.z)
-                put("tickCount", feed.tickCount)
-                put("autoRelockOnReload", feed.autoRelockOnReload)
-                put("relockConfidencePercent", feed.relockConfidencePercent)
-                put("relockMethodUsed", feed.relockMethodUsed)
+    private fun extractStringArray(array: JSONArray?): List<String> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val item = array.optString(i, "").trim()
+                if (item.isNotEmpty()) add(item)
             }
-        )
-
-        val analysis = state.pointerAnalysis
-        root.put(
-            "pointerSignature",
-            JSONObject().apply {
-                put("inspectedBaseIndex", analysis.inspectedBaseIndex)
-                put("aobPatternHex", analysis.aobPatternHex)
-                put("floatPatternSummary", analysis.floatPatternSummary)
-                put("anchorCount", analysis.anchorCount)
-                put("parentPointerCount", analysis.parentPointers.size)
-            }
-        )
-
-        val entitiesArr = JSONArray()
-        state.discoveredEntities.forEach { e ->
-            entitiesArr.put(
-                JSONObject().apply {
-                    put("baseIndex", e.baseIndex)
-                    put("byteAddressHex", formatHexAddress(e.byteAddress))
-                    put("offsetFromPlayer", e.offsetFromPlayer)
-                    put("x", e.x)
-                    put("y", e.y)
-                    put("z", e.z)
-                    put("distanceToPlayer", e.distanceToPlayer)
-                    put("strideGroup", e.strideGroup)
-                    put("isPinned", e.isPinned)
-                }
-            )
         }
-        root.put("nearbyEntities", entitiesArr)
-
-        val assetsArr = JSONArray()
-        state.interceptedAssets.forEach { a ->
-            assetsArr.put(
-                JSONObject().apply {
-                    put("url", a.url)
-                    put("fileName", a.fileName)
-                    put("extension", a.extension)
-                    put("captureStatus", a.captureStatus.name)
-                    put("byteSize", a.byteSize)
-                    put("sha256Prefix", a.sha256Prefix)
-                    put("magicSignature", a.magicSignature)
-                    put("structuralSummary", a.structuralSummary)
-                }
-            )
-        }
-        root.put("interceptedAssets", assetsArr)
-
-        val logsArr = JSONArray()
-        state.logs.forEach { log ->
-            logsArr.put(
-                JSONObject().apply {
-                    put("id", log.id)
-                    put("timestamp", log.timestamp)
-                    put("category", log.category.tag)
-                    put("summary", log.summary)
-                    put("payload", log.payload)
-                }
-            )
-        }
-        root.put("logs", logsArr)
-        return root.toString(2)
     }
 
     private fun appendLog(category: LogCategory, summary: String, payload: String) {
+        val now = System.currentTimeMillis()
         val entry = TelemetryLogEntry(
-            id = nextLogId.getAndIncrement(),
-            timestamp = nowTimeLabel(),
-            epochMs = System.currentTimeMillis(),
+            id = logIdGenerator.getAndIncrement(),
+            timestamp = formatTimestamp(now),
+            epochMs = now,
             category = category,
-            summary = summary.ifBlank { category.label },
+            summary = summary,
             payload = payload
         )
-        _uiState.update { current ->
-            val updated = (listOf(entry) + current.logs).take(MAX_LOG_ENTRIES)
-            current.copy(logs = updated)
+        _uiState.update { state ->
+            val updated = (state.logs + entry).takeLast(MAX_LOG_ENTRIES)
+            state.copy(logs = updated)
         }
     }
 
-    private fun extractHost(url: String): String {
-        return runCatching { URI(url).host.orEmpty() }.getOrDefault("")
+    private fun buildFullReportJson(
+        state: DiagnosticsUiState,
+        viewportMetricsJson: String
+    ): String {
+        val root = JSONObject()
+        root.put("application", "WebViewDiagnosticsApp")
+        root.put("generatedAtIso", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date()))
+        root.put("activeUrl", state.activeUrl)
+        root.put("pageTitle", state.pageTitle)
+        root.put("desktopUserAgentEnabled", state.isDesktopMode)
+        root.put("remoteWebContentsDebuggingEnabled", false)
+        root.put("totalScansExecuted", state.scanCounter)
+
+        val bridgeObj = try {
+            JSONObject(viewportMetricsJson)
+        } catch (_: Exception) {
+            JSONObject().put("raw", viewportMetricsJson)
+        }
+
+        // 1. Viewport dimensions
+        val viewportObj = bridgeObj.optJSONObject("viewport") ?: JSONObject()
+        root.put(
+            "viewport",
+            JSONObject()
+                .put("width", viewportObj.optInt("width", viewportObj.optInt("innerWidth", 0)))
+                .put("height", viewportObj.optInt("height", viewportObj.optInt("innerHeight", 0)))
+                .put("devicePixelRatio", viewportObj.optDouble("devicePixelRatio", 1.0))
+                .put("canvases", bridgeObj.optJSONArray("canvases") ?: JSONArray())
+        )
+
+        // 2. Pinned Candidate Staging List & Full Accumulated Buffer
+        val pinnedArr = JSONArray()
+        val fullStagingArr = JSONArray()
+        state.stagingBuffer.forEach { item ->
+            val itemJson = JSONObject()
+                .put("path", item.path)
+                .put("sourceStep", item.sourceStep)
+                .put("detail", item.detail)
+                .put("scanNumber", item.scanNumber)
+                .put("seenCount", item.seenCount)
+                .put("isPinned", item.isPinned)
+                .put("lastSeenTimestamp", item.lastSeenTimestamp)
+            fullStagingArr.put(itemJson)
+            if (item.isPinned) pinnedArr.put(itemJson)
+        }
+        root.put("pinnedCandidates", pinnedArr)
+        root.put("candidateStagingBuffer", fullStagingArr)
+
+        // 3. Confirmed Live Player Coordinate Reference Path + Live Sample
+        val confirmedPlayerPath = state.discoveredPlayerPath
+            ?: bridgeObj.optString("discoveredPlayerPath", "").takeIf { it.isNotBlank() && it != "null" }
+        val liveSampleJson = JSONObject().apply {
+            val live = state.livePlayerCoords
+            val bridgeLive = bridgeObj.optJSONObject("livePlayerSample")
+            if (bridgeLive != null) {
+                put("x", bridgeLive.optDouble("x", live?.x ?: 0.0))
+                put("y", bridgeLive.optDouble("y", live?.y ?: 0.0))
+                put("z", bridgeLive.optDouble("z", live?.z ?: 0.0))
+            } else if (live != null) {
+                put("x", live.x)
+                put("y", live.y)
+                put("z", live.z)
+            }
+        }
+        val deltasArr = JSONArray()
+        state.isolatedPaths.forEach { item ->
+            deltasArr.put(
+                JSONObject()
+                    .put("path", item.path)
+                    .put("baseline", item.baselineValue)
+                    .put("current", item.currentValue)
+                    .put("delta", item.delta)
+            )
+        }
+        root.put(
+            "playerCoordinates",
+            JSONObject()
+                .put("confirmedJsPath", confirmedPlayerPath ?: JSONObject.NULL)
+                .put("propertyKeys", bridgeObj.optJSONObject("liveRefPropertyKeys") ?: state.playerPropertyKeys)
+                .put("livePollingIntervalMs", 200)
+                .put("liveSample", if (liveSampleJson.length() > 0) liveSampleJson else JSONObject.NULL)
+                .put("isolatedDeltas", deltasArr)
+        )
+
+        // 4. Confirmed Entity Array + Screen Projections
+        val confirmedEntityPath = state.discoveredEntityArrayPath
+            ?: bridgeObj.optString("discoveredEntityArrayPath", "").takeIf { it.isNotBlank() && it != "null" }
+        val entitiesArr = JSONArray()
+        state.discoveredEntities.forEach { ent ->
+            val keysJson = JSONArray()
+            ent.sampleKeys.forEach { keysJson.put(it) }
+            entitiesArr.put(
+                JSONObject()
+                    .put("name", ent.name)
+                    .put("id", ent.id)
+                    .put("path", ent.path)
+                    .put(
+                        "worldCoords",
+                        JSONObject()
+                            .put("x", ent.worldX)
+                            .put("y", ent.worldY)
+                            .put("z", ent.worldZ)
+                    )
+                    .put("distanceToPlayer", ent.distanceToPlayer)
+                    .put(
+                        "projectedScreenCoords",
+                        JSONObject()
+                            .put("screenX", ent.screenX)
+                            .put("screenY", ent.screenY)
+                            .put("inViewport", ent.inViewport)
+                    )
+                    .put("sampleKeys", keysJson)
+            )
+        }
+        root.put(
+            "entityCollection",
+            JSONObject()
+                .put("confirmedJsPath", confirmedEntityPath ?: JSONObject.NULL)
+                .put("projectionMode", state.entityProjectionMode)
+                .put("totalDetectedEntities", state.discoveredEntities.size)
+                .put("entities", entitiesArr)
+        )
+
+        // 5. Intercepted asset catalog with local ByteBuffer metadata
+        val assetsArray = JSONArray()
+        state.interceptedAssets.forEach { asset ->
+            assetsArray.put(
+                JSONObject()
+                    .put("url", asset.url)
+                    .put("fileName", asset.fileName)
+                    .put("extension", asset.extension)
+                    .put("method", asset.method)
+                    .put("timestamp", asset.timestamp)
+                    .put("isForMainFrame", asset.isForMainFrame)
+                    .put("captureStatus", asset.captureStatus.name)
+                    .put("localRelativePath", asset.localRelativePath ?: JSONObject.NULL)
+                    .put("httpStatus", asset.httpStatus ?: JSONObject.NULL)
+                    .put("contentType", asset.contentType)
+                    .put("byteSize", asset.byteSize)
+                    .put("isTruncated", asset.isTruncated)
+                    .put("sha256Prefix", asset.sha256Prefix)
+                    .put("magicSignature", asset.magicSignature)
+                    .put("entropyBits", asset.entropyBits)
+                    .put("hexHeaderPreview", asset.hexHeaderPreview)
+                    .put("structuralSummary", asset.structuralSummary)
+                    .put("structuralDetails", asset.structuralDetails)
+            )
+        }
+        root.put("interceptedAssetUrls", assetsArray)
+        root.put(
+            "interceptedAssetCatalog",
+            JSONObject()
+                .put("totalObserved", state.interceptedAssets.size)
+                .put("totalCachedLocally", state.cachedAssetCount)
+                .put("totalCachedBytes", state.totalCachedAssetBytes)
+                .put("assets", assetsArray)
+        )
+
+        // 6. WASM Heap Value-Tracker & Float Delta Memory Map (if active/isolated)
+        if (state.wasmHeap.isolatedIndex != null ||
+            state.wasmHeap.totalMatches > 0 ||
+            state.wasmFloatDelta.candidates.isNotEmpty() ||
+            state.wasmFloatDelta.lockedCoords != null ||
+            state.wasmFloatDelta.pointerChains.isNotEmpty()
+        ) {
+            root.put("wasmHeapMemoryMap", JSONObject(buildWasmMemoryMapJson(state)))
+        }
+
+        // 7. Session logs
+        val logsArray = JSONArray()
+        state.logs.forEach { entry ->
+            logsArray.put(
+                JSONObject()
+                    .put("id", entry.id)
+                    .put("timestamp", entry.timestamp)
+                    .put("epochMs", entry.epochMs)
+                    .put("category", entry.category.tag)
+                    .put("summary", entry.summary)
+                    .put("payload", entry.payload)
+            )
+        }
+        root.put("sessionLogs", logsArray)
+
+        return root.toString(2)
     }
 
-    private fun nowTimeLabel(): String {
-        return SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
+    private fun prettyFormatIfJson(raw: String): String {
+        val trimmed = raw.trim()
+        if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return raw
+        return try {
+            if (trimmed.startsWith("{")) JSONObject(trimmed).toString(2)
+            else JSONArray(trimmed).toString(2)
+        } catch (_: Exception) {
+            raw
+        }
+    }
+
+    private fun formatTimestamp(epochMs: Long): String {
+        return SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date(epochMs))
     }
 
     companion object {
-        private const val MAX_LOG_ENTRIES = 350
-        private const val MAX_TRACKED_ASSETS = 120
-        private const val MAX_LIVE_STREAM_LINES = 60
+        private const val MAX_LOG_ENTRIES = 500
+        private const val MAX_TRACKED_ASSETS = 500
+        private const val MAX_STAGING_ITEMS = 250
 
         const val DESKTOP_USER_AGENT =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
-        private val TRACKED_ASSET_EXTENSIONS = listOf(
-            ".wasm", ".bin", ".json", ".glb", ".gltf", ".data", ".mem", ".pak", ".pck", ".atlas"
+        private val TRACKED_EXTENSIONS = listOf(
+            ".wasm", ".json", ".bin", ".glb", ".gltf", ".data", ".pck", ".pak", ".ktx2", ".dds"
         )
 
-        fun createShareIntent(uri: Uri, mimeType: String, title: String): Intent {
-            val sendIntent = Intent(Intent.ACTION_SEND).apply {
-                type = mimeType
-                putExtra(Intent.EXTRA_STREAM, uri)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        fun mergeIntoStagingBuffer(
+            existing: List<CandidateStagingItem>,
+            incoming: List<Pair<String, String>>,
+            sourceStep: String,
+            scanNumber: Int,
+            timestamp: String,
+            forcePin: Boolean = false
+        ): List<CandidateStagingItem> {
+            val map = LinkedHashMap<String, CandidateStagingItem>(existing.size + incoming.size)
+            existing.forEach { map[it.path] = it }
+
+            incoming.forEach { (rawPath, detail) ->
+                val path = rawPath.trim()
+                if (path.isEmpty()) return@forEach
+                val prev = map[path]
+                if (prev != null) {
+                    map[path] = prev.copy(
+                        sourceStep = sourceStep,
+                        detail = detail.ifBlank { prev.detail },
+                        scanNumber = scanNumber,
+                        seenCount = prev.seenCount + 1,
+                        isPinned = prev.isPinned || forcePin,
+                        lastSeenTimestamp = timestamp
+                    )
+                } else {
+                    map[path] = CandidateStagingItem(
+                        path = path,
+                        sourceStep = sourceStep,
+                        detail = detail,
+                        scanNumber = scanNumber,
+                        seenCount = 1,
+                        isPinned = forcePin,
+                        lastSeenTimestamp = timestamp
+                    )
+                }
             }
-            return Intent.createChooser(sendIntent, title).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            return sortStagingBuffer(map.values.toList()).take(MAX_STAGING_ITEMS)
+        }
+
+        fun filterStagingBuffer(
+            items: List<CandidateStagingItem>,
+            showPinnedOnly: Boolean,
+            rawQuery: String
+        ): List<CandidateStagingItem> {
+            val base = if (showPinnedOnly) items.filter { it.isPinned } else items
+            val tokens = rawQuery.trim()
+                .lowercase(Locale.US)
+                .split(Regex("\\s+"))
+                .filter { it.isNotBlank() }
+            if (tokens.isEmpty()) return base
+            return base.filter { item ->
+                val haystack = "${item.path} ${item.detail} ${item.sourceStep}".lowercase(Locale.US)
+                tokens.all { token -> haystack.contains(token) }
             }
+        }
+
+        fun buildFullLogDumpText(state: DiagnosticsUiState): String {
+            val isoNow = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date())
+            return buildString {
+                appendLine("========================================================================")
+                appendLine("WebViewDiagnosticsApp — Complete Diagnostic Log Dump")
+                appendLine("========================================================================")
+                appendLine("Generated At : $isoNow")
+                appendLine("Active URL   : ${state.activeUrl}")
+                appendLine("Page Title   : ${state.pageTitle.ifBlank { "(untitled)" }}")
+                appendLine("User-Agent   : ${if (state.isDesktopMode) "Desktop" else "Mobile"}")
+                appendLine("Remote Debug : false (disabled)")
+                appendLine("Scans Run    : ${state.scanCounter}")
+                appendLine("Canvases     : ${state.canvasCount}")
+                if (state.entityViewportWidth > 0 && state.entityViewportHeight > 0) {
+                    appendLine("Viewport     : ${state.entityViewportWidth}x${state.entityViewportHeight}")
+                }
+                appendLine()
+
+                appendLine("--- [1] LIVE PLAYER COORDINATE LOCK ---")
+                appendLine("Confirmed Path : ${state.discoveredPlayerPath ?: "(not isolated)"}")
+                appendLine("Property Keys  : ${state.playerPropertyKeys.ifBlank { "(none)" }}")
+                state.livePlayerCoords?.let { coords ->
+                    appendLine(
+                        "Live Coords    : X=${String.format(Locale.US, "%.4f", coords.x)}, " +
+                            "Y=${String.format(Locale.US, "%.4f", coords.y)}, " +
+                            "Z=${String.format(Locale.US, "%.4f", coords.z)} (ticks=${state.livePollTickCount})"
+                    )
+                }
+                if (state.isolatedPaths.isNotEmpty()) {
+                    appendLine("Isolated Deltas (${state.isolatedPaths.size}):")
+                    state.isolatedPaths.forEach { d ->
+                        appendLine("  • ${d.path} | base=${d.baselineValue} -> cur=${d.currentValue} (Δ ${d.delta})")
+                    }
+                }
+                appendLine()
+
+                appendLine("--- [2] STAGED VARIABLES (${state.stagingBuffer.size} total, ${state.pinnedCandidateCount} pinned) ---")
+                if (state.stagingBuffer.isEmpty()) {
+                    appendLine("  (none)")
+                } else {
+                    state.stagingBuffer.forEach { item ->
+                        val pinTag = if (item.isPinned) "[PINNED] " else ""
+                        appendLine("  $pinTag${item.path} | ${item.detail} | ${item.sourceStep} #${item.scanNumber} (×${item.seenCount}, ${item.lastSeenTimestamp})")
+                    }
+                }
+                appendLine()
+
+                appendLine("--- [3] ENTITY SCAN RESULTS (${state.discoveredEntities.size} detected) ---")
+                appendLine("Entity Array   : ${state.discoveredEntityArrayPath ?: "(not scanned)"}")
+                if (state.entityProjectionMode.isNotBlank()) {
+                    appendLine("Projection     : ${state.entityProjectionMode}")
+                }
+                if (state.discoveredEntities.isEmpty()) {
+                    appendLine("  (none)")
+                } else {
+                    state.discoveredEntities.forEachIndexed { idx, e ->
+                        val vis = if (e.inViewport) "IN VIEW" else "OFFSCREEN"
+                        appendLine(
+                            "  [${idx + 1}] ${e.name}${if (e.id.isNotBlank()) " #${e.id}" else ""} ($vis) | " +
+                                "world=(${String.format(Locale.US, "%.2f", e.worldX)}, ${String.format(Locale.US, "%.2f", e.worldY)}, ${String.format(Locale.US, "%.2f", e.worldZ)}) | " +
+                                "dist=${String.format(Locale.US, "%.1f", e.distanceToPlayer)} | " +
+                                "screen=(${String.format(Locale.US, "%.1f", e.screenX)}px, ${String.format(Locale.US, "%.1f", e.screenY)}px) | " +
+                                "path=${e.path}"
+                        )
+                    }
+                }
+                appendLine()
+
+                appendLine("--- [4] INTERCEPTED ASSET CATALOG (${state.interceptedAssets.size} observed, ${state.cachedAssetCount} cached locally) ---")
+                if (state.interceptedAssets.isEmpty()) {
+                    appendLine("  (none)")
+                } else {
+                    state.interceptedAssets.forEach { asset ->
+                        val sizeStr = if (asset.byteSize > 0L) " | ${BinaryAssetInspector.formatBytes(asset.byteSize)}" else ""
+                        val magicStr = if (asset.magicSignature.isNotBlank()) " | ${asset.magicSignature}" else ""
+                        appendLine("  [${asset.timestamp}] ${asset.method} (${asset.extension}) ${asset.fileName.ifBlank { asset.url }}$sizeStr$magicStr")
+                        appendLine("    URL: ${asset.url}")
+                        if (!asset.localRelativePath.isNullOrBlank()) {
+                            appendLine("    Local: filesDir/${asset.localRelativePath} | SHA-256: ${asset.sha256Prefix}")
+                        }
+                        if (asset.structuralSummary.isNotBlank()) {
+                            appendLine("    Summary: ${asset.structuralSummary}")
+                        }
+                    }
+                }
+                appendLine()
+
+                if (state.wasmHeap.isolatedIndex != null || state.wasmHeap.totalMatches > 0) {
+                    appendLine("--- [5] WASM HEAP VALUE-TRACKER MEMORY MAP ---")
+                    appendLine("Heap Source    : ${state.wasmHeap.heapSourceLabel.ifBlank { "(unknown)" }}")
+                    appendLine("Matches        : ${state.wasmHeap.totalMatches} (HEAP32=${state.wasmHeap.heap32MatchCount}, HEAPF32=${state.wasmHeap.heapF32MatchCount})")
+                    state.wasmHeap.isolatedIndex?.let { idx ->
+                        val addr = state.wasmHeap.isolatedByteAddress ?: (idx.toLong() * 4L)
+                        appendLine("Isolated Slot  : ${state.wasmHeap.isolatedHeapType ?: "HEAP32"}[$idx] (${formatHexAddress(addr)}) = ${state.wasmHeap.isolatedCurrentValue}")
+                    }
+                    state.wasmHeap.neighborFloats.forEach { nb ->
+                        val sign = if (nb.byteOffset >= 0) "+" else ""
+                        val dynTag = if (nb.changeCount > 0) " [DYNAMIC ×${nb.changeCount}]" else ""
+                        appendLine("  ${sign}${nb.byteOffset}B (${formatHexAddress(nb.byteAddress)}) | F32=${String.format(Locale.US, "%.4f", nb.floatValue)} | I32=${nb.intValue}$dynTag")
+                    }
+                    appendLine()
+                }
+
+                if (state.wasmFloatDelta.candidates.isNotEmpty() ||
+                    state.wasmFloatDelta.lockedCoords != null ||
+                    state.wasmFloatDelta.pointerChains.isNotEmpty()
+                ) {
+                    appendLine("--- [5B] WASM FLOAT HEAP DELTA & PERSISTENT POINTERS (window.HEAPF32) ---")
+                    appendLine("Heap Source    : ${state.wasmFloatDelta.heapSourceLabel.ifBlank { "window.HEAPF32" }}")
+                    appendLine("Baseline / Hit : ${state.wasmFloatDelta.baselineSampleCount} stable -> ${state.wasmFloatDelta.totalDeltaMatches} moving (round #${state.wasmFloatDelta.scanRound})")
+                    state.wasmFloatDelta.lockedCoords?.let { locked ->
+                        val idxs = listOfNotNull(locked.xIndex, locked.yIndex, locked.zIndex).joinToString(",")
+                        appendLine(
+                            "Locked Coords  : window.HEAPF32[$idxs] (${formatHexAddress(locked.xByteAddress)}) | " +
+                                "X=${String.format(Locale.US, "%.4f", locked.xValue)}, " +
+                                "Y=${String.format(Locale.US, "%.4f", locked.yValue)}, " +
+                                "Z=${String.format(Locale.US, "%.4f", locked.zValue)} (ticks=${locked.liveTickCount})"
+                        )
+                    }
+                    state.wasmFloatDelta.candidates.forEach { c ->
+                        val pinTag = if (c.isPinned) "[PINNED] " else ""
+                        val axisTag = if (c.axisHint.isNotBlank()) "[${c.axisHint}] " else ""
+                        appendLine(
+                            "  $pinTag${axisTag}HEAPF32[${c.heapIndex}] (${formatHexAddress(c.byteAddress)}) | " +
+                                "cur=${String.format(Locale.US, "%.4f", c.currentValue)} | " +
+                                "base=${String.format(Locale.US, "%.4f", c.baselineValue)} | " +
+                                "Δ=${String.format(Locale.US, "%+.4f", c.delta)} | ticksChanged=${c.changeCount}"
+                        )
+                    }
+                    if (state.wasmFloatDelta.pointerChains.isNotEmpty()) {
+                        appendLine("Persistent Pointer Chains (${state.wasmFloatDelta.pointerChains.size}, L1=${state.wasmFloatDelta.pointerScanTotalL1}, L2=${state.wasmFloatDelta.pointerScanTotalL2}):")
+                        state.wasmFloatDelta.pointerChains.forEach { p ->
+                            val regTag = if (p.isLikelyStatic) "STATIC" else "HEAP"
+                            val liveTag = if (p.isVerifiedLive) "LIVE" else "STALE"
+                            val pinTag = if (p.isPinned) "[PINNED] " else ""
+                            appendLine(
+                                "  $pinTag[L${p.depth} $regTag $liveTag] ${p.expression} -> ${formatHexAddress(p.resolvedTargetAddress)} " +
+                                    "(${String.format(Locale.US, "%.3f", p.resolvedX)}, ${String.format(Locale.US, "%.3f", p.resolvedY)}, ${String.format(Locale.US, "%.3f", p.resolvedZ)})"
+                            )
+                        }
+                    }
+                    appendLine()
+                }
+
+                appendLine("--- [6] COMPLETE ROLLING LOG HISTORY (${state.logs.size} entries) ---")
+                if (state.logs.isEmpty()) {
+                    appendLine("  (no log entries)")
+                } else {
+                    state.logs.forEach { entry ->
+                        appendLine("[${entry.timestamp}] [${entry.category.tag}] ${entry.summary}")
+                        if (entry.payload.isNotBlank() && entry.payload != entry.summary) {
+                            entry.payload.lineSequence().forEach { line ->
+                                appendLine("    $line")
+                            }
+                        }
+                    }
+                }
+                appendLine("========================================================================")
+            }
+        }
+
+        fun formatHexAddress(byteAddress: Long): String {
+            return String.format(Locale.US, "0x%08X", byteAddress.coerceAtLeast(0L))
+        }
+
+        fun buildWasmMemoryMapJson(state: DiagnosticsUiState): String {
+            val wasm = state.wasmHeap
+            val root = JSONObject()
+            root.put("application", "WebViewDiagnosticsApp")
+            root.put("reportType", "wasm_heap_memory_map")
+            root.put("generatedAtIso", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date()))
+            root.put("activeUrl", state.activeUrl)
+            root.put("remoteWebContentsDebuggingEnabled", false)
+            root.put("heapSource", wasm.heapSourceLabel.ifBlank { "window.HEAP32 / window.HEAPF32" })
+            root.put("heapByteLength", wasm.heapByteLength)
+            root.put("initialSearchValue", wasm.initialSearchValue ?: JSONObject.NULL)
+            root.put("lastFilterValue", wasm.lastFilterValue ?: JSONObject.NULL)
+            root.put("filterRounds", wasm.filterRound)
+            root.put("remainingMatches", wasm.totalMatches)
+            root.put("heap32MatchCount", wasm.heap32MatchCount)
+            root.put("heapF32MatchCount", wasm.heapF32MatchCount)
+
+            val isolatedObj = JSONObject()
+            if (wasm.isolatedIndex != null) {
+                val byteAddr = wasm.isolatedByteAddress ?: (wasm.isolatedIndex.toLong() * 4L)
+                isolatedObj.put("heapType", wasm.isolatedHeapType ?: "HEAP32")
+                isolatedObj.put("elementIndex", wasm.isolatedIndex)
+                isolatedObj.put("byteAddress", byteAddr)
+                isolatedObj.put("hexByteAddress", formatHexAddress(byteAddr))
+                isolatedObj.put("currentValue", wasm.isolatedCurrentValue)
+                isolatedObj.put("pollTicksObserved", wasm.neighborPollTickCount)
+                root.put("isolatedTarget", isolatedObj)
+            } else {
+                root.put("isolatedTarget", JSONObject.NULL)
+            }
+
+            val neighborsArr = JSONArray()
+            val dynamicCoordsArr = JSONArray()
+            wasm.neighborFloats.forEach { nb ->
+                val isDynamic = nb.byteOffset != 0 && nb.changeCount > 0
+                val nbJson = JSONObject()
+                    .put("byteOffset", nb.byteOffset)
+                    .put("offsetLabel", if (nb.byteOffset >= 0) "+${nb.byteOffset}B" else "${nb.byteOffset}B")
+                    .put("heapIndex", nb.heapIndex)
+                    .put("byteAddress", nb.byteAddress)
+                    .put("hexByteAddress", formatHexAddress(nb.byteAddress))
+                    .put("float32Value", nb.floatValue)
+                    .put("int32Value", nb.intValue)
+                    .put("changeCount", nb.changeCount)
+                    .put("isTargetSlot", nb.byteOffset == 0)
+                    .put("isDynamicCoordinateCandidate", isDynamic)
+                neighborsArr.put(nbJson)
+                if (isDynamic) {
+                    dynamicCoordsArr.put(nbJson)
+                }
+            }
+            root.put("neighboringMemoryMap", neighborsArr)
+            root.put("dynamicCoordinateCandidates", dynamicCoordsArr)
+
+            val candidatesArr = JSONArray()
+            wasm.survivingCandidates.forEach { c ->
+                candidatesArr.put(
+                    JSONObject()
+                        .put("heapType", c.heapType)
+                        .put("index", c.index)
+                        .put("byteAddress", c.byteAddress)
+                        .put("hexByteAddress", formatHexAddress(c.byteAddress))
+                        .put("currentValue", c.currentValue)
+                )
+            }
+            root.put("survivingCandidates", candidatesArr)
+
+            val floatDelta = state.wasmFloatDelta
+            val floatDeltaArr = JSONArray()
+            floatDelta.candidates.forEach { c ->
+                floatDeltaArr.put(
+                    JSONObject()
+                        .put("heapIndex", c.heapIndex)
+                        .put("byteAddress", c.byteAddress)
+                        .put("hexByteAddress", formatHexAddress(c.byteAddress))
+                        .put("axisHint", c.axisHint)
+                        .put("baselineValue", c.baselineValue)
+                        .put("currentValue", c.currentValue)
+                        .put("delta", c.delta)
+                        .put("clusterSize", c.clusterSize)
+                        .put("isPinned", c.isPinned)
+                        .put("changeCount", c.changeCount)
+                )
+            }
+            val lockedJson = floatDelta.lockedCoords?.let { locked ->
+                JSONObject()
+                    .put("xIndex", locked.xIndex)
+                    .put("yIndex", locked.yIndex ?: JSONObject.NULL)
+                    .put("zIndex", locked.zIndex ?: JSONObject.NULL)
+                    .put("xByteAddress", locked.xByteAddress)
+                    .put("xHexByteAddress", formatHexAddress(locked.xByteAddress))
+                    .put("yByteAddress", locked.yByteAddress ?: JSONObject.NULL)
+                    .put("zByteAddress", locked.zByteAddress ?: JSONObject.NULL)
+                    .put("xValue", locked.xValue)
+                    .put("yValue", locked.yValue)
+                    .put("zValue", locked.zValue)
+                    .put("lockedAtTimestamp", locked.lockedAtTimestamp)
+                    .put("liveTickCount", locked.liveTickCount)
+            } ?: JSONObject.NULL
+
+            val pointerChainsArr = JSONArray()
+            floatDelta.pointerChains.forEach { chain ->
+                val offs = JSONArray()
+                chain.offsets.forEach { offs.put(it) }
+                pointerChainsArr.put(
+                    JSONObject()
+                        .put("id", chain.id)
+                        .put("depth", chain.depth)
+                        .put("basePointerAddress", chain.basePointerAddress)
+                        .put("basePointerHex", formatHexAddress(chain.basePointerAddress))
+                        .put("offsets", offs)
+                        .put("resolvedTargetAddress", chain.resolvedTargetAddress)
+                        .put("resolvedTargetHex", formatHexAddress(chain.resolvedTargetAddress))
+                        .put("resolvedX", chain.resolvedX)
+                        .put("resolvedY", chain.resolvedY)
+                        .put("resolvedZ", chain.resolvedZ)
+                        .put("isLikelyStatic", chain.isLikelyStatic)
+                        .put("isVerifiedLive", chain.isVerifiedLive)
+                        .put("isPinned", chain.isPinned)
+                        .put("expression", chain.expression)
+                )
+            }
+
+            root.put(
+                "wasmFloatDeltaScanner",
+                JSONObject()
+                    .put("heapSource", floatDelta.heapSourceLabel.ifBlank { "window.HEAPF32" })
+                    .put("baselineSampleCount", floatDelta.baselineSampleCount)
+                    .put("scanRound", floatDelta.scanRound)
+                    .put("totalDeltaMatches", floatDelta.totalDeltaMatches)
+                    .put("lockedCoords", lockedJson)
+                    .put("pointerScanTotalL1", floatDelta.pointerScanTotalL1)
+                    .put("pointerScanTotalL2", floatDelta.pointerScanTotalL2)
+                    .put("persistentPointerChains", pointerChainsArr)
+                    .put("candidates", floatDeltaArr)
+            )
+
+            return root.toString(2)
+        }
+
+        private fun sortStagingBuffer(items: List<CandidateStagingItem>): List<CandidateStagingItem> {
+            return items.sortedWith(
+                compareByDescending<CandidateStagingItem> { it.isPinned }
+                    .thenByDescending { it.scanNumber }
+                    .thenByDescending { it.seenCount }
+            )
         }
 
         fun normalizeAndValidateUrl(rawInput: String): UrlValidationResult {
             val trimmed = rawInput.trim()
-            if (trimmed.isEmpty()) {
-                return UrlValidationResult.Invalid("Please enter a target URL.")
-            }
-            if (trimmed.any { it.isWhitespace() || it.isISOControl() }) {
-                return UrlValidationResult.Invalid("URL cannot contain spaces or control characters.")
+            if (trimmed.isEmpty() || trimmed.equals("about:blank", ignoreCase = true)) {
+                return UrlValidationResult.Valid("about:blank")
             }
 
             val lower = trimmed.lowercase(Locale.US)
-            if (lower.startsWith("javascript:") ||
-                lower.startsWith("file:") ||
-                lower.startsWith("content:") ||
-                lower.startsWith("data:")
-            ) {
-                return UrlValidationResult.Invalid("Blocked scheme. Only http:// and https:// URLs are permitted.")
+            val disallowedSchemes = listOf("javascript:", "file:", "content:", "data:", "intent:", "vbscript:")
+            if (disallowedSchemes.any { lower.startsWith(it) }) {
+                return UrlValidationResult.Invalid("Scheme not allowed in diagnostic WebView: ${trimmed.substringBefore(':')}:")
             }
 
-            val withScheme = if (lower.startsWith("http://") || lower.startsWith("https://")) {
+            val withScheme = if (lower.startsWith("https://") || lower.startsWith("http://")) {
                 trimmed
+            } else if (trimmed.contains("://")) {
+                return UrlValidationResult.Invalid("Only http://, https://, and about:blank URLs are supported.")
             } else {
                 "https://$trimmed"
             }
 
-            return try {
-                val parsed = URI(withScheme)
-                val scheme = parsed.scheme?.lowercase(Locale.US)
-                val host = parsed.host
-                if ((scheme != "https" && scheme != "http") || host.isNullOrBlank()) {
-                    UrlValidationResult.Invalid("Enter a valid http:// or https:// host.")
-                } else {
-                    UrlValidationResult.Valid(parsed.toASCIIString())
-                }
-            } catch (_: Exception) {
-                UrlValidationResult.Invalid("Malformed URL syntax.")
+            val parsed = Uri.parse(withScheme)
+            val host = parsed.host
+            if (host.isNullOrBlank()) {
+                return UrlValidationResult.Invalid("Please enter a valid domain or URL.")
             }
+            return UrlValidationResult.Valid(withScheme)
         }
 
-        fun isAllowedNavigationUri(uri: Uri): Boolean {
-            val scheme = uri.scheme?.lowercase(Locale.US) ?: return false
-            return (scheme == "https" || scheme == "http") && !uri.host.isNullOrBlank()
+        fun isAllowedNavigationUri(uri: Uri?): Boolean {
+            if (uri == null) return false
+            val full = uri.toString()
+            if (full.equals("about:blank", ignoreCase = true)) return true
+            val scheme = uri.scheme?.lowercase(Locale.US)
+            return scheme == "https" || scheme == "http"
         }
 
         fun matchTrackedAssetExtension(pathLower: String): String? {
-            val clean = pathLower.substringBefore('?').substringBefore('#').trim()
-            if (clean.isEmpty()) return null
-            return TRACKED_ASSET_EXTENSIONS.firstOrNull { ext -> clean.endsWith(ext) }
-        }
-
-        fun formatHexAddress(byteAddress: Long): String {
-            val safe = byteAddress.coerceAtLeast(0L)
-            return "0x${safe.toString(16).uppercase(Locale.US)}"
-        }
-
-        fun buildFullLogDumpText(state: DiagnosticsUiState): String {
-            val feed = state.heapFeed
-            return buildString {
-                appendLine("=== WebViewDiagnosticsApp Full Telemetry Dump ===")
-                appendLine("Active URL      : ${state.activeUrl}")
-                appendLine("Page Title      : ${state.pageTitle}")
-                appendLine("Lock Status     : ${feed.lockStatus.label}")
-                appendLine("HEAPF32 Base    : [${feed.baseIndex}] (${formatHexAddress(feed.byteAddress)})")
-                appendLine(
-                    String.format(
-                        Locale.US,
-                        "Live Coords     : X=%.3f  Y=%.3f  Z=%.3f (ticks=%d)",
-                        feed.x,
-                        feed.y,
-                        feed.z,
-                        feed.tickCount
-                    )
-                )
-                if (state.pointerAnalysis.aobPatternHex.isNotBlank()) {
-                    appendLine("AOB Signature   : ${state.pointerAnalysis.aobPatternHex}")
-                    appendLine("Parent Pointers : ${state.pointerAnalysis.parentPointers.size}")
+            for (ext in TRACKED_EXTENSIONS) {
+                if (pathLower.endsWith(ext) || pathLower.contains("$ext?")) {
+                    return ext
                 }
-                appendLine("Nearby Entities : ${state.discoveredEntities.size}")
-                appendLine("Tracked Assets  : ${state.interceptedAssets.size} (cached=${state.cachedAssetCount})")
-                appendLine("Log Entries     : ${state.logs.size}")
-                appendLine()
-                appendLine("--- Rolling Telemetry Logs ---")
-                state.logs.forEach { entry ->
-                    appendLine("[${entry.timestamp}] [${entry.category.tag}] ${entry.summary}")
-                    if (entry.payload.isNotBlank() && entry.payload != entry.summary) {
-                        appendLine("    ${entry.payload.replace("\n", "\n    ")}")
-                    }
-                }
-            }.trimEnd()
+            }
+            if (pathLower.contains("chunk") && (pathLower.endsWith(".js") || pathLower.endsWith(".mjs") || pathLower.endsWith(".bin"))) {
+                return "chunk"
+            }
+            return null
         }
     }
 }

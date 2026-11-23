@@ -6,102 +6,77 @@
     <string name="action_desktop_ua">Desktop UA</string>
     <string name="action_mobile_ua">Mobile UA</string>
 
-    <!-- Guided Wizard Titles, Buttons, and Plain-English Instructions -->
-    <string name="wizard_step_1_title">Step 1 — Find Game Engine</string>
-    <string name="step_1_inspect_scope">1. Scan Custom Globals</string>
-    <string name="wizard_step_1_instruction">Load the web app and log in until your character is visible on screen, then tap \'1. Scan Custom Globals\'. Auto-detected engine roots and batched custom globals stream live into Staging.</string>
-    <string name="step_1_manual_query_title">Manual Property Inspector</string>
-    <string name="step_1_manual_query_hint">e.g. game.player or window.AppInstance</string>
-    <string name="action_query_path">Query Path</string>
-    <string name="cd_query_path">Inspect property path and stage it</string>
+    <!-- Top Live Coordinate HUD & Direct Heap Feed -->
+    <string name="hud_title_live_coords">LIVE HEAPF32 FEED</string>
+    <string name="hud_status_live">LIVE 200ms</string>
+    <string name="hud_status_standby">STANDBY</string>
+    <string name="hud_status_relocking">RELOCKING…</string>
 
-    <string name="wizard_step_2_title">Step 2 — Lock On to Live Player Coordinates</string>
-    <string name="step_2a_capture_baseline">2A. Capture Standing Baseline</string>
-    <string name="wizard_step_2a_instruction">Stand completely still in-game and tap \'2A. Capture Standing Baseline\'.</string>
-    <string name="step_2b_compute_delta">2B. Isolate Player Coords</string>
-    <string name="wizard_step_2b_instruction">Walk your character 5–10 steps in any direction, stop, and tap \'2B. Isolate Player Coords\' to start 200ms live reference polling.</string>
+    <!-- Primary Action Buttons -->
+    <string name="action_relock_coordinates">Relock Coordinates</string>
+    <string name="action_scan_entities">Scan Entities</string>
+    <string name="action_export_report">Export Report</string>
+    <string name="action_share_report">Share</string>
+    <string name="action_capture_signature">Capture Signature</string>
+    <string name="action_start_feed">Start 200ms Feed</string>
+    <string name="action_pause_feed">Pause Feed</string>
+    <string name="action_apply_base_index">Apply Index</string>
+    <string name="action_reset_verified_index">Reset 581246</string>
 
-    <string name="wizard_step_3_title">Step 3 — Visual Entity Inspection</string>
-    <string name="step_3_scan_entities">3. Scan Nearby Entities</string>
-    <string name="wizard_step_3_instruction">Make sure 2+ monsters or entities are visible on your screen, then tap \'3. Scan Nearby Entities\' (anchored to Step 2B\'s player parent container).</string>
-
-    <string name="wizard_step_4_title">Step 4 — Export Handoff Report</string>
-    <string name="step_4_export_report">4. Export Report (.json)</string>
-    <string name="wizard_step_4_instruction">Once Steps 2B and 3 show [CAPTURED ✓] (and any candidates are pinned in Staging), tap \'4. Export Report (.json)\' to save to Downloads.</string>
-
-    <string name="action_share_report">Share JSON</string>
-    <string name="action_js_drawer">JS Console</string>
-    <string name="action_execute_script">Execute Script</string>
-    <string name="js_input_hint">Enter JS expression or query path…</string>
-    <string name="tab_wizard">Wizard</string>
-    <string name="tab_staging">Staging</string>
+    <!-- Tabs -->
+    <string name="tab_controls">Controls</string>
     <string name="tab_entities">Entities</string>
     <string name="tab_assets">Assets</string>
     <string name="tab_logs">Logs</string>
-    <string name="console_title">TELEMETRY CONSOLE</string>
-    <string name="scan_status_idle">Idle</string>
-    <string name="scan_status_running">Scanning…</string>
-    <string name="scan_status_paused">Paused</string>
-    <string name="scan_status_completed">Completed</string>
-    <string name="scan_status_error">Error</string>
-    <string name="action_pause_scan">Pause</string>
-    <string name="action_resume_scan">Resume</string>
-    <string name="staging_search_hint">Search staged paths (e.g. pos, coord, player, actor)…</string>
-    <string name="action_export_log_dump_txt">Export Full Log Dump (.txt)</string>
+
+    <!-- Controls & Guidance Copy -->
+    <string name="controls_feed_title">Direct Heap Feed (window.HEAPF32)</string>
+    <string name="controls_feed_description">Reads verified player coordinates directly from window.HEAPF32[581246] (X), [581247] (Y), and [581248] (Z) every 200ms.</string>
+    <string name="controls_relock_title">Auto-Relock Memory Signature</string>
+    <string name="controls_relock_description">Captures the static float/int32 signature around the player base index and rescans window.HEAPF32 after page reloads or zone changes.</string>
+    <string name="controls_entities_title">Nearby Entity Struct Scanner (±50,000)</string>
+    <string name="controls_entities_description">Searches ±50,000 indices around the player for repeating (X, Y, Z) float triplets within valid world bounds.</string>
+    <string name="base_index_input_hint">Base index (default 581246)</string>
+
+    <!-- Collapsible Live Telemetry Stream -->
+    <string name="telemetry_stream_title">LIVE TELEMETRY STREAM</string>
+    <string name="telemetry_stream_empty">Waiting for 200ms window.HEAPF32 coordinate samples…</string>
+
+    <!-- Manual JS & Logs & Assets -->
+    <string name="action_js_drawer">JS</string>
+    <string name="action_execute_script">Execute Script</string>
+    <string name="js_input_hint">Enter JS expression or query path…</string>
+    <string name="action_export_log_dump_txt">Export Log Dump (.txt)</string>
     <string name="action_export_log_dump_json">.json</string>
     <string name="action_share_log_dump">Share</string>
-    <string name="console_empty_title">Diagnostic Engine Armed</string>
-    <string name="console_empty_subtitle">Follow Steps 1 → 4 in the Wizard tab to accumulate candidates, lock live 200ms player coordinates, inspect entities, and export JSON.</string>
-    <string name="staging_empty_title">Candidate Staging Buffer Empty</string>
-    <string name="staging_empty_subtitle">Run Step 1 or Step 2 multiple times (standing, moving, interacting) to accumulate candidate paths here and pin items of interest.</string>
-    <string name="entities_empty_title">No Entities Inspected Yet</string>
-    <string name="entities_empty_subtitle">Complete Step 2B to lock onto your player coordinates, then tap \'3. Scan Nearby Entities\' to inspect world coordinates and 2D screen projections here.</string>
+    <string name="action_clear_asset_cache">Clear Cache</string>
+
+    <!-- Empty States -->
+    <string name="entities_empty_title">No Nearby Entity Structs Scanned</string>
+    <string name="entities_empty_subtitle">Tap \'Scan Entities\' above to search ±50,000 indices around the player in window.HEAPF32 for repeating (X, Y, Z) float triplets.</string>
     <string name="assets_empty_title">No Binary Assets Intercepted Yet</string>
     <string name="assets_empty_subtitle">Load a web application to passively capture .wasm, .bin, and .json requests into private app storage and inspect ByteBuffer headers, sections, and entropy here.</string>
-    <string name="action_clear_asset_cache">Clear Cache</string>
-    <string name="cd_clear_asset_cache">Clear locally cached binary assets</string>
+    <string name="console_empty_title">Diagnostic Engine Armed</string>
+    <string name="console_empty_subtitle">Load your target page to start the 200ms window.HEAPF32 direct coordinate feed, capture a relock signature, or scan nearby entities.</string>
+
+    <!-- Accessibility Content Descriptions -->
     <string name="cd_reload_page">Reload current page</string>
     <string name="cd_toggle_desktop_ua">Toggle desktop user agent mode</string>
     <string name="cd_toggle_js_drawer">Toggle manual JavaScript execution drawer</string>
     <string name="cd_clear_logs">Clear telemetry logs</string>
-    <string name="cd_toggle_split">Toggle console split height</string>
-    <string name="cd_copy_log">Copy log payload</string>
+    <string name="cd_copy_log">Copy telemetry payload</string>
     <string name="cd_share_report">Share exported JSON report</string>
     <string name="cd_close_drawer">Close JavaScript drawer</string>
-    <string name="cd_pin_candidate">Pin or unpin candidate</string>
-    <string name="cd_track_candidate">Lock candidate for live 200ms tracking</string>
-    <string name="cd_clear_search">Clear search query</string>
+    <string name="cd_clear_asset_cache">Clear locally cached binary assets</string>
     <string name="cd_share_log_dump">Share exported full log dump</string>
+    <string name="cd_toggle_telemetry_stream">Expand or collapse live telemetry stream</string>
+    <string name="cd_toggle_webview_height">Expand or compact WebView viewport height</string>
+    <string name="cd_pin_entity">Pin or unpin entity struct</string>
+
+    <!-- Toasts & Intents -->
     <string name="toast_report_saved">Diagnostic report saved to Downloads: %1$s</string>
     <string name="toast_log_dump_saved">Full log dump saved to Downloads: %1$s</string>
-    <string name="toast_wasm_map_saved">WASM memory map saved to Downloads: %1$s</string>
     <string name="toast_report_failed">Failed to export report: %1$s</string>
     <string name="toast_log_copied">Copied to clipboard</string>
     <string name="share_report_chooser_title">Share Diagnostic Telemetry File</string>
-
-    <!-- WASM Heap Value-Tracker -->
-    <string name="tab_wasm_heap">WASM Heap</string>
-    <string name="wasm_tracker_title">WASM Heap Value-Tracker (HP / Stat Scanner)</string>
-    <string name="wasm_value_input_hint">Enter exact stat / HP value (e.g. 4338)</string>
-    <string name="wasm_action_scan_heap">1. Scan HEAP32 / F32</string>
-    <string name="wasm_action_filter_delta">2. Filter Changed Value</string>
-    <string name="wasm_action_reset">Reset</string>
-    <string name="wasm_action_stop_poll">Stop Poll</string>
-    <string name="wasm_action_export_map">Export Memory Map (.json)</string>
-    <string name="wasm_filter_instruction">Take damage or heal in-game so your HP changes, enter your new HP value, and tap filter.</string>
-    <string name="wasm_neighbors_title">Neighboring Memory Inspector (±4 to ±16 Bytes)</string>
-    <string name="wasm_neighbors_hint">Walk or move in-game — adjacent floats that highlight in green reveal live player coordinates.</string>
-    <string name="cd_export_wasm_map">Export isolated WASM memory map as JSON</string>
-
-    <!-- WASM Float Heap Delta Scanner (Step 2A/2B Float Mode) -->
-    <string name="step2_mode_wasm_float">WASM Float Heap</string>
-    <string name="step2_mode_js">JS Objects</string>
-    <string name="step_2a_float_baseline">2A. Capture Float Baseline</string>
-    <string name="step_2b_scan_float_deltas">Scan Float Heap Deltas</string>
-    <string name="wizard_step_2_float_instruction">Stand still, tap Baseline, walk 5 steps forward in-game, then tap Scan Float Deltas.</string>
-    <string name="wasm_float_watcher_title">Live Float Watcher (HEAPF32)</string>
-    <string name="wasm_float_pin_top">Pin X/Y/Z</string>
-    <string name="wasm_float_stop_watch">Stop</string>
-    <string name="cd_pin_float_candidate">Pin float offset to Staging</string>
-    <string name="cd_inspect_float_neighbors">Inspect ±16B neighbors around this float</string>
 </resources>

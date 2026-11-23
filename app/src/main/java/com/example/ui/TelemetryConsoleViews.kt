@@ -9,47 +9,31 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Bookmark
-import androidx.compose.material.icons.filled.BookmarkBorder
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.MyLocation
-import androidx.compose.material.icons.filled.Pause
-import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PushPin
 import androidx.compose.material.icons.filled.Radar
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.ViewInAr
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material.icons.filled.Terminal
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -58,20 +42,16 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.CandidateStagingItem
 import com.example.DiagnosticsUiState
-import com.example.DiagnosticsViewModel
-import com.example.DiscoveredEntitySample
 import com.example.LogCategory
+import com.example.NearbyEntityStruct
 import com.example.R
-import com.example.ScopeBatchProgress
 import com.example.TelemetryLogEntry
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
@@ -86,644 +66,75 @@ import com.example.ui.theme.TelemetryViolet
 import java.util.Locale
 
 /**
- * Multi-Scan Candidate Staging Buffer & Accumulation Drawer.
- * Preserves candidates across repeated Step 1 & Step 2 scans, supports pinning/bookmarking
- * items of interest, and lets developers lock any candidate into 200ms live coordinate polling.
+ * Entities Tab: displays repeating `(X, Y, Z)` float triplets discovered within ±50,000 indices
+ * of the player's `window.HEAPF32` base index.
  */
 @Composable
-fun StagingBufferView(
+fun NearbyEntitiesTabView(
     state: DiagnosticsUiState,
-    onTogglePin: (String) -> Unit,
-    onTogglePinnedOnly: () -> Unit,
-    onSearchQueryChanged: (String) -> Unit,
-    onClearUnpinned: () -> Unit,
-    onTrackLive: (String) -> Unit,
-    onPauseBatchScan: () -> Unit,
-    onResumeBatchScan: () -> Unit,
-    onCopyPath: (String) -> Unit,
+    onTogglePinEntity: (Int) -> Unit,
+    onCopyEntity: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val visibleItems = remember(state.stagingBuffer, state.showPinnedOnly, state.stagingSearchQuery) {
-        DiagnosticsViewModel.filterStagingBuffer(
-            items = state.stagingBuffer,
-            showPinnedOnly = state.showPinnedOnly,
-            rawQuery = state.stagingSearchQuery
-        )
-    }
-    val quickKeywords = remember { listOf("pos", "coord", "player", "actor", "scene", "entity") }
-
     Column(modifier = modifier.background(ObsidianBg)) {
-        // Live Batched Scan Banner when Step 1 is actively scanning or paused
-        if (state.scopeBatchProgress.isActive || state.scopeBatchProgress.isPaused) {
-            BatchScanProgressBanner(
-                progress = state.scopeBatchProgress,
-                onPause = onPauseBatchScan,
-                onResume = onResumeBatchScan,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 5.dp)
-            )
-            HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
-        }
-
-        // Staging Buffer Toolbar
+        // Summary strip
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(ObsidianSurface)
-                .padding(horizontal = 8.dp, vertical = 5.dp),
+                .padding(horizontal = 12.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+            horizontalArrangement = Arrangement.SpaceBetween
         ) {
-            val countText = if (state.stagingSearchQuery.isNotBlank() || state.showPinnedOnly) {
-                "Showing ${visibleItems.size} / ${state.stagingBuffer.size}"
-            } else {
-                "Scans: ${state.scanCounter} • Staged: ${state.stagingBuffer.size}"
-            }
-            Text(
-                text = countText,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.weight(1f)
-            )
-
-            Surface(
-                onClick = onTogglePinnedOnly,
-                shape = RoundedCornerShape(6.dp),
-                color = if (state.showPinnedOnly) AssetAmber.copy(alpha = 0.22f) else ObsidianBg,
-                border = BorderStroke(
-                    1.dp,
-                    if (state.showPinnedOnly) AssetAmber else ObsidianBorder
-                ),
-                modifier = Modifier.testTag("staging_pinned_filter_button")
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Bookmark,
-                        contentDescription = null,
-                        tint = if (state.showPinnedOnly) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(13.dp)
-                    )
-                    Text(
-                        text = "Pinned (${state.pinnedCandidateCount})",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (state.showPinnedOnly) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-
-            Surface(
-                onClick = onClearUnpinned,
-                shape = RoundedCornerShape(6.dp),
-                color = ObsidianBg,
-                border = BorderStroke(1.dp, ObsidianBorder),
-                modifier = Modifier.testTag("staging_clear_unpinned_button")
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(3.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.DeleteOutline,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(13.dp)
-                    )
-                    Text(
-                        text = "Prune",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-        }
-
-        // Filtered Search & Quick Keyword Query Bar
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(ObsidianSurface)
-                .padding(start = 8.dp, end = 8.dp, bottom = 6.dp),
-            verticalArrangement = Arrangement.spacedBy(5.dp)
-        ) {
-            Surface(
-                shape = RoundedCornerShape(7.dp),
-                color = ObsidianBg,
-                border = BorderStroke(
-                    1.dp,
-                    if (state.stagingSearchQuery.isNotBlank()) ElectricCyan.copy(alpha = 0.7f) else ObsidianBorder
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 38.dp)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Search,
-                        contentDescription = null,
-                        tint = if (state.stagingSearchQuery.isNotBlank()) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(16.dp)
-                    )
-                    Box(
-                        modifier = Modifier.weight(1f),
-                        contentAlignment = Alignment.CenterStart
-                    ) {
-                        if (state.stagingSearchQuery.isEmpty()) {
-                            Text(
-                                text = stringResource(R.string.staging_search_hint),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        BasicTextField(
-                            value = state.stagingSearchQuery,
-                            onValueChange = onSearchQueryChanged,
-                            singleLine = true,
-                            textStyle = MaterialTheme.typography.bodySmall.copy(
-                                fontFamily = JetBrainsMonoFontFamily,
-                                color = MaterialTheme.colorScheme.onSurface
-                            ),
-                            cursorBrush = SolidColor(ElectricCyan),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .testTag("staging_search_input")
-                        )
-                    }
-                    if (state.stagingSearchQuery.isNotEmpty()) {
-                        IconButton(
-                            onClick = { onSearchQueryChanged("") },
-                            modifier = Modifier
-                                .size(24.dp)
-                                .testTag("staging_search_clear_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = stringResource(R.string.cd_clear_search),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(14.dp)
-                            )
-                        }
-                    }
-                }
-            }
-
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                quickKeywords.forEach { kw ->
-                    val isSelected = state.stagingSearchQuery.trim().equals(kw, ignoreCase = true)
-                    Surface(
-                        onClick = { onSearchQueryChanged(if (isSelected) "" else kw) },
-                        shape = RoundedCornerShape(5.dp),
-                        color = if (isSelected) ElectricCyan.copy(alpha = 0.22f) else ObsidianBg,
-                        border = BorderStroke(
-                            1.dp,
-                            if (isSelected) ElectricCyan else ObsidianBorder.copy(alpha = 0.8f)
-                        ),
-                        modifier = Modifier.testTag("staging_quick_filter_$kw")
-                    ) {
-                        Text(
-                            text = kw,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                            color = if (isSelected) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 10.sp,
-                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
-                        )
-                    }
-                }
-            }
-        }
-
-        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
-
-        if (visibleItems.isEmpty()) {
-            Box(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Icon(
-                        imageVector = if (state.stagingSearchQuery.isNotBlank()) Icons.Default.Search else Icons.Default.BookmarkBorder,
-                        contentDescription = null,
-                        tint = if (state.stagingSearchQuery.isNotBlank()) ElectricCyan.copy(alpha = 0.75f) else AssetAmber.copy(alpha = 0.75f),
-                        modifier = Modifier.size(28.dp)
-                    )
-                    Text(
-                        text = when {
-                            state.stagingSearchQuery.isNotBlank() -> "No matches for \"${state.stagingSearchQuery.trim()}\""
-                            state.showPinnedOnly -> "No Pinned Candidates Yet"
-                            else -> stringResource(R.string.staging_empty_title)
-                        },
-                        style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onSurface
-                    )
-                    Text(
-                        text = when {
-                            state.stagingSearchQuery.isNotBlank() -> "Try a broader keyword (e.g. pos, coord, player, actor) or tap × to clear."
-                            state.showPinnedOnly -> "Tap the bookmark icon on any discovered path to pin it for export."
-                            else -> stringResource(R.string.staging_empty_subtitle)
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .testTag("staging_candidate_list"),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                items(visibleItems, key = { it.path }) { item ->
-                    StagingCandidateCard(
-                        item = item,
-                        isActiveLiveTarget = state.discoveredPlayerPath == item.path,
-                        onTogglePin = { onTogglePin(item.path) },
-                        onTrackLive = { onTrackLive(item.path) },
-                        onCopyPath = { onCopyPath(item.path) }
-                    )
-                }
-            }
-        }
-    }
-}
-
-/**
- * Reusable live batched scan progress banner with Pause / Resume controls (100 items / batch).
- */
-@Composable
-fun BatchScanProgressBanner(
-    progress: ScopeBatchProgress,
-    onPause: () -> Unit,
-    onResume: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val accent = if (progress.isPaused) AssetAmber else ElectricCyan
-    Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = accent.copy(alpha = 0.12f),
-        border = BorderStroke(1.dp, accent.copy(alpha = 0.5f)),
-        modifier = modifier.testTag("batch_scan_progress_banner")
-    ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
-            verticalArrangement = Arrangement.spacedBy(5.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(
-                        text = progress.statusText.ifBlank { "Scanning batches…" },
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        fontWeight = FontWeight.Bold,
-                        color = accent,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = "${progress.foundCount} custom globals staged • 100 items/batch",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 10.sp
-                    )
-                }
-
-                Surface(
-                    onClick = if (progress.isPaused) onResume else onPause,
-                    shape = RoundedCornerShape(6.dp),
-                    color = ObsidianBg,
-                    border = BorderStroke(1.dp, accent),
-                    modifier = Modifier.testTag("step1_pause_resume_button")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Icon(
-                            imageVector = if (progress.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
-                            contentDescription = null,
-                            tint = accent,
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Text(
-                            text = stringResource(if (progress.isPaused) R.string.action_resume_scan else R.string.action_pause_scan),
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = accent
-                        )
-                    }
-                }
-            }
-
-            LinearProgressIndicator(
-                progress = { progress.fraction },
-                color = accent,
-                trackColor = ObsidianBg,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(2.dp))
-            )
-        }
-    }
-}
-
-@Composable
-private fun StagingCandidateCard(
-    item: CandidateStagingItem,
-    isActiveLiveTarget: Boolean,
-    onTogglePin: () -> Unit,
-    onTrackLive: () -> Unit,
-    onCopyPath: () -> Unit
-) {
-    val borderColor = when {
-        isActiveLiveTarget -> SignalEmerald
-        item.isPinned -> AssetAmber.copy(alpha = 0.75f)
-        else -> ObsidianBorder
-    }
-
-    Surface(
-        shape = RoundedCornerShape(8.dp),
-        color = ObsidianSurface,
-        border = BorderStroke(1.dp, borderColor),
-        modifier = Modifier
-            .fillMaxWidth()
-            .testTag("staging_item_${item.path}")
-    ) {
-        Column(
-            modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Surface(
-                    color = ElectricCyan.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(4.dp)
-                ) {
-                    Text(
-                        text = "${item.sourceStep} #${item.scanNumber}",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = ElectricCyan,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                    )
-                }
-
-                if (item.seenCount > 1) {
-                    Surface(
-                        color = SignalEmerald.copy(alpha = 0.16f),
-                        shape = RoundedCornerShape(4.dp)
-                    ) {
-                        Text(
-                            text = "×${item.seenCount}",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = SignalEmerald,
-                            fontSize = 9.sp,
-                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                        )
-                    }
-                }
-
-                if (isActiveLiveTarget) {
-                    Surface(
-                        color = SignalEmerald.copy(alpha = 0.22f),
-                        shape = RoundedCornerShape(4.dp)
-                    ) {
-                        Text(
-                            text = "LIVE LOCK",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = SignalEmerald,
-                            fontSize = 9.sp,
-                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                        )
-                    }
-                }
-
-                Spacer(Modifier.weight(1f))
-
-                IconButton(
-                    onClick = onTrackLive,
-                    modifier = Modifier
-                        .size(32.dp)
-                        .testTag("track_candidate_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.MyLocation,
-                        contentDescription = stringResource(R.string.cd_track_candidate),
-                        tint = if (isActiveLiveTarget) SignalEmerald else ElectricCyan,
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
-
-                IconButton(
-                    onClick = onTogglePin,
-                    modifier = Modifier
-                        .size(32.dp)
-                        .testTag("pin_candidate_button")
-                ) {
-                    Icon(
-                        imageVector = if (item.isPinned) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
-                        contentDescription = stringResource(R.string.cd_pin_candidate),
-                        tint = if (item.isPinned) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(17.dp)
-                    )
-                }
-
-                IconButton(
-                    onClick = onCopyPath,
-                    modifier = Modifier.size(32.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.ContentCopy,
-                        contentDescription = stringResource(R.string.cd_copy_log),
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(15.dp)
-                    )
-                }
-            }
-
-            Text(
-                text = item.path,
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = JetBrainsMonoFontFamily,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurface,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
-                    text = item.detail,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
+                    text = "Nearby Structs: ${state.discoveredEntities.size} (±${state.entityScanRadius} window)",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = TelemetryViolet
                 )
+                val metaLine = buildString {
+                    append("Origin: HEAPF32[${state.heapFeed.baseIndex}]")
+                    state.entityDetectedStride?.let { append(" • Stride: $it floats (${it * 4}B)") }
+                    state.entityScanDurationMs?.let { append(" • ${String.format(Locale.US, "%.0f", it)}ms") }
+                }
                 Text(
-                    text = item.lastSeenTimestamp,
+                    text = metaLine,
                     style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 9.sp
+                    fontSize = 10.sp
+                )
+            }
+
+            if (state.isScanningEntities) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = TelemetryViolet
                 )
             }
         }
-    }
-}
 
-/**
- * Dedicated Visual Entity Inspection Console (Step 3).
- * Displays total detected entity count, confirmed sibling collection path, projection mode,
- * and a scrollable list of entities with World (X, Y, Z) and 2D Canvas Projections (screenX, screenY).
- */
-@Composable
-fun EntityInspectionConsoleView(
-    state: DiagnosticsUiState,
-    onRescanEntities: () -> Unit,
-    onPinPath: (path: String, detail: String) -> Unit,
-    onCopyPayload: (String) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Column(modifier = modifier.background(ObsidianBg)) {
-        // Entity Console Summary Header
-        Surface(
-            color = ObsidianSurface,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 10.dp, vertical = 7.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        Text(
-                            text = "Detected Entities: ${state.discoveredEntities.size}",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = TelemetryViolet
-                        )
-                        if (state.entityViewportWidth > 0 && state.entityViewportHeight > 0) {
-                            Text(
-                                text = "${state.entityViewportWidth}×${state.entityViewportHeight}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                    Text(
-                        text = state.discoveredEntityArrayPath?.let { "Array: $it (${state.entityProjectionMode})" }
-                            ?: "Anchor: ${state.discoveredPlayerPath ?: "Complete Step 2B first"}",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                Surface(
-                    onClick = onRescanEntities,
-                    enabled = !state.discoveredPlayerPath.isNullOrBlank(),
-                    shape = RoundedCornerShape(6.dp),
-                    color = if (!state.discoveredPlayerPath.isNullOrBlank()) TelemetryViolet.copy(alpha = 0.2f) else ObsidianSurfaceElevated,
-                    border = BorderStroke(
-                        1.dp,
-                        if (!state.discoveredPlayerPath.isNullOrBlank()) TelemetryViolet else ObsidianBorder
-                    ),
-                    modifier = Modifier.testTag("entity_console_rescan_button")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = null,
-                            tint = if (!state.discoveredPlayerPath.isNullOrBlank()) TelemetryViolet else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Text(
-                            text = "Rescan",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = if (!state.discoveredPlayerPath.isNullOrBlank()) TelemetryViolet else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-        }
-
-        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
+        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.8f), thickness = 1.dp)
 
         if (state.discoveredEntities.isEmpty()) {
             Box(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .padding(16.dp),
+                    .padding(20.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.ViewInAr,
+                        imageVector = Icons.Default.Radar,
                         contentDescription = null,
-                        tint = TelemetryViolet.copy(alpha = 0.75f),
-                        modifier = Modifier.size(28.dp)
+                        tint = TelemetryViolet.copy(alpha = 0.8f),
+                        modifier = Modifier.size(30.dp)
                     )
                     Text(
                         text = stringResource(R.string.entities_empty_title),
@@ -742,16 +153,22 @@ fun EntityInspectionConsoleView(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .testTag("entity_inspection_list"),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+                    .testTag("nearby_entities_list"),
+                contentPadding = PaddingValues(10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                items(state.discoveredEntities, key = { "${it.path}_${it.id}" }) { entity ->
-                    EntityInspectionCard(
+                items(state.discoveredEntities, key = { it.baseIndex }) { entity ->
+                    NearbyEntityCard(
                         entity = entity,
-                        onPin = { onPinPath(entity.path, "${entity.name} (${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)})") },
+                        onTogglePin = { onTogglePinEntity(entity.baseIndex) },
                         onCopy = {
-                            onCopyPayload("${entity.name} [${entity.path}] world=(${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)}) screen=(${fmt1(entity.screenX)}, ${fmt1(entity.screenY)})")
+                            val hexAddr = "0x${entity.byteAddress.toString(16).uppercase(Locale.US)}"
+                            val copyText = "window.HEAPF32[${entity.baseIndex}..${entity.baseIndex + 2}] ($hexAddr, Δ${entity.offsetFromPlayer}) " +
+                                "X=${String.format(Locale.US, "%.3f", entity.x)} " +
+                                "Y=${String.format(Locale.US, "%.3f", entity.y)} " +
+                                "Z=${String.format(Locale.US, "%.3f", entity.z)} " +
+                                "dist=${String.format(Locale.US, "%.2f", entity.distanceToPlayer)}"
+                            onCopyEntity(copyText)
                         }
                     )
                 }
@@ -761,63 +178,428 @@ fun EntityInspectionConsoleView(
 }
 
 @Composable
-private fun EntityInspectionCard(
-    entity: DiscoveredEntitySample,
-    onPin: () -> Unit,
+private fun NearbyEntityCard(
+    entity: NearbyEntityStruct,
+    onTogglePin: () -> Unit,
     onCopy: () -> Unit
 ) {
-    val viewTint = if (entity.inViewport) SignalEmerald else AssetAmber
-    val viewLabel = if (entity.inViewport) "IN VIEW" else "OFFSCREEN"
+    val hexAddr = remember(entity.byteAddress) {
+        "0x${entity.byteAddress.toString(16).uppercase(Locale.US)}"
+    }
+    val offsetLabel = remember(entity.offsetFromPlayer) {
+        if (entity.offsetFromPlayer >= 0) "+${entity.offsetFromPlayer}" else "${entity.offsetFromPlayer}"
+    }
+    val borderColor = if (entity.isPinned) AssetAmber.copy(alpha = 0.85f) else ObsidianBorder
 
     Surface(
-        shape = RoundedCornerShape(8.dp),
+        shape = RoundedCornerShape(10.dp),
         color = ObsidianSurface,
-        border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.45f)),
+        border = BorderStroke(1.dp, borderColor),
         modifier = Modifier
             .fillMaxWidth()
-            .testTag("entity_card_${entity.path}")
+            .testTag("entity_card_${entity.baseIndex}")
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
-            verticalArrangement = Arrangement.spacedBy(5.dp)
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                Surface(
+                    shape = RoundedCornerShape(6.dp),
+                    color = TelemetryViolet.copy(alpha = 0.2f),
+                    border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.55f))
+                ) {
+                    Text(
+                        text = "[${entity.baseIndex}]",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        color = TelemetryViolet,
+                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
+                    )
+                }
+
                 Text(
-                    text = entity.name + if (entity.id.isNotBlank()) " #${entity.id}" else "",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
+                    text = "$hexAddr • Δ$offsetLabel",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
+
+                if (entity.strideGroup > 0) {
+                    Surface(
+                        shape = RoundedCornerShape(5.dp),
+                        color = ElectricCyan.copy(alpha = 0.16f)
+                    ) {
+                        Text(
+                            text = "stride ${entity.strideGroup}",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.SemiBold,
+                            color = ElectricCyan,
+                            fontSize = 9.sp,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+
                 Surface(
-                    color = viewTint.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(4.dp),
-                    border = BorderStroke(1.dp, viewTint.copy(alpha = 0.5f))
+                    shape = RoundedCornerShape(5.dp),
+                    color = SignalEmerald.copy(alpha = 0.16f)
                 ) {
                     Text(
-                        text = viewLabel,
+                        text = "${String.format(Locale.US, "%.1f", entity.distanceToPlayer)}m",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        color = SignalEmerald,
+                        fontSize = 10.sp,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(7.dp))
+                        .background(ObsidianBg)
+                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "X ${String.format(Locale.US, "%.2f", entity.x)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.SemiBold,
+                        color = SignalEmerald
+                    )
+                    Text(
+                        text = "Y ${String.format(Locale.US, "%.2f", entity.y)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.SemiBold,
+                        color = ElectricCyan
+                    )
+                    Text(
+                        text = "Z ${String.format(Locale.US, "%.2f", entity.z)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.SemiBold,
+                        color = TelemetryViolet
+                    )
+                }
+
+                IconButton(
+                    onClick = onTogglePin,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("pin_entity_${entity.baseIndex}")
+                ) {
+                    Icon(
+                        imageVector = if (entity.isPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
+                        contentDescription = stringResource(R.string.cd_pin_entity),
+                        tint = if (entity.isPinned) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+
+                IconButton(
+                    onClick = onCopy,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("copy_entity_${entity.baseIndex}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ContentCopy,
+                        contentDescription = stringResource(R.string.cd_copy_log),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Logs Tab: category-filterable rolling telemetry log viewer with `.txt` / `.json` full log dump
+ * export and share controls.
+ */
+@Composable
+fun LiveLogConsoleView(
+    state: DiagnosticsUiState,
+    filteredLogs: List<TelemetryLogEntry>,
+    onSelectFilter: (LogCategory) -> Unit,
+    onClearLogs: () -> Unit,
+    onExportLogDumpTxt: () -> Unit,
+    onExportLogDumpJson: () -> Unit,
+    onShareLastLogDump: () -> Unit,
+    onCopyLog: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier.background(ObsidianBg)) {
+        // Export & Clear Toolbar
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianSurface)
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Surface(
+                onClick = onExportLogDumpTxt,
+                enabled = !state.isExportingLogDump,
+                shape = RoundedCornerShape(8.dp),
+                color = SignalEmerald.copy(alpha = 0.18f),
+                border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.7f)),
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .weight(1f)
+                    .testTag("export_log_dump_txt_button")
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    if (state.isExportingLogDump) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(15.dp),
+                            strokeWidth = 2.dp,
+                            color = SignalEmerald
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.Download,
+                            contentDescription = null,
+                            tint = SignalEmerald,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    Text(
+                        text = " " + stringResource(R.string.action_export_log_dump_txt),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = SignalEmerald,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            Surface(
+                onClick = onExportLogDumpJson,
+                enabled = !state.isExportingLogDump,
+                shape = RoundedCornerShape(8.dp),
+                color = ElectricCyan.copy(alpha = 0.16f),
+                border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f)),
+                modifier = Modifier
+                    .heightIn(min = 48.dp)
+                    .testTag("export_log_dump_json_button")
+            ) {
+                Box(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = stringResource(R.string.action_export_log_dump_json),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan
+                    )
+                }
+            }
+
+            if (state.lastLogDumpExport?.success == true) {
+                IconButton(
+                    onClick = onShareLastLogDump,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("share_log_dump_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Share,
+                        contentDescription = stringResource(R.string.cd_share_log_dump),
+                        tint = SignalEmerald,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
+            }
+
+            IconButton(
+                onClick = onClearLogs,
+                modifier = Modifier
+                    .size(48.dp)
+                    .testTag("clear_logs_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.DeleteOutline,
+                    contentDescription = stringResource(R.string.cd_clear_logs),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(19.dp)
+                )
+            }
+        }
+
+        // Category Filter Row
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianSurface)
+                .horizontalScroll(rememberScrollState())
+                .padding(start = 10.dp, end = 10.dp, bottom = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            LogCategory.entries.forEach { category ->
+                val selected = state.selectedFilter == category
+                val accent = categoryAccentColor(category)
+                Surface(
+                    onClick = { onSelectFilter(category) },
+                    shape = RoundedCornerShape(6.dp),
+                    color = if (selected) accent.copy(alpha = 0.22f) else ObsidianBg,
+                    border = BorderStroke(1.dp, if (selected) accent else ObsidianBorder),
+                    modifier = Modifier.testTag("log_filter_${category.name.lowercase(Locale.US)}")
+                ) {
+                    Text(
+                        text = category.label,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                        color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                    )
+                }
+            }
+        }
+
+        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.75f), thickness = 1.dp)
+
+        if (filteredLogs.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Terminal,
+                        contentDescription = null,
+                        tint = ElectricCyan.copy(alpha = 0.75f),
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Text(
+                        text = stringResource(R.string.console_empty_title),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = stringResource(R.string.console_empty_subtitle),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .testTag("telemetry_log_list"),
+                contentPadding = PaddingValues(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items(filteredLogs, key = { it.id }) { entry ->
+                    LogEntryCard(
+                        entry = entry,
+                        onCopy = { onCopyLog("[${entry.timestamp}] [${entry.category.tag}] ${entry.summary}\n${entry.payload}") }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LogEntryCard(
+    entry: TelemetryLogEntry,
+    onCopy: () -> Unit
+) {
+    var expanded by remember(entry.id) { mutableStateOf(false) }
+    val accent = categoryAccentColor(entry.category)
+
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = ObsidianSurface,
+        border = BorderStroke(1.dp, if (expanded) accent.copy(alpha = 0.65f) else ObsidianBorder),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { expanded = !expanded }
+            .testTag("log_entry_${entry.id}")
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(4.dp),
+                    color = accent.copy(alpha = 0.18f)
+                ) {
+                    Text(
+                        text = entry.category.tag,
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
-                        color = viewTint,
+                        color = accent,
                         fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
                     )
                 }
-                IconButton(onClick = onPin, modifier = Modifier.size(28.dp)) {
-                    Icon(
-                        imageVector = Icons.Default.BookmarkBorder,
-                        contentDescription = stringResource(R.string.cd_pin_candidate),
-                        tint = AssetAmber,
-                        modifier = Modifier.size(15.dp)
-                    )
-                }
-                IconButton(onClick = onCopy, modifier = Modifier.size(28.dp)) {
+
+                Text(
+                    text = entry.summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = if (expanded) 4 else 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+
+                Text(
+                    text = entry.timestamp,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 9.sp
+                )
+
+                IconButton(
+                    onClick = onCopy,
+                    modifier = Modifier.size(32.dp)
+                ) {
                     Icon(
                         imageVector = Icons.Default.ContentCopy,
                         contentDescription = stringResource(R.string.cd_copy_log),
@@ -827,416 +609,31 @@ private fun EntityInspectionCard(
                 }
             }
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Surface(
-                    color = ObsidianBg,
-                    shape = RoundedCornerShape(5.dp),
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Column(modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)) {
-                        Text(
-                            text = "WORLD (X, Y, Z) • d=${fmt1(entity.distanceToPlayer)}",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 9.sp
-                        )
-                        Text(
-                            text = "${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)}",
-                            style = MaterialTheme.typography.bodySmall,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            color = ElectricCyan,
-                            fontSize = 10.sp
-                        )
-                    }
-                }
-
-                Surface(
-                    color = ObsidianBg,
-                    shape = RoundedCornerShape(5.dp),
-                    modifier = Modifier.weight(0.9f)
-                ) {
-                    Column(modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)) {
-                        Text(
-                            text = "2D CANVAS (screenX, Y)",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 9.sp
-                        )
-                        Text(
-                            text = "${fmt1(entity.screenX)}px, ${fmt1(entity.screenY)}px",
-                            style = MaterialTheme.typography.bodySmall,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            fontWeight = FontWeight.Bold,
-                            color = TelemetryViolet,
-                            fontSize = 10.sp
-                        )
-                    }
-                }
-            }
-
-            Text(
-                text = entity.path,
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = JetBrainsMonoFontFamily,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                fontSize = 9.sp
-            )
-        }
-    }
-}
-
-@Composable
-fun LiveLogConsoleView(
-    state: DiagnosticsUiState,
-    onSelectFilter: (LogCategory) -> Unit,
-    onExportLogDumpTxt: () -> Unit,
-    onExportLogDumpJson: () -> Unit,
-    onShareLogDump: () -> Unit,
-    onCopyPayload: (String) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val filteredLogs = remember(state.logs, state.selectedFilter) {
-        if (state.selectedFilter == LogCategory.ALL) state.logs
-        else state.logs.filter { it.category == state.selectedFilter }
-    }
-
-    val listState = rememberLazyListState()
-    LaunchedEffect(filteredLogs.size) {
-        if (filteredLogs.isNotEmpty()) {
-            listState.animateScrollToItem(filteredLogs.lastIndex)
-        }
-    }
-
-    Column(modifier = modifier) {
-        // Dedicated Complete Log Dump Export Toolbar (.txt / .json + Share)
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(ObsidianSurface)
-                .padding(horizontal = 8.dp, vertical = 5.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Button(
-                onClick = onExportLogDumpTxt,
-                enabled = !state.isExportingLogDump,
-                shape = RoundedCornerShape(7.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = SignalEmerald.copy(alpha = 0.2f),
-                    contentColor = SignalEmerald,
-                    disabledContainerColor = ObsidianSurfaceElevated,
-                    disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
-                ),
-                border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.7f)),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                modifier = Modifier
-                    .weight(1f)
-                    .heightIn(min = 38.dp)
-                    .testTag("export_log_dump_txt_button")
-            ) {
-                if (state.isExportingLogDump) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(14.dp),
-                        strokeWidth = 2.dp,
-                        color = SignalEmerald
-                    )
-                } else {
-                    Icon(
-                        imageVector = Icons.Default.Download,
-                        contentDescription = null,
-                        modifier = Modifier.size(15.dp)
-                    )
-                }
-                Spacer(Modifier.width(5.dp))
+            if (expanded && entry.payload.isNotBlank()) {
                 Text(
-                    text = stringResource(R.string.action_export_log_dump_txt),
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            OutlinedButton(
-                onClick = onExportLogDumpJson,
-                enabled = !state.isExportingLogDump,
-                shape = RoundedCornerShape(7.dp),
-                border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.7f)),
-                contentPadding = PaddingValues(horizontal = 9.dp, vertical = 6.dp),
-                modifier = Modifier
-                    .heightIn(min = 38.dp)
-                    .testTag("export_log_dump_json_button")
-            ) {
-                Text(
-                    text = stringResource(R.string.action_export_log_dump_json),
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = AssetAmber
-                )
-            }
-
-            if (state.lastLogDumpExport?.success == true && state.lastLogDumpExport.contentUri != null) {
-                OutlinedButton(
-                    onClick = onShareLogDump,
-                    shape = RoundedCornerShape(7.dp),
-                    border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.8f)),
-                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                    modifier = Modifier
-                        .heightIn(min = 38.dp)
-                        .testTag("share_log_dump_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Share,
-                        contentDescription = stringResource(R.string.cd_share_log_dump),
-                        tint = ElectricCyan,
-                        modifier = Modifier.size(14.dp)
-                    )
-                    Spacer(Modifier.width(3.dp))
-                    Text(
-                        text = stringResource(R.string.action_share_log_dump),
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = ElectricCyan
-                    )
-                }
-            }
-        }
-
-        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.6f), thickness = 1.dp)
-
-        LogFilterRow(
-            selectedFilter = state.selectedFilter,
-            assetCount = state.interceptedAssets.size,
-            deltaCount = state.isolatedPaths.size,
-            onSelectFilter = onSelectFilter
-        )
-        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
-
-        if (filteredLogs.isEmpty()) {
-            ConsoleEmptyState(
-                hasAnyLogs = state.logs.isNotEmpty(),
-                selectedFilter = state.selectedFilter,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-            )
-        } else {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .background(ObsidianBg)
-                    .testTag("telemetry_log_list"),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                verticalArrangement = Arrangement.spacedBy(5.dp)
-            ) {
-                items(filteredLogs, key = { it.id }) { entry ->
-                    TelemetryLogRow(
-                        entry = entry,
-                        onCopyPayload = onCopyPayload
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun LogFilterRow(
-    selectedFilter: LogCategory,
-    assetCount: Int,
-    deltaCount: Int,
-    onSelectFilter: (LogCategory) -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(ObsidianSurface)
-            .horizontalScroll(rememberScrollState())
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(5.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        LogCategory.entries.forEach { category ->
-            val selected = category == selectedFilter
-            val accent = categoryAccentColor(category)
-            val suffix = when (category) {
-                LogCategory.ASSET -> if (assetCount > 0) " ($assetCount)" else ""
-                LogCategory.DELTA -> if (deltaCount > 0) " ($deltaCount)" else ""
-                else -> ""
-            }
-            Surface(
-                onClick = { onSelectFilter(category) },
-                shape = RoundedCornerShape(6.dp),
-                color = if (selected) accent.copy(alpha = 0.22f) else ObsidianBg,
-                border = BorderStroke(
-                    width = 1.dp,
-                    color = if (selected) accent else ObsidianBorder
-                ),
-                modifier = Modifier.testTag("filter_chip_${category.tag.lowercase()}")
-            ) {
-                Text(
-                    text = "${category.label}$suffix",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                    color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun TelemetryLogRow(
-    entry: TelemetryLogEntry,
-    onCopyPayload: (String) -> Unit
-) {
-    var expanded by remember(entry.id) { mutableStateOf(false) }
-    val accent = categoryAccentColor(entry.category)
-    val hasRichPayload = entry.payload.isNotBlank() && entry.payload != entry.summary
-
-    Surface(
-        shape = RoundedCornerShape(6.dp),
-        color = ObsidianSurface,
-        border = BorderStroke(
-            width = 1.dp,
-            color = if (expanded) accent.copy(alpha = 0.5f) else ObsidianBorder.copy(alpha = 0.55f)
-        ),
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(enabled = hasRichPayload) { expanded = !expanded }
-            .testTag("log_entry_${entry.id}")
-    ) {
-        Column(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(
-                    text = entry.timestamp,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 9.sp
-                )
-                Surface(
-                    color = accent.copy(alpha = 0.18f),
-                    shape = RoundedCornerShape(4.dp)
-                ) {
-                    Text(
-                        text = entry.category.tag,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = accent,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                    )
-                }
-                Text(
-                    text = entry.summary,
+                    text = entry.payload,
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = if (expanded) Int.MAX_VALUE else 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                if (hasRichPayload) {
-                    IconButton(
-                        onClick = { onCopyPayload(entry.payload) },
-                        modifier = Modifier.size(28.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.ContentCopy,
-                            contentDescription = stringResource(R.string.cd_copy_log),
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.size(14.dp)
-                        )
-                    }
-                }
-            }
-
-            if (expanded && hasRichPayload) {
-                Spacer(Modifier.height(4.dp))
-                Box(
+                    fontFamily = JetBrainsMonoFontFamily,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 10.sp,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(ObsidianBg)
-                        .padding(6.dp)
-                ) {
-                    Text(
-                        text = entry.payload,
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = accent.copy(alpha = 0.92f),
-                        fontSize = 10.sp,
-                        lineHeight = 14.sp
-                    )
-                }
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(ObsidianSurfaceElevated)
+                        .padding(8.dp)
+                )
             }
         }
     }
 }
 
-@Composable
-private fun ConsoleEmptyState(
-    hasAnyLogs: Boolean,
-    selectedFilter: LogCategory,
-    modifier: Modifier = Modifier
-) {
-    Box(
-        modifier = modifier
-            .background(ObsidianBg)
-            .padding(16.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Default.Radar,
-                contentDescription = null,
-                tint = ElectricCyan.copy(alpha = 0.7f),
-                modifier = Modifier.size(28.dp)
-            )
-            Text(
-                text = if (hasAnyLogs) "No ${selectedFilter.label} events yet" else stringResource(R.string.console_empty_title),
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.onSurface
-            )
-            Text(
-                text = if (hasAnyLogs) {
-                    "Switch back to All or run the corresponding Wizard step."
-                } else {
-                    stringResource(R.string.console_empty_subtitle)
-                },
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 3
-            )
-        }
-    }
-}
-
-internal fun categoryAccentColor(category: LogCategory): Color = when (category) {
+fun categoryAccentColor(category: LogCategory): Color = when (category) {
     LogCategory.ALL -> ElectricCyan
-    LogCategory.SCOPE -> ElectricCyan
-    LogCategory.DELTA -> SignalEmerald
+    LogCategory.FEED -> SignalEmerald
+    LogCategory.RELOCK -> ElectricCyan
     LogCategory.ENTITY -> TelemetryViolet
-    LogCategory.WASM -> Color(0xFF38BDF8)
     LogCategory.ASSET -> AssetAmber
-    LogCategory.JS -> Color(0xFF60A5FA)
+    LogCategory.JS -> ElectricCyan
     LogCategory.SYSTEM -> Color(0xFF94A3B8)
     LogCategory.ERROR -> AlertCoral
 }
-
-private fun fmt1(value: Double): String = String.format(Locale.US, "%.1f", value)
-private fun fmt2(value: Double): String = String.format(Locale.US, "%.2f", value)

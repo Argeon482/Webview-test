@@ -10,31 +10,33 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Secure native telemetry bridge exposed to the diagnostic WebView execution context.
  *
- * Security controls:
+ * Security & performance controls:
+ * - Strictly observational: receives read-only coordinate telemetry, auto-relock signatures,
+ *   entity scan results, and user-initiated report exports.
  * - Strict payload length bounds, control-character sanitization, and sliding-window rate
- *   limiting prevent memory exhaustion or log flooding from untrusted web pages.
- * - Export writes are gated behind an explicit user-triggered arming flag ([armExport]) so an
- *   arbitrary page cannot write files to device storage unsolicited.
- * - Async scan status updates are validated against a strict allowlist ([AsyncScanStatus]).
- * - Live 200ms player coordinate telemetry validates finite numeric values and throttles bursts.
- * - All UI state mutations are marshaled safely onto the Android main thread.
+ *   limiting prevent memory exhaustion or log flooding from web pages.
+ * - Export writes are gated behind an explicit user-triggered arming flag ([armExport]).
+ * - High-frequency 200 ms `window.HEAPF32` coordinate updates validate finite floats and
+ *   marshal state changes cleanly onto the Android main thread.
  */
 class TelemetryBridge(
     private val onTelemetryReceived: (category: String, payload: String) -> Unit,
     private val onReportPayloadReceived: (jsonContent: String) -> Unit,
     private val onScanStatusChanged: (status: AsyncScanStatus, detail: String) -> Unit = { _, _ -> },
-    private val onPlayerCoordsUpdated: (path: String, x: Double, y: Double, z: Double) -> Unit = { _, _, _, _ -> },
-    private val onBatchProgressChanged: (ScopeBatchProgress) -> Unit = { _ -> },
-    private val onWasmNeighborsUpdated: (jsonPayload: String) -> Unit = { _ -> },
-    private val onWasmFloatCandidatesUpdated: (jsonPayload: String) -> Unit = { _ -> }
+    private val onDirectHeapCoordsUpdated: (
+        baseIndex: Int,
+        x: Double,
+        y: Double,
+        z: Double,
+        heapByteLength: Long,
+        heapSource: String
+    ) -> Unit = { _, _, _, _, _, _ -> }
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exportArmed = AtomicBoolean(false)
     private val lastLogWindowStartMs = AtomicLong(0L)
     private val logsInCurrentWindow = AtomicLong(0L)
     private val lastCoordUpdateMs = AtomicLong(0L)
-    private val lastWasmNeighborUpdateMs = AtomicLong(0L)
-    private val lastWasmFloatWatchUpdateMs = AtomicLong(0L)
 
     /**
      * Arms the bridge to accept the next structured report payload produced by a user-initiated
@@ -74,94 +76,35 @@ class TelemetryBridge(
         }
     }
 
+    /**
+     * Receives live 200 ms player coordinates read directly from
+     * `window.HEAPF32[baseIndex]`, `window.HEAPF32[baseIndex + 1]`, and `window.HEAPF32[baseIndex + 2]`.
+     */
     @JavascriptInterface
-    fun updatePlayerCoords(path: String, x: Double, y: Double, z: Double) {
-        if (!x.isFinite() || !y.isFinite() || !z.isFinite()) return
+    fun updateDirectHeapCoords(
+        baseIndex: Int,
+        x: Double,
+        y: Double,
+        z: Double,
+        heapByteLength: Long,
+        heapSource: String
+    ) {
+        if (baseIndex < 0 || !x.isFinite() || !y.isFinite() || !z.isFinite()) return
 
         val now = System.currentTimeMillis()
         val prev = lastCoordUpdateMs.get()
         if (now - prev < MIN_COORD_INTERVAL_MS) return
         if (!lastCoordUpdateMs.compareAndSet(prev, now)) return
 
-        val safePath = sanitizePayload(path, MAX_PATH_CHARS)
+        val safeSource = sanitizePayload(heapSource, MAX_SOURCE_CHARS)
             .replace('\n', ' ')
             .replace('\r', ' ')
             .trim()
-        if (safePath.isEmpty()) return
+            .ifEmpty { "window.HEAPF32" }
+        val safeBytes = heapByteLength.coerceAtLeast(0L)
 
         mainHandler.post {
-            onPlayerCoordsUpdated(safePath, x, y, z)
-        }
-    }
-
-    @JavascriptInterface
-    fun updateBatchProgress(
-        currentBatch: Int,
-        totalBatches: Int,
-        itemStart: Int,
-        itemEnd: Int,
-        totalItems: Int,
-        foundCount: Int,
-        isActive: Boolean,
-        isPaused: Boolean
-    ) {
-        val safeTotalBatches = totalBatches.coerceIn(0, 10_000)
-        val safeCurrentBatch = currentBatch.coerceIn(0, safeTotalBatches.coerceAtLeast(1))
-        val safeTotalItems = totalItems.coerceIn(0, 1_000_000)
-        val safeStart = itemStart.coerceIn(0, safeTotalItems)
-        val safeEnd = itemEnd.coerceIn(safeStart, safeTotalItems)
-        val safeFound = foundCount.coerceIn(0, 100_000)
-
-        val progress = ScopeBatchProgress(
-            isActive = isActive,
-            isPaused = isPaused,
-            currentBatch = safeCurrentBatch,
-            totalBatches = safeTotalBatches,
-            itemStart = safeStart,
-            itemEnd = safeEnd,
-            totalItems = safeTotalItems,
-            foundCount = safeFound
-        )
-        mainHandler.post {
-            onBatchProgressChanged(progress)
-        }
-    }
-
-    /**
-     * Streams live ±4..±16 byte neighboring float/int32 readouts from the isolated WebAssembly
-     * heap address at ~200 ms intervals so the developer can watch adjacent coordinate floats move.
-     */
-    @JavascriptInterface
-    fun updateWasmNeighbors(jsonPayload: String) {
-        val now = System.currentTimeMillis()
-        val prev = lastWasmNeighborUpdateMs.get()
-        if (now - prev < MIN_COORD_INTERVAL_MS) return
-        if (!lastWasmNeighborUpdateMs.compareAndSet(prev, now)) return
-
-        val safePayload = sanitizePayload(jsonPayload, MAX_LOG_PAYLOAD_CHARS).trim()
-        if (safePayload.isEmpty()) return
-
-        mainHandler.post {
-            onWasmNeighborsUpdated(safePayload)
-        }
-    }
-
-    /**
-     * Streams live 200 ms decimal values for the top movement-filtered `window.HEAPF32`
-     * coordinate candidates into the bottom Live Float Watcher panel.
-     */
-    @JavascriptInterface
-    fun updateWasmFloatCandidates(jsonPayload: String) {
-        val now = System.currentTimeMillis()
-        val prev = lastWasmFloatWatchUpdateMs.get()
-        if (now - prev < MIN_COORD_INTERVAL_MS) return
-        if (!lastWasmFloatWatchUpdateMs.compareAndSet(prev, now)) return
-
-        val safePayload = sanitizePayload(jsonPayload, MAX_LOG_PAYLOAD_CHARS).trim()
-        if (safePayload.isEmpty()) return
-
-        mainHandler.post {
-            onWasmFloatCandidatesUpdated(safePayload)
+            onDirectHeapCoordsUpdated(baseIndex, x, y, z, safeBytes, safeSource)
         }
     }
 
@@ -180,7 +123,6 @@ class TelemetryBridge(
 
         val boundedPayload = jsonContent.take(MAX_EXPORT_PAYLOAD_CHARS).trim()
         val validatedJson = try {
-            // Verify well-formed JSON object before forwarding to Kotlin exporter.
             JSONObject(boundedPayload).toString()
         } catch (_: Exception) {
             JSONObject().put("rawMetricsError", "Invalid JSON payload received from WebView").toString()
@@ -225,8 +167,8 @@ class TelemetryBridge(
         const val BRIDGE_NAME = "TelemetryBridge"
         private const val MAX_CATEGORY_CHARS = 16
         private const val MAX_STATUS_DETAIL_CHARS = 120
-        private const val MAX_PATH_CHARS = 240
-        private const val MAX_LOG_PAYLOAD_CHARS = 16_384
+        private const val MAX_SOURCE_CHARS = 80
+        private const val MAX_LOG_PAYLOAD_CHARS = 32_768
         private const val MAX_EXPORT_PAYLOAD_CHARS = 1_500_000
         private const val RATE_LIMIT_WINDOW_MS = 1_000L
         private const val MAX_LOGS_PER_WINDOW = 60L

@@ -505,15 +505,7 @@ fun EntityInspectionConsoleView(
     state: DiagnosticsUiState,
     onRescanEntities: () -> Unit,
     onToggleLiveEntities: () -> Unit,
-    onToggleStructProberExpanded: () -> Unit = {},
-    onSelectStructProbeField: (WasmStructFieldKind) -> Unit = {},
-    onStructProbeInputChanged: (String) -> Unit = {},
-    onRunStructProbe: () -> Unit = {},
-    onRunStructRefine: () -> Unit = {},
-    onRunAutoProbeNames: () -> Unit = {},
-    onBindStructCandidate: (WasmStructProbeCandidate) -> Unit = {},
-    onClearBoundStructField: (WasmStructFieldKind) -> Unit = {},
-    onClearAllBoundStructFields: () -> Unit = {},
+    onOpenProber: () -> Unit,
     onPinPath: (path: String, detail: String) -> Unit,
     onCopyPayload: (String) -> Unit,
     modifier: Modifier = Modifier
@@ -524,130 +516,152 @@ fun EntityInspectionConsoleView(
         state.structProber.schema.hasAnyBound
 
     Column(modifier = modifier.background(ObsidianBg)) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(ObsidianSurface)
-                .padding(horizontal = 10.dp, vertical = 7.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text(
-                    text = state.discoveredEntityArrayPath ?: "Entity Collection (Not Scanned)",
-                    style = MaterialTheme.typography.labelMedium,
-                    fontFamily = JetBrainsMonoFontFamily,
-                    fontWeight = FontWeight.Bold,
-                    color = TelemetryViolet,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                val meta = buildString {
-                    append("${state.discoveredEntities.size} detected")
-                    if (state.isWasmEntitiesLivePolling) append(" • LIVE #${state.wasmEntityLiveTickCount}")
-                    if (state.entityProjectionMode.isNotBlank()) append(" • ${state.entityProjectionMode}")
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        text = state.discoveredEntityArrayPath ?: "Nearby Entities (Not Scanned)",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        color = TelemetryViolet,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    val meta = buildString {
+                        append("${state.discoveredEntities.size} detected")
+                        if (state.isWasmEntitiesLivePolling) append(" • LIVE #${state.wasmEntityLiveTickCount}")
+                        if (state.structProber.schema.hasAnyBound) {
+                            append(" • ${state.structProber.schema.boundCount} offsets bound")
+                        }
+                    }
+                    Text(
+                        text = meta,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        color = if (state.isWasmEntitiesLivePolling) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
-                Text(
-                    text = meta,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = JetBrainsMonoFontFamily,
-                    color = if (state.isWasmEntitiesLivePolling) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 10.sp,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
 
-            if (isWasmEntityMode && state.discoveredEntities.isNotEmpty()) {
+                // Quick shortcut straight to the dedicated Prober tab
                 Surface(
-                    onClick = onToggleLiveEntities,
-                    shape = RoundedCornerShape(7.dp),
-                    color = if (state.isWasmEntitiesLivePolling) AlertCoral.copy(alpha = 0.16f) else SignalEmerald.copy(alpha = 0.18f),
-                    border = BorderStroke(
-                        1.dp,
-                        if (state.isWasmEntitiesLivePolling) AlertCoral.copy(alpha = 0.7f) else SignalEmerald.copy(alpha = 0.65f)
-                    ),
+                    onClick = onOpenProber,
+                    shape = RoundedCornerShape(8.dp),
+                    color = ElectricCyan.copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f)),
                     modifier = Modifier
                         .heightIn(min = 44.dp)
-                        .testTag("toggle_wasm_entities_live_button")
+                        .testTag("entities_open_prober_shortcut")
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Icon(
-                            imageVector = if (state.isWasmEntitiesLivePolling) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = stringResource(R.string.cd_toggle_wasm_entities_live),
-                            tint = if (state.isWasmEntitiesLivePolling) AlertCoral else SignalEmerald,
-                            modifier = Modifier.size(15.dp)
-                        )
                         Text(
-                            text = stringResource(
-                                if (state.isWasmEntitiesLivePolling) R.string.action_live_entities_off
-                                else R.string.action_live_entities_on
-                            ),
+                            text = stringResource(R.string.action_probe_hp_names_shortcut),
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
-                            color = if (state.isWasmEntitiesLivePolling) AlertCoral else SignalEmerald
+                            color = ElectricCyan
                         )
                     }
                 }
             }
 
-            Surface(
-                onClick = onRescanEntities,
-                shape = RoundedCornerShape(7.dp),
-                color = TelemetryViolet.copy(alpha = 0.18f),
-                border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.65f)),
-                modifier = Modifier
-                    .heightIn(min = 44.dp)
-                    .testTag("rescan_entities_button")
+            // Primary spacious 48dp Action Row: Scan Entities + Live 500ms Toggle
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                Surface(
+                    onClick = onRescanEntities,
+                    shape = RoundedCornerShape(8.dp),
+                    color = TelemetryViolet.copy(alpha = 0.22f),
+                    border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.75f)),
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .testTag("rescan_entities_button")
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Refresh,
-                        contentDescription = null,
-                        tint = TelemetryViolet,
-                        modifier = Modifier.size(15.dp)
-                    )
-                    Text(
-                        text = "Rescan",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = TelemetryViolet
-                    )
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = null,
+                            tint = TelemetryViolet,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = "Scan Entities",
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = TelemetryViolet
+                        )
+                    }
+                }
+
+                if (isWasmEntityMode && state.discoveredEntities.isNotEmpty()) {
+                    Surface(
+                        onClick = onToggleLiveEntities,
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (state.isWasmEntitiesLivePolling) AlertCoral.copy(alpha = 0.18f) else SignalEmerald.copy(alpha = 0.2f),
+                        border = BorderStroke(
+                            1.dp,
+                            if (state.isWasmEntitiesLivePolling) AlertCoral.copy(alpha = 0.75f) else SignalEmerald.copy(alpha = 0.75f)
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 48.dp)
+                            .testTag("toggle_wasm_entities_live_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = if (state.isWasmEntitiesLivePolling) Icons.Default.Pause else Icons.Default.PlayArrow,
+                                contentDescription = stringResource(R.string.cd_toggle_wasm_entities_live),
+                                tint = if (state.isWasmEntitiesLivePolling) AlertCoral else SignalEmerald,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = stringResource(
+                                    if (state.isWasmEntitiesLivePolling) R.string.action_live_entities_off
+                                    else R.string.action_live_entities_on
+                                ),
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = if (state.isWasmEntitiesLivePolling) AlertCoral else SignalEmerald
+                            )
+                        }
+                    }
                 }
             }
         }
 
         HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
-
-        if (isWasmEntityMode) {
-            StructProberPanel(
-                prober = state.structProber,
-                hasPlayerAnchor = state.hasLiveWasmPlayerAnchor,
-                trackedMobCount = state.discoveredEntities.size,
-                onToggleExpanded = onToggleStructProberExpanded,
-                onSelectField = onSelectStructProbeField,
-                onInputChanged = onStructProbeInputChanged,
-                onRunProbe = onRunStructProbe,
-                onRunRefine = onRunStructRefine,
-                onRunAutoProbeNames = onRunAutoProbeNames,
-                onBindCandidate = onBindStructCandidate,
-                onClearField = onClearBoundStructField,
-                onClearAllFields = onClearAllBoundStructFields,
-                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
-            )
-            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
-        }
 
         if (state.discoveredEntities.isEmpty()) {
             Box(

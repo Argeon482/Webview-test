@@ -722,6 +722,146 @@ class ExampleRobolectricTest {
         assertTrue(dumpText.contains("HP=240/280"))
         assertTrue(dumpText.contains("BOUND ENTITY STRUCT SCHEMA"))
     }
+
+    @Test
+    fun `bookmarked pointers and struct offsets survive cold app restart via synchronous SharedPreferences and populate startup Saved Sites`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        // Ensure clean slate in Robolectric SharedPreferences
+        SitePointerStore(context).clearPointersForHost("universe.flyff.com")
+        SiteStructSchemaStore(context).clearSchemaForHost("universe.flyff.com")
+
+        val siteUrl = "https://universe.flyff.com/play"
+
+        // --- Session 1: Discover pointer, bookmark it, bind HP + Name offsets ---
+        val session1Vm = DiagnosticsViewModel()
+        session1Vm.attachContext(context)
+        session1Vm.onUrlInputChanged(siteUrl)
+        session1Vm.onLoadUrlRequested()
+        session1Vm.onPageFinished(siteUrl, "Flyff Universe")
+
+        session1Vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":10.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
+        )
+        session1Vm.onTogglePinWasmPointerChain("L1_0x00135C64_+0x98")
+        assertEquals(1, session1Vm.uiState.value.wasmFloatDelta.savedPointerCountForHost)
+
+        session1Vm.onSelectStructProbeField(WasmStructFieldKind.HP)
+        session1Vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"HP","isRefine":false,"durationMs":1.2,"totalFound":1,"candidates":[{"id":"D_456_INT32","relOffsetBytes":456,"subOffsetBytes":null,"valueType":"INT32","expression":"+0x1C8 [i32]","playerDisplayValue":"4338","playerNumericValue":4338,"adjacentMaxOffsetBytes":460,"adjacentMaxValue":4500,"mobPreviews":["#1=280"],"nonZeroMobCount":1}]}"""
+        )
+        session1Vm.onBindStructFieldCandidate(session1Vm.uiState.value.structProber.candidates.first())
+
+        // --- Session 2: Simulated cold app restart (brand new ViewModel on about:blank) ---
+        val coldStartVm = DiagnosticsViewModel()
+        coldStartVm.attachContext(context)
+
+        // Immediately shows Saved Site profile on startup even before navigating away from about:blank
+        assertEquals("about:blank", coldStartVm.uiState.value.activeUrl)
+        val savedProfiles = coldStartVm.uiState.value.savedSiteProfiles
+        assertEquals(1, savedProfiles.size)
+        val flyffProfile = savedProfiles.first()
+        assertEquals("universe.flyff.com", flyffProfile.hostKey)
+        assertEquals(1, flyffProfile.pointerCount)
+        assertEquals(2, flyffProfile.boundStructFieldCount) // HP + adjacent MaxHP
+        assertTrue(flyffProfile.pointerExpressions.any { it.contains("*(0x00135C64) + 0x98") })
+
+        // One-tap Open & Verify restores pointers + schema and queues URL load
+        coldStartVm.onOpenSavedSiteProfile(flyffProfile)
+        assertEquals(siteUrl, coldStartVm.uiState.value.urlInput)
+        assertEquals(1, coldStartVm.uiState.value.wasmFloatDelta.pointerChains.size)
+        assertEquals(456, coldStartVm.uiState.value.structProber.schema.hp?.relOffsetBytes)
+
+        // Subdomain redirect on page finish still resolves saved data & triggers auto-verify
+        coldStartVm.onPageFinished("https://play.universe.flyff.com/world", "Flyff World")
+        assertTrue(coldStartVm.uiState.value.wasmFloatDelta.isAutoVerifyingOnReload)
+        assertEquals(1, coldStartVm.uiState.value.wasmFloatDelta.pointerChains.size)
+        assertEquals(456, coldStartVm.uiState.value.structProber.schema.hp?.relOffsetBytes)
+
+        // Delete saved site clears both stores and updates startup list
+        coldStartVm.onDeleteSavedSiteProfile("universe.flyff.com")
+        assertTrue(coldStartVm.uiState.value.savedSiteProfiles.isEmpty())
+        assertEquals(0, SitePointerStore(context).loadPointersForHost("universe.flyff.com").size)
+        assertFalse(SiteStructSchemaStore(context).loadSchemaForHost("universe.flyff.com").hasAnyBound)
+    }
+
+    @Test
+    fun `draggable split presets and 4-tab console navigation work cleanly`() {
+        val vm = DiagnosticsViewModel()
+
+        // Default tab is COORDS in balanced split mode
+        assertEquals(ConsoleTab.COORDS, vm.uiState.value.activeConsoleTab)
+        assertEquals(0.48f, vm.uiState.value.consoleSplitFraction, 0.001f)
+
+        // Snap to Mini, Split, Full and clamp out-of-range drag values
+        vm.onSnapConsoleMini()
+        assertEquals(0.15f, vm.uiState.value.consoleSplitFraction, 0.001f)
+
+        // Selecting a tab while in Mini mode auto-expands back to comfortable split height
+        vm.onSelectConsoleTab(ConsoleTab.PROBER)
+        assertEquals(ConsoleTab.PROBER, vm.uiState.value.activeConsoleTab)
+        assertEquals(0.48f, vm.uiState.value.consoleSplitFraction, 0.001f)
+
+        vm.onSelectProberSubTab(ProberSubTab.FULL_HEAP)
+        assertEquals(ProberSubTab.FULL_HEAP, vm.uiState.value.activeProberSubTab)
+
+        vm.onSelectConsoleTab(ConsoleTab.LOGS_ASSETS)
+        vm.onSelectLogsAssetsSubTab(LogsAssetsSubTab.ASSETS)
+        assertEquals(ConsoleTab.LOGS_ASSETS, vm.uiState.value.activeConsoleTab)
+        assertEquals(LogsAssetsSubTab.ASSETS, vm.uiState.value.activeLogsAssetsSubTab)
+
+        vm.onSnapConsoleFull()
+        assertEquals(0.88f, vm.uiState.value.consoleSplitFraction, 0.001f)
+
+        vm.onSetConsoleSplitFraction(0.02f)
+        assertEquals(0.14f, vm.uiState.value.consoleSplitFraction, 0.001f)
+        vm.onSetConsoleSplitFraction(0.99f)
+        assertEquals(0.88f, vm.uiState.value.consoleSplitFraction, 0.001f)
+    }
+
+    @Test
+    fun `site stores support registrable domain subdomain fallback and startup host listing`() {
+        val ptrStore = SitePointerStore(InMemoryPointerStorage())
+        val sampleChain = WasmPointerChain(
+            id = "L1_0x00135C64_+0x98",
+            depth = 1,
+            basePointerAddress = 1268836L,
+            offsets = listOf(152),
+            resolvedTargetAddress = 65011712L,
+            resolvedX = 6961.98,
+            resolvedY = 100.0,
+            resolvedZ = 3309.76,
+            isLikelyStatic = true,
+            isVerifiedLive = true,
+            expression = "*(0x00135C64) + 0x98"
+        )
+        ptrStore.savePointerForUrl("https://universe.flyff.com/play", sampleChain)
+
+        // Subdomain redirect falls back to registrable root domain
+        val subdomainLoaded = ptrStore.loadPointersForUrl("https://play.universe.flyff.com/world1")
+        assertEquals(1, subdomainLoaded.size)
+        assertEquals("L1_0x00135C64_+0x98", subdomainLoaded.first().id)
+
+        // Startup saved-sites listing returns metadata including lastUrl
+        val savedSites = ptrStore.listSavedSites()
+        assertEquals(1, savedSites.size)
+        assertEquals("universe.flyff.com", savedSites.first().hostKey)
+        assertEquals("https://universe.flyff.com/play", savedSites.first().lastUrl)
+
+        // Struct schema store also resolves across subdomains
+        val schemaStore = SiteStructSchemaStore(InMemoryPointerStorage())
+        val schema = WasmEntityStructSchema(
+            hp = WasmStructFieldOffset(456, null, WasmStructValueType.INT32, "+0x1C8 [i32]"),
+            name = WasmStructFieldOffset(528, null, WasmStructValueType.CHAR_PTR, "+0x210 [char*]")
+        )
+        schemaStore.saveSchemaForUrl("https://universe.flyff.com/play", schema)
+        val loadedSubdomainSchema = schemaStore.loadSchemaForUrl("https://play.universe.flyff.com/world1")
+        assertEquals(456, loadedSubdomainSchema.hp?.relOffsetBytes)
+        assertEquals(528, loadedSubdomainSchema.name?.relOffsetBytes)
+        assertTrue(loadedSubdomainSchema.isSavedLocally)
+    }
 }
+
 
 

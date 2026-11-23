@@ -2,14 +2,15 @@ package com.example
 
 import android.content.Context
 import org.json.JSONObject
+import java.util.Locale
 
 /**
  * Private on-device per-site persistence store for confirmed WASM entity struct field offsets
  * (HP, MaxHP, MP, MaxMP, FP, MaxFP, and Mob/Player Name).
  *
- * Keyed by normalized host (e.g. `universe.flyff.com`) via [SitePointerStore.normalizeHostKey]
- * so bound stat and name offsets survive Reset, WebView page reloads, and full app restarts
- * without requiring extra permissions or external storage.
+ * Uses synchronous [SharedPrefsPointerStorage] commits and supports registrable root-domain
+ * fallback matching (e.g. `play.universe.flyff.com` ↔ `universe.flyff.com`) so bound stat and
+ * name offsets survive Reset, WebView page reloads, and full app restarts.
  */
 class SiteStructSchemaStore(
     private val storage: PointerKeyValueStorage
@@ -21,9 +22,31 @@ class SiteStructSchemaStore(
     )
 
     fun loadSchemaForUrl(url: String): WasmEntityStructSchema {
-        val hostKey = SitePointerStore.normalizeHostKey(url) ?: return WasmEntityStructSchema()
-        val raw = storage.getString(prefKeyForHost(hostKey)) ?: return WasmEntityStructSchema(hostKey = hostKey)
-        return deserializeSchema(raw, hostKey)
+        val exactHost = SitePointerStore.normalizeHostKey(url) ?: return WasmEntityStructSchema()
+        val exactRaw = storage.getString(prefKeyForHost(exactHost))
+        if (!exactRaw.isNullOrBlank()) {
+            return deserializeSchema(exactRaw, exactHost)
+        }
+        val targetDomain = SitePointerStore.extractRegistrableDomain(exactHost)
+            ?: return WasmEntityStructSchema(hostKey = exactHost)
+        val fallbackHost = listSavedSchemaHosts().keys.firstOrNull { savedHost ->
+            savedHost != exactHost &&
+                SitePointerStore.extractRegistrableDomain(savedHost) == targetDomain
+        }
+        if (fallbackHost != null) {
+            val fallbackRaw = storage.getString(prefKeyForHost(fallbackHost))
+            if (!fallbackRaw.isNullOrBlank()) {
+                return deserializeSchema(fallbackRaw, fallbackHost)
+            }
+        }
+        return WasmEntityStructSchema(hostKey = exactHost)
+    }
+
+    fun loadSchemaForHost(hostKey: String): WasmEntityStructSchema {
+        val normalized = SitePointerStore.normalizeHostKey(hostKey) ?: return WasmEntityStructSchema()
+        val raw = storage.getString(prefKeyForHost(normalized))
+            ?: return WasmEntityStructSchema(hostKey = normalized)
+        return deserializeSchema(raw, normalized)
     }
 
     fun saveSchemaForUrl(url: String, schema: WasmEntityStructSchema): WasmEntityStructSchema {
@@ -39,7 +62,28 @@ class SiteStructSchemaStore(
 
     fun clearSchemaForUrl(url: String) {
         val hostKey = SitePointerStore.normalizeHostKey(url) ?: return
-        storage.remove(prefKeyForHost(hostKey))
+        clearSchemaForHost(hostKey)
+    }
+
+    fun clearSchemaForHost(hostKey: String) {
+        val normalized = SitePointerStore.normalizeHostKey(hostKey) ?: return
+        storage.remove(prefKeyForHost(normalized))
+    }
+
+    fun listSavedSchemaHosts(): Map<String, Int> {
+        val result = LinkedHashMap<String, Int>()
+        storage.allKeys().forEach { key ->
+            if (key.startsWith(KEY_PREFIX)) {
+                val host = key.removePrefix(KEY_PREFIX).trim().lowercase(Locale.US)
+                if (host.isNotEmpty()) {
+                    val schema = loadSchemaForHost(host)
+                    if (schema.hasAnyBound) {
+                        result[host] = schema.boundCount
+                    }
+                }
+            }
+        }
+        return result
     }
 
     companion object {

@@ -139,5 +139,24 @@
     <string name="action_clear_schema">Clear All</string>
     <string name="cd_toggle_struct_prober">Expand or collapse entity struct field prober</string>
     <string name="cd_clear_bound_field">Clear this bound struct offset</string>
+
+    <!-- 4-Tab Overhaul, Draggable Split View & Saved Sites Startup Card -->
+    <string name="tab_coords">Coords</string>
+    <string name="tab_prober">Prober</string>
+    <string name="tab_logs_assets">Logs</string>
+    <string name="subtab_struct_prober">Struct Prober</string>
+    <string name="subtab_full_heap">Full-Heap Tracker</string>
+    <string name="split_snap_mini">Mini</string>
+    <string name="split_snap_half">Split</string>
+    <string name="split_snap_full">Full</string>
+    <string name="cd_drag_split_handle">Drag to resize website and diagnostic tools</string>
+    <string name="saved_sites_title">Saved Sites &amp; Pointers</string>
+    <string name="saved_sites_subtitle">Persisted locally on disk — tap Open to load &amp; auto-verify.</string>
+    <string name="action_open_and_verify">Open &amp; Verify</string>
+    <string name="cd_delete_saved_site">Delete saved pointers for this site</string>
+    <string name="action_probe_hp_names_shortcut">Probe HP/Names</string>
+    <string name="advanced_legacy_tools_title">Advanced Scope, Manual Path &amp; Export</string>
+    <string name="prober_no_anchor_banner">No active WASM player pointer yet. Lock coordinates or verify a saved pointer in the Coords tab first.</string>
+    <string name="action_go_to_coords">Go to Coords</string>
 </resources>
 

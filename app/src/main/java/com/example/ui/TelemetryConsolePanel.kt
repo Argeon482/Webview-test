@@ -37,6 +37,7 @@ import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Radar
@@ -45,6 +46,7 @@ import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.TrackChanges
+import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.ViewInAr
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -59,7 +61,10 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -76,8 +81,11 @@ import com.example.AsyncScanStatus
 import com.example.ConsoleTab
 import com.example.DiagnosticsUiState
 import com.example.LogCategory
+import com.example.LogsAssetsSubTab
 import com.example.PlayerCoordinates
+import com.example.ProberSubTab
 import com.example.R
+import com.example.SavedSiteProfile
 import com.example.Step2ScanMode
 import com.example.WasmStructFieldKind
 import com.example.WasmStructProbeCandidate
@@ -112,6 +120,10 @@ fun TelemetryConsolePanel(
     onExportLogDumpJson: () -> Unit,
     onShareLogDump: () -> Unit,
     onSelectConsoleTab: (ConsoleTab) -> Unit,
+    onSelectProberSubTab: (ProberSubTab) -> Unit,
+    onSelectLogsAssetsSubTab: (LogsAssetsSubTab) -> Unit,
+    onOpenSavedSiteProfile: (SavedSiteProfile) -> Unit,
+    onDeleteSavedSiteProfile: (String) -> Unit,
     onSelectFilter: (LogCategory) -> Unit,
     onTogglePinCandidate: (String) -> Unit,
     onTogglePinnedOnly: () -> Unit,
@@ -124,7 +136,7 @@ fun TelemetryConsolePanel(
     onExecuteManualJs: () -> Unit,
     onClearAssetCache: () -> Unit,
     onClearLogs: () -> Unit,
-    onToggleExpanded: () -> Unit,
+    onExpandFromMini: () -> Unit,
     onCopyPayload: (String) -> Unit,
     onWasmValueChanged: (String) -> Unit,
     onRunWasmScan: () -> Unit,
@@ -152,400 +164,430 @@ fun TelemetryConsolePanel(
     onPruneWasmPointers: () -> Unit,
     onTogglePinPointerChain: (String) -> Unit,
     onToggleWasmEntitiesLive: () -> Unit,
-    onToggleStructProberExpanded: () -> Unit = {},
-    onSelectStructProbeField: (WasmStructFieldKind) -> Unit = {},
-    onStructProbeInputChanged: (String) -> Unit = {},
-    onRunStructProbe: () -> Unit = {},
-    onRunStructRefine: () -> Unit = {},
-    onRunAutoProbeNames: () -> Unit = {},
-    onBindStructCandidate: (WasmStructProbeCandidate) -> Unit = {},
-    onClearBoundStructField: (WasmStructFieldKind) -> Unit = {},
-    onClearAllBoundStructFields: () -> Unit = {},
+    onSelectStructProbeField: (WasmStructFieldKind) -> Unit,
+    onStructProbeInputChanged: (String) -> Unit,
+    onRunStructProbe: () -> Unit,
+    onRunStructRefine: () -> Unit,
+    onRunAutoProbeNames: () -> Unit,
+    onBindStructCandidate: (WasmStructProbeCandidate) -> Unit,
+    onClearBoundStructField: (WasmStructFieldKind) -> Unit,
+    onClearAllBoundStructFields: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     if (state.isJsDrawerOpen) {
         BackHandler { onToggleJsDrawer() }
     }
 
+    val isMiniHud = state.consoleSplitFraction <= 0.19f
+
     Surface(
         modifier = modifier.fillMaxSize(),
         color = ObsidianSurface
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            ConsoleHeaderBar(
+            // Persistent Live Coords + Bound Player HP/MP/FP HUD strip (always visible, even in Mini HUD)
+            LiveHudTelemetryStrip(
                 state = state,
-                onSelectTab = onSelectConsoleTab,
-                onToggleJsDrawer = onToggleJsDrawer,
-                onClearLogs = onClearLogs,
-                onToggleExpanded = onToggleExpanded
+                isMiniHud = isMiniHud,
+                onTapExpand = onExpandFromMini,
+                onCopyPayload = onCopyPayload
             )
 
-            // Persistent compact Live Coords + Player HP/MP/FP HUD strip (visible across all tabs)
-            val hudCoords = state.livePlayerCoords
-            val hudVitals = state.playerVitals?.takeIf { it.hasAnyContent }
-            if (hudCoords != null || hudVitals != null) {
-                HorizontalDivider(color = SignalEmerald.copy(alpha = 0.45f), thickness = 1.dp)
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(SignalEmerald.copy(alpha = 0.08f))
-                        .clickable {
-                            val summary = buildString {
-                                hudVitals?.playerName?.let { append("$it | ") }
-                                hudCoords?.let {
-                                    append("X=${fmtCoord(it.x)}, Y=${fmtCoord(it.y)}, Z=${fmtCoord(it.z)}")
-                                }
-                                hudVitals?.let { v ->
-                                    v.hp?.let { append(" | HP=$it${v.effectiveMaxHp?.let { m -> "/$m" } ?: ""}") }
-                                    v.mp?.let { append(" MP=$it${v.effectiveMaxMp?.let { m -> "/$m" } ?: ""}") }
-                                    v.fp?.let { append(" FP=$it${v.effectiveMaxFp?.let { m -> "/$m" } ?: ""}") }
-                                }
-                            }
-                            onCopyPayload(summary)
-                        }
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                        .testTag("live_coords_hud_strip"),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+            if (!isMiniHud) {
+                // 4-Tab Equal-Width Primary Bar + Slim Utility Status Strip
+                FourTabHeaderBar(
+                    state = state,
+                    onSelectTab = onSelectConsoleTab,
+                    onToggleJsDrawer = onToggleJsDrawer,
+                    onClearLogs = onClearLogs
+                )
+
+                HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+
+                AnimatedVisibility(
+                    visible = state.isJsDrawerOpen,
+                    enter = expandVertically() + fadeIn(),
+                    exit = shrinkVertically() + fadeOut()
                 ) {
-                    if (hudCoords != null) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.MyLocation,
-                                contentDescription = null,
-                                tint = SignalEmerald,
-                                modifier = Modifier.size(13.dp)
-                            )
-                            Text(
-                                text = "X:${fmtCoord(hudCoords.x)}  Y:${fmtCoord(hudCoords.y)}  Z:${fmtCoord(hudCoords.z)}",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontFamily = JetBrainsMonoFontFamily,
-                                fontWeight = FontWeight.Bold,
-                                color = SignalEmerald,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                            Text(
-                                text = hudVitals?.playerName?.takeIf { it.isNotBlank() } ?: hudCoords.path,
-                                style = MaterialTheme.typography.labelSmall,
-                                fontFamily = JetBrainsMonoFontFamily,
-                                fontWeight = if (!hudVitals?.playerName.isNullOrBlank()) FontWeight.Bold else FontWeight.Normal,
-                                color = if (!hudVitals?.playerName.isNullOrBlank()) TelemetryViolet else MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 9.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f)
-                            )
-                        }
+                    ManualJsExecutionDrawer(
+                        script = state.manualJsInput,
+                        onScriptChanged = onManualJsChanged,
+                        onExecute = onExecuteManualJs,
+                        onClose = onToggleJsDrawer
+                    )
+                }
+
+                when (state.activeConsoleTab) {
+                    ConsoleTab.COORDS -> {
+                        CoordsSingleScrollTab(
+                            state = state,
+                            onOpenSavedSiteProfile = onOpenSavedSiteProfile,
+                            onDeleteSavedSiteProfile = onDeleteSavedSiteProfile,
+                            onRunStep1 = onRunStep1,
+                            onPauseStep1 = onPauseStep1,
+                            onResumeStep1 = onResumeStep1,
+                            onManualPathInputChanged = onManualPathInputChanged,
+                            onQueryManualPath = onQueryManualPath,
+                            onRunStep2A = onRunStep2A,
+                            onRunStep2B = onRunStep2B,
+                            onSelectStep2ScanMode = onSelectStep2ScanMode,
+                            onRunFloatBaseline = onRunFloatBaseline,
+                            onRunFloatDeltaScan = onRunFloatDeltaScan,
+                            onResetFloatDelta = onResetFloatDelta,
+                            onToggleFloatWatcherExpanded = onToggleFloatWatcherExpanded,
+                            onTogglePinFloatCandidate = onTogglePinFloatCandidate,
+                            onPinTopFloatTriplet = onPinTopFloatTriplet,
+                            onInspectFloatNeighbors = onInspectFloatNeighbors,
+                            onStopFloatWatch = onStopFloatWatch,
+                            onLockFloatCoords = onLockFloatCoords,
+                            onUnlockFloatCoords = onUnlockFloatCoords,
+                            onFindWasmPointers = onFindWasmPointers,
+                            onVerifyWasmPointers = onVerifyWasmPointers,
+                            onToggleWatchWasmPointers = onToggleWatchWasmPointers,
+                            onStreamPointerToHud = onStreamPointerToHud,
+                            onPruneWasmPointers = onPruneWasmPointers,
+                            onTogglePinPointerChain = onTogglePinPointerChain,
+                            onExportWasmMemoryMap = onExportWasmMemoryMap,
+                            onCopyPayload = onCopyPayload,
+                            onRunStep3 = onRunStep3,
+                            onExportReport = onExportReport,
+                            onShareReport = onShareReport,
+                            onOpenStaging = {
+                                onSelectLogsAssetsSubTab(LogsAssetsSubTab.STAGING)
+                                onSelectConsoleTab(ConsoleTab.LOGS_ASSETS)
+                            },
+                            onOpenEntities = { onSelectConsoleTab(ConsoleTab.ENTITIES) },
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                        )
                     }
 
-                    AnimatedVisibility(
-                        visible = hudVitals != null && (hudVitals.hp != null || hudVitals.mp != null || hudVitals.fp != null),
-                        enter = expandVertically() + fadeIn(),
-                        exit = shrinkVertically() + fadeOut()
-                    ) {
-                        hudVitals?.let { v ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("live_player_vitals_hud_row"),
-                                horizontalArrangement = Arrangement.spacedBy(5.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                v.hp?.let { hpVal ->
-                                    VitalGaugePill(
-                                        label = "HP",
-                                        current = hpVal,
-                                        max = v.effectiveMaxHp,
-                                        accent = AlertCoral,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
-                                v.mp?.let { mpVal ->
-                                    VitalGaugePill(
-                                        label = "MP",
-                                        current = mpVal,
-                                        max = v.effectiveMaxMp,
-                                        accent = ElectricCyan,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
-                                v.fp?.let { fpVal ->
-                                    VitalGaugePill(
-                                        label = "FP",
-                                        current = fpVal,
-                                        max = v.effectiveMaxFp,
-                                        accent = AssetAmber,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                }
-                            }
-                        }
+                    ConsoleTab.ENTITIES -> {
+                        EntityInspectionConsoleView(
+                            state = state,
+                            onRescanEntities = onRunStep3,
+                            onToggleLiveEntities = onToggleWasmEntitiesLive,
+                            onOpenProber = {
+                                onSelectProberSubTab(ProberSubTab.STRUCT_PROBER)
+                                onSelectConsoleTab(ConsoleTab.PROBER)
+                            },
+                            onPinPath = { path, detail -> onPinExternalPath(path, "Step 3", detail) },
+                            onCopyPayload = onCopyPayload,
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                        )
+                    }
+
+                    ConsoleTab.PROBER -> {
+                        ProberTabContainer(
+                            state = state,
+                            onSelectSubTab = onSelectProberSubTab,
+                            onSelectStructProbeField = onSelectStructProbeField,
+                            onStructProbeInputChanged = onStructProbeInputChanged,
+                            onRunStructProbe = onRunStructProbe,
+                            onRunStructRefine = onRunStructRefine,
+                            onRunAutoProbeNames = onRunAutoProbeNames,
+                            onBindStructCandidate = onBindStructCandidate,
+                            onClearBoundStructField = onClearBoundStructField,
+                            onClearAllBoundStructFields = onClearAllBoundStructFields,
+                            onGoToCoords = { onSelectConsoleTab(ConsoleTab.COORDS) },
+                            onWasmValueChanged = onWasmValueChanged,
+                            onRunWasmScan = onRunWasmScan,
+                            onRunWasmFilter = onRunWasmFilter,
+                            onInspectWasmCandidate = onInspectWasmCandidate,
+                            onStopWasmPoll = onStopWasmPoll,
+                            onResetWasmTracker = onResetWasmTracker,
+                            onExportWasmMemoryMap = onExportWasmMemoryMap,
+                            onShareWasmMemoryMap = onShareWasmMemoryMap,
+                            onCopyPayload = onCopyPayload,
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                        )
+                    }
+
+                    ConsoleTab.LOGS_ASSETS -> {
+                        LogsAssetsTabContainer(
+                            state = state,
+                            onSelectSubTab = onSelectLogsAssetsSubTab,
+                            onSelectFilter = onSelectFilter,
+                            onExportLogDumpTxt = onExportLogDumpTxt,
+                            onExportLogDumpJson = onExportLogDumpJson,
+                            onShareLogDump = onShareLogDump,
+                            onClearAssetCache = onClearAssetCache,
+                            onTogglePinCandidate = onTogglePinCandidate,
+                            onTogglePinnedOnly = onTogglePinnedOnly,
+                            onStagingSearchQueryChanged = onStagingSearchQueryChanged,
+                            onClearUnpinnedCandidates = onClearUnpinnedCandidates,
+                            onLockCandidateForLivePolling = onLockCandidateForLivePolling,
+                            onPauseBatchScan = onPauseStep1,
+                            onResumeBatchScan = onResumeStep1,
+                            onCopyPayload = onCopyPayload,
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxWidth()
+                        )
                     }
                 }
-            }
-
-            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
-
-            AnimatedVisibility(
-                visible = state.isJsDrawerOpen,
-                enter = expandVertically() + fadeIn(),
-                exit = shrinkVertically() + fadeOut()
-            ) {
-                ManualJsExecutionDrawer(
-                    script = state.manualJsInput,
-                    onScriptChanged = onManualJsChanged,
-                    onExecute = onExecuteManualJs,
-                    onClose = onToggleJsDrawer
-                )
-            }
-
-            when (state.activeConsoleTab) {
-                ConsoleTab.WIZARD -> {
-                    GuidedFourStepWizard(
-                        state = state,
-                        onRunStep1 = onRunStep1,
-                        onPauseStep1 = onPauseStep1,
-                        onResumeStep1 = onResumeStep1,
-                        onManualPathInputChanged = onManualPathInputChanged,
-                        onQueryManualPath = onQueryManualPath,
-                        onRunStep2A = onRunStep2A,
-                        onRunStep2B = onRunStep2B,
-                        onSelectStep2ScanMode = onSelectStep2ScanMode,
-                        onRunFloatBaseline = onRunFloatBaseline,
-                        onRunFloatDeltaScan = onRunFloatDeltaScan,
-                        onResetFloatDelta = onResetFloatDelta,
-                        onLockFloatCoords = { onLockFloatCoords(null) },
-                        onUnlockFloatCoords = onUnlockFloatCoords,
-                        onFindWasmPointers = onFindWasmPointers,
-                        onVerifyWasmPointers = onVerifyWasmPointers,
-                        onToggleWatchWasmPointers = onToggleWatchWasmPointers,
-                        onStreamPointerToHud = onStreamPointerToHud,
-                        onPruneWasmPointers = onPruneWasmPointers,
-                        onTogglePinPointerChain = onTogglePinPointerChain,
-                        onExportWasmMemoryMap = onExportWasmMemoryMap,
-                        onCopyPayload = onCopyPayload,
-                        onRunStep3 = onRunStep3,
-                        onExportReport = onExportReport,
-                        onShareReport = onShareReport,
-                        onOpenStaging = { onSelectConsoleTab(ConsoleTab.STAGING) },
-                        onOpenEntities = { onSelectConsoleTab(ConsoleTab.ENTITIES) },
-                        onOpenLogs = { onSelectConsoleTab(ConsoleTab.LOGS) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                    )
-                }
-
-                ConsoleTab.WASM_HEAP -> {
-                    WasmHeapTrackerView(
-                        state = state,
-                        onValueInputChanged = onWasmValueChanged,
-                        onRunInitialScan = onRunWasmScan,
-                        onRunFilterDelta = onRunWasmFilter,
-                        onInspectCandidate = onInspectWasmCandidate,
-                        onStopNeighborPoll = onStopWasmPoll,
-                        onResetTracker = onResetWasmTracker,
-                        onExportMemoryMap = onExportWasmMemoryMap,
-                        onShareMemoryMap = onShareWasmMemoryMap,
-                        onCopyText = onCopyPayload,
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                    )
-                }
-
-                ConsoleTab.STAGING -> {
-                    StagingBufferView(
-                        state = state,
-                        onTogglePin = onTogglePinCandidate,
-                        onTogglePinnedOnly = onTogglePinnedOnly,
-                        onSearchQueryChanged = onStagingSearchQueryChanged,
-                        onClearUnpinned = onClearUnpinnedCandidates,
-                        onTrackLive = onLockCandidateForLivePolling,
-                        onPauseBatchScan = onPauseStep1,
-                        onResumeBatchScan = onResumeStep1,
-                        onCopyPath = onCopyPayload,
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                    )
-                }
-
-                ConsoleTab.ENTITIES -> {
-                    EntityInspectionConsoleView(
-                        state = state,
-                        onRescanEntities = onRunStep3,
-                        onToggleLiveEntities = onToggleWasmEntitiesLive,
-                        onToggleStructProberExpanded = onToggleStructProberExpanded,
-                        onSelectStructProbeField = onSelectStructProbeField,
-                        onStructProbeInputChanged = onStructProbeInputChanged,
-                        onRunStructProbe = onRunStructProbe,
-                        onRunStructRefine = onRunStructRefine,
-                        onRunAutoProbeNames = onRunAutoProbeNames,
-                        onBindStructCandidate = onBindStructCandidate,
-                        onClearBoundStructField = onClearBoundStructField,
-                        onClearAllBoundStructFields = onClearAllBoundStructFields,
-                        onPinPath = { path, detail -> onPinExternalPath(path, "Step 3", detail) },
-                        onCopyPayload = onCopyPayload,
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                    )
-                }
-
-                ConsoleTab.ASSETS -> {
-                    AssetMetadataInspectorView(
-                        state = state,
-                        onClearAssetCache = onClearAssetCache,
-                        onExportAssetDumpJson = onExportLogDumpJson,
-                        onCopyMetadata = onCopyPayload,
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                    )
-                }
-
-                ConsoleTab.LOGS -> {
-                    LiveLogConsoleView(
-                        state = state,
-                        onSelectFilter = onSelectFilter,
-                        onExportLogDumpTxt = onExportLogDumpTxt,
-                        onExportLogDumpJson = onExportLogDumpJson,
-                        onShareLogDump = onShareLogDump,
-                        onCopyPayload = onCopyPayload,
-                        modifier = Modifier
-                            .weight(1f)
-                            .fillMaxWidth()
-                    )
-                }
-            }
-
-            // Docked bottom Live Float Watcher & Pinning panel (streams top HEAPF32 X/Y/Z candidates)
-            if (state.wasmFloatDelta.candidates.isNotEmpty()) {
-                LiveFloatWatcherBottomBar(
-                    floatState = state.wasmFloatDelta,
-                    onToggleExpanded = onToggleFloatWatcherExpanded,
-                    onTogglePinCandidate = onTogglePinFloatCandidate,
-                    onPinTopTriplet = onPinTopFloatTriplet,
-                    onLockCoords = onLockFloatCoords,
-                    onFindPointers = {
-                        onSelectConsoleTab(ConsoleTab.WIZARD)
-                        onFindWasmPointers()
-                    },
-                    onInspectNeighbors = onInspectFloatNeighbors,
-                    onStopWatch = onStopFloatWatch,
-                    onCopyText = onCopyPayload
-                )
             }
         }
     }
 }
 
 @Composable
-private fun ConsoleHeaderBar(
+private fun LiveHudTelemetryStrip(
+    state: DiagnosticsUiState,
+    isMiniHud: Boolean,
+    onTapExpand: () -> Unit,
+    onCopyPayload: (String) -> Unit
+) {
+    val hudCoords = state.livePlayerCoords
+    val hudVitals = state.playerVitals?.takeIf { it.hasAnyContent }
+
+    if (hudCoords == null && hudVitals == null && !isMiniHud) return
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                if (hudCoords != null || hudVitals != null) SignalEmerald.copy(alpha = 0.09f)
+                else ObsidianSurfaceElevated
+            )
+            .clickable {
+                if (isMiniHud) {
+                    onTapExpand()
+                } else {
+                    val summary = buildString {
+                        hudVitals?.playerName?.let { append("$it | ") }
+                        hudCoords?.let {
+                            append("X=${fmtCoord(it.x)}, Y=${fmtCoord(it.y)}, Z=${fmtCoord(it.z)}")
+                        }
+                        hudVitals?.let { v ->
+                            v.hp?.let { append(" | HP=$it${v.effectiveMaxHp?.let { m -> "/$m" } ?: ""}") }
+                            v.mp?.let { append(" MP=$it${v.effectiveMaxMp?.let { m -> "/$m" } ?: ""}") }
+                            v.fp?.let { append(" FP=$it${v.effectiveMaxFp?.let { m -> "/$m" } ?: ""}") }
+                        }
+                    }
+                    if (summary.isNotBlank()) onCopyPayload(summary)
+                }
+            }
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+            .testTag("live_coords_hud_strip"),
+        verticalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        if (hudCoords != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.MyLocation,
+                    contentDescription = null,
+                    tint = SignalEmerald,
+                    modifier = Modifier.size(14.dp)
+                )
+                Text(
+                    text = "X:${fmtCoord(hudCoords.x)}  Y:${fmtCoord(hudCoords.y)}  Z:${fmtCoord(hudCoords.z)}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontWeight = FontWeight.Bold,
+                    color = SignalEmerald,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = hudVitals?.playerName?.takeIf { it.isNotBlank() } ?: hudCoords.path,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontWeight = if (!hudVitals?.playerName.isNullOrBlank()) FontWeight.Bold else FontWeight.Normal,
+                    color = if (!hudVitals?.playerName.isNullOrBlank()) TelemetryViolet else MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        } else if (isMiniHud) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text(
+                    text = if (state.savedSiteProfiles.isNotEmpty()) {
+                        "Mini HUD • ${state.savedSiteProfiles.sumOf { it.pointerCount }} saved pointer(s) ready"
+                    } else {
+                        "Mini HUD • Tap Split or Full to open tools"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = ElectricCyan,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        AnimatedVisibility(
+            visible = hudVitals != null && (hudVitals.hp != null || hudVitals.mp != null || hudVitals.fp != null),
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut()
+        ) {
+            hudVitals?.let { v ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("live_player_vitals_hud_row"),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    v.hp?.let { hpVal ->
+                        VitalGaugePill(
+                            label = "HP",
+                            current = hpVal,
+                            max = v.effectiveMaxHp,
+                            accent = AlertCoral,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    v.mp?.let { mpVal ->
+                        VitalGaugePill(
+                            label = "MP",
+                            current = mpVal,
+                            max = v.effectiveMaxMp,
+                            accent = ElectricCyan,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    v.fp?.let { fpVal ->
+                        VitalGaugePill(
+                            label = "FP",
+                            current = fpVal,
+                            max = v.effectiveMaxFp,
+                            accent = AssetAmber,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+        }
+    }
+    HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+}
+
+@Composable
+private fun FourTabHeaderBar(
     state: DiagnosticsUiState,
     onSelectTab: (ConsoleTab) -> Unit,
     onToggleJsDrawer: () -> Unit,
-    onClearLogs: () -> Unit,
-    onToggleExpanded: () -> Unit
+    onClearLogs: () -> Unit
 ) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(ObsidianSurfaceElevated)
     ) {
+        // 4 Clean Equal-Width Tabs (minimum 48dp touch height, zero cramped scrolling)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 8.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            // Horizontally scrollable 4-tab console switcher
-            Row(
-                modifier = Modifier
-                    .weight(1f)
-                    .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                HeaderTabPill(
-                    label = stringResource(R.string.tab_wizard),
-                    selected = state.activeConsoleTab == ConsoleTab.WIZARD,
-                    accent = ElectricCyan,
-                    testTag = "tab_wizard_button",
-                    onClick = { onSelectTab(ConsoleTab.WIZARD) }
-                )
-                val wasmLabel = if (state.wasmHeap.totalMatches > 0) {
-                    "${stringResource(R.string.tab_wasm_heap)} (${state.wasmHeap.totalMatches})"
-                } else {
-                    stringResource(R.string.tab_wasm_heap)
-                }
-                HeaderTabPill(
-                    label = wasmLabel,
-                    selected = state.activeConsoleTab == ConsoleTab.WASM_HEAP,
-                    accent = SignalEmerald,
-                    testTag = "tab_wasm_heap_button",
-                    onClick = { onSelectTab(ConsoleTab.WASM_HEAP) }
-                )
-                HeaderTabPill(
-                    label = "${stringResource(R.string.tab_staging)} (${state.stagingBuffer.size})",
-                    selected = state.activeConsoleTab == ConsoleTab.STAGING,
-                    accent = AssetAmber,
-                    testTag = "tab_staging_button",
-                    onClick = { onSelectTab(ConsoleTab.STAGING) }
-                )
-                HeaderTabPill(
-                    label = "${stringResource(R.string.tab_entities)} (${state.discoveredEntities.size})",
-                    selected = state.activeConsoleTab == ConsoleTab.ENTITIES,
-                    accent = TelemetryViolet,
-                    testTag = "tab_entities_button",
-                    onClick = { onSelectTab(ConsoleTab.ENTITIES) }
-                )
-                HeaderTabPill(
-                    label = "${stringResource(R.string.tab_assets)} (${state.interceptedAssets.size})",
-                    selected = state.activeConsoleTab == ConsoleTab.ASSETS,
-                    accent = ElectricCyan,
-                    testTag = "tab_assets_button",
-                    onClick = { onSelectTab(ConsoleTab.ASSETS) }
-                )
-                HeaderTabPill(
-                    label = "${stringResource(R.string.tab_logs)} (${state.logs.size})",
-                    selected = state.activeConsoleTab == ConsoleTab.LOGS,
-                    accent = SignalEmerald,
-                    testTag = "tab_logs_button",
-                    onClick = { onSelectTab(ConsoleTab.LOGS) }
-                )
+            PrimaryConsoleTabButton(
+                label = stringResource(R.string.tab_coords),
+                badgeCount = state.wasmFloatDelta.pointerChains.size.takeIf { it > 0 },
+                icon = Icons.Default.MyLocation,
+                selected = state.activeConsoleTab == ConsoleTab.COORDS,
+                accent = SignalEmerald,
+                testTag = "tab_coords_button",
+                onClick = { onSelectTab(ConsoleTab.COORDS) },
+                modifier = Modifier.weight(1f)
+            )
+            PrimaryConsoleTabButton(
+                label = stringResource(R.string.tab_entities),
+                badgeCount = state.discoveredEntities.size.takeIf { it > 0 },
+                icon = Icons.Default.ViewInAr,
+                selected = state.activeConsoleTab == ConsoleTab.ENTITIES,
+                accent = TelemetryViolet,
+                testTag = "tab_entities_button",
+                onClick = { onSelectTab(ConsoleTab.ENTITIES) },
+                modifier = Modifier.weight(1f)
+            )
+            PrimaryConsoleTabButton(
+                label = stringResource(R.string.tab_prober),
+                badgeCount = state.structProber.schema.boundCount.takeIf { it > 0 },
+                icon = Icons.Default.Memory,
+                selected = state.activeConsoleTab == ConsoleTab.PROBER,
+                accent = ElectricCyan,
+                testTag = "tab_prober_button",
+                onClick = { onSelectTab(ConsoleTab.PROBER) },
+                modifier = Modifier.weight(1f)
+            )
+            PrimaryConsoleTabButton(
+                label = stringResource(R.string.tab_logs_assets),
+                badgeCount = state.logs.size.takeIf { it > 0 },
+                icon = Icons.Default.Terminal,
+                selected = state.activeConsoleTab == ConsoleTab.LOGS_ASSETS,
+                accent = AssetAmber,
+                testTag = "tab_logs_assets_button",
+                onClick = { onSelectTab(ConsoleTab.LOGS_ASSETS) },
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        // Slim Telemetry Status + Quick JS Drawer Utility Strip
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianBg.copy(alpha = 0.65f))
+                .padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            AsyncScanStatusPill(
+                status = state.scanStatus,
+                detail = state.scanStatusDetail,
+                modifier = Modifier.weight(1f)
+            )
+
+            if (state.wasmFloatDelta.isWatchingPointers) {
+                StatusMicroBadge(text = "PTR 200ms", accent = TelemetryViolet)
+            }
+            if (state.wasmFloatDelta.isLiveWatching) {
+                StatusMicroBadge(text = "FLOAT 200ms", accent = SignalEmerald)
+            }
+            if (state.wasmFloatDelta.savedPointerCountForHost > 0) {
+                StatusMicroBadge(text = "SAVED:${state.wasmFloatDelta.savedPointerCountForHost}", accent = AssetAmber)
             }
 
-            // JS Console Toggle
+            // Manual JS Drawer Toggle
             Surface(
                 shape = RoundedCornerShape(6.dp),
-                color = if (state.isJsDrawerOpen) MaterialTheme.colorScheme.primaryContainer else ObsidianSurfaceHighest,
+                color = if (state.isJsDrawerOpen) ElectricCyan.copy(alpha = 0.22f) else ObsidianSurfaceHighest,
                 border = BorderStroke(
                     1.dp,
                     if (state.isJsDrawerOpen) ElectricCyan else ObsidianBorder
                 ),
                 modifier = Modifier
-                    .heightIn(min = 34.dp)
+                    .heightIn(min = 32.dp)
                     .clip(RoundedCornerShape(6.dp))
                     .clickable(onClick = onToggleJsDrawer)
                     .testTag("toggle_js_drawer_button")
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 5.dp),
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Terminal,
+                        imageVector = Icons.Default.Code,
                         contentDescription = stringResource(R.string.cd_toggle_js_drawer),
                         tint = if (state.isJsDrawerOpen) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(14.dp)
+                        modifier = Modifier.size(13.dp)
                     )
                     Text(
                         text = "JS",
@@ -556,155 +598,19 @@ private fun ConsoleHeaderBar(
                 }
             }
 
-            if (state.activeConsoleTab == ConsoleTab.LOGS) {
+            if (state.activeConsoleTab == ConsoleTab.LOGS_ASSETS && state.activeLogsAssetsSubTab == LogsAssetsSubTab.LOGS) {
                 IconButton(
                     onClick = onClearLogs,
                     modifier = Modifier
-                        .size(34.dp)
+                        .size(32.dp)
                         .testTag("clear_logs_button")
                 ) {
                     Icon(
                         imageVector = Icons.Default.DeleteSweep,
                         contentDescription = stringResource(R.string.cd_clear_logs),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(17.dp)
+                        modifier = Modifier.size(16.dp)
                     )
-                }
-            }
-
-            IconButton(
-                onClick = onToggleExpanded,
-                modifier = Modifier
-                    .size(34.dp)
-                    .testTag("toggle_split_button")
-            ) {
-                Icon(
-                    imageVector = if (state.isConsoleExpanded) Icons.Default.ExpandMore else Icons.Default.ExpandLess,
-                    contentDescription = stringResource(R.string.cd_toggle_split),
-                    tint = ElectricCyan,
-                    modifier = Modifier.size(19.dp)
-                )
-            }
-        }
-
-        // Slim live telemetry status strip
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(ObsidianBg.copy(alpha = 0.65f))
-                .padding(horizontal = 8.dp, vertical = 3.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            AsyncScanStatusPill(
-                status = state.scanStatus,
-                detail = state.scanStatusDetail,
-                modifier = Modifier.weight(1f)
-            )
-            if (state.livePollActive) {
-                Surface(
-                    color = SignalEmerald.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(4.dp),
-                    border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.5f))
-                ) {
-                    Text(
-                        text = "LIVE 200ms",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = SignalEmerald,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                    )
-                }
-            }
-            if (state.wasmHeap.isNeighborPolling) {
-                Surface(
-                    color = ElectricCyan.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(4.dp),
-                    border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.55f))
-                ) {
-                    Text(
-                        text = "WASM ±16B",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = ElectricCyan,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                    )
-                }
-            }
-            if (state.wasmFloatDelta.lockedCoords != null) {
-                Surface(
-                    color = AssetAmber.copy(alpha = 0.2f),
-                    shape = RoundedCornerShape(4.dp),
-                    border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.7f))
-                ) {
-                    Text(
-                        text = "LOCKED",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = AssetAmber,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                    )
-                }
-            }
-            if (state.wasmFloatDelta.isWatchingPointers) {
-                Surface(
-                    color = TelemetryViolet.copy(alpha = 0.2f),
-                    shape = RoundedCornerShape(4.dp),
-                    border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.65f))
-                ) {
-                    Text(
-                        text = "PTR 200ms",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = TelemetryViolet,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                    )
-                }
-            }
-            if (state.wasmFloatDelta.isLiveWatching) {
-                Surface(
-                    color = SignalEmerald.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(4.dp),
-                    border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.55f))
-                ) {
-                    Text(
-                        text = "FLOAT 200ms",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = SignalEmerald,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                    )
-                }
-            }
-            if (state.pinnedCandidateCount > 0) {
-                Surface(
-                    color = AssetAmber.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(4.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(3.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Bookmark,
-                            contentDescription = null,
-                            tint = AssetAmber,
-                            modifier = Modifier.size(10.dp)
-                        )
-                        Text(
-                            text = "${state.pinnedCandidateCount}",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = AssetAmber,
-                            fontSize = 9.sp
-                        )
-                    }
                 }
             }
         }
@@ -712,36 +618,97 @@ private fun ConsoleHeaderBar(
 }
 
 @Composable
-private fun HeaderTabPill(
-    label: String,
-    selected: Boolean,
-    accent: Color,
-    testTag: String,
-    onClick: () -> Unit
-) {
+private fun StatusMicroBadge(text: String, accent: Color) {
     Surface(
-        onClick = onClick,
-        shape = RoundedCornerShape(6.dp),
-        color = if (selected) accent.copy(alpha = 0.2f) else ObsidianBg,
-        border = BorderStroke(
-            1.dp,
-            if (selected) accent.copy(alpha = 0.7f) else ObsidianBorder
-        ),
-        modifier = Modifier.testTag(testTag)
+        color = accent.copy(alpha = 0.16f),
+        shape = RoundedCornerShape(4.dp),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.55f))
     ) {
         Text(
-            text = label,
+            text = text,
             style = MaterialTheme.typography.labelSmall,
-            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-            color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+            fontFamily = JetBrainsMonoFontFamily,
+            fontWeight = FontWeight.Bold,
+            color = accent,
+            fontSize = 9.sp,
+            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
         )
     }
 }
 
 @Composable
-private fun GuidedFourStepWizard(
+private fun PrimaryConsoleTabButton(
+    label: String,
+    badgeCount: Int?,
+    icon: ImageVector,
+    selected: Boolean,
+    accent: Color,
+    testTag: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(9.dp),
+        color = if (selected) accent.copy(alpha = 0.22f) else ObsidianBg,
+        border = BorderStroke(
+            width = if (selected) 1.5.dp else 1.dp,
+            color = if (selected) accent else ObsidianBorder
+        ),
+        modifier = modifier
+            .heightIn(min = 48.dp)
+            .testTag(testTag)
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 5.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(3.dp)
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(15.dp)
+                )
+                if (badgeCount != null) {
+                    Text(
+                        text = if (badgeCount > 99) "99+" else "$badgeCount",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 10.sp
+                    )
+                }
+            }
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/**
+ * TAB 1 — Coords (Single-Scroll):
+ * 1. Startup Saved Sites & Pointers launcher (always visible when saved sites exist)
+ * 2. Player Movement Coords Scanner + Locked Coords + Persistent Pointer Chains
+ * 3. Inline Live Float Candidates (no bottom overlay stealing height!)
+ * 4. Collapsible Advanced Scope / Manual Path / Full Report Export
+ */
+@Composable
+private fun CoordsSingleScrollTab(
     state: DiagnosticsUiState,
+    onOpenSavedSiteProfile: (SavedSiteProfile) -> Unit,
+    onDeleteSavedSiteProfile: (String) -> Unit,
     onRunStep1: () -> Unit,
     onPauseStep1: () -> Unit,
     onResumeStep1: () -> Unit,
@@ -753,7 +720,12 @@ private fun GuidedFourStepWizard(
     onRunFloatBaseline: () -> Unit,
     onRunFloatDeltaScan: () -> Unit,
     onResetFloatDelta: () -> Unit,
-    onLockFloatCoords: () -> Unit,
+    onToggleFloatWatcherExpanded: () -> Unit,
+    onTogglePinFloatCandidate: (Int) -> Unit,
+    onPinTopFloatTriplet: () -> Unit,
+    onInspectFloatNeighbors: (Int) -> Unit,
+    onStopFloatWatch: () -> Unit,
+    onLockFloatCoords: (Int?) -> Unit,
     onUnlockFloatCoords: () -> Unit,
     onFindWasmPointers: () -> Unit,
     onVerifyWasmPointers: () -> Unit,
@@ -768,296 +740,469 @@ private fun GuidedFourStepWizard(
     onShareReport: () -> Unit,
     onOpenStaging: () -> Unit,
     onOpenEntities: () -> Unit,
-    onOpenLogs: () -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Column(modifier = modifier.background(ObsidianBg)) {
-        Column(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+    var advancedExpanded by remember { mutableStateOf(false) }
+
+    Column(
+        modifier = modifier
+            .background(ObsidianBg)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        // 1. Saved Sites & Bookmarked Pointers (immediately visible on cold startup!)
+        if (state.savedSiteProfiles.isNotEmpty()) {
+            SavedSitesStartupCard(
+                profiles = state.savedSiteProfiles,
+                activeUrl = state.activeUrl,
+                onOpenProfile = onOpenSavedSiteProfile,
+                onDeleteProfile = onDeleteSavedSiteProfile
+            )
+        }
+
+        // 2. Player Coords & Persistent Pointers Card
+        WizardStepCard(
+            title = stringResource(R.string.wizard_step_2_title),
+            badge = state.step2Badge,
+            accent = SignalEmerald
         ) {
-            // STEP 1 — Find Game Engine (Non-Blocking Yielding Batches + Auto-Roots + Manual Path Inspector)
-            WizardStepCard(
-                title = stringResource(R.string.wizard_step_1_title),
-                badge = state.step1Badge,
-                accent = ElectricCyan
-            ) {
+            Step2ModeSelectorRow(
+                selectedMode = state.step2ScanMode,
+                onSelectMode = onSelectStep2ScanMode
+            )
+
+            if (state.step2ScanMode == Step2ScanMode.WASM_FLOAT_HEAP) {
+                Step2FloatModeControls(
+                    floatState = state.wasmFloatDelta,
+                    onCaptureFloatBaseline = onRunFloatBaseline,
+                    onScanFloatDeltas = onRunFloatDeltaScan,
+                    onResetFloatDelta = onResetFloatDelta,
+                    onLockCoords = { onLockFloatCoords(null) },
+                    onUnlockCoords = onUnlockFloatCoords,
+                    onFindPointers = onFindWasmPointers,
+                    onVerifyPointers = onVerifyWasmPointers,
+                    onToggleWatchPointers = onToggleWatchWasmPointers,
+                    onStreamPointerToHud = onStreamPointerToHud,
+                    onPrunePointers = onPruneWasmPointers,
+                    onTogglePinPointerChain = onTogglePinPointerChain,
+                    onExportMemoryMap = onExportWasmMemoryMap,
+                    onCopyText = onCopyPayload
+                )
+            } else {
                 StepActionButton(
-                    label = stringResource(R.string.step_1_inspect_scope),
-                    icon = Icons.Default.Radar,
-                    accent = ElectricCyan,
+                    label = stringResource(R.string.step_2a_capture_baseline),
+                    icon = Icons.Default.TrackChanges,
+                    accent = SignalEmerald,
                     enabled = true,
-                    isBusy = state.scopeBatchProgress.isActive && !state.scopeBatchProgress.isPaused,
-                    testTag = "step_1_inspect_scope_button",
-                    onClick = onRunStep1
+                    filled = state.baselineCaptured,
+                    testTag = "step_2a_baseline_button",
+                    onClick = onRunStep2A
                 )
-                if (state.scopeBatchProgress.isActive || state.scopeBatchProgress.isPaused) {
-                    BatchScanProgressBanner(
-                        progress = state.scopeBatchProgress,
-                        onPause = onPauseStep1,
-                        onResume = onResumeStep1,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-                if (state.detectedGameNamespaces.isNotEmpty()) {
-                    CapturedSnippetBox(
-                        accent = SignalEmerald,
-                        text = "Auto-detected roots: ${state.detectedGameNamespaces.joinToString(", ")}",
-                        actionLabel = "View in Staging (${state.stagingBuffer.size}) ›",
-                        onActionClick = onOpenStaging
-                    )
-                }
                 Text(
-                    text = stringResource(R.string.wizard_step_1_instruction),
+                    text = stringResource(R.string.wizard_step_2a_instruction),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                // Step 1 Manual Property Inspector Drawer (for closure-scoped / custom paths)
-                Step1ManualPropertyInspectorBox(
-                    pathInput = state.manualPropertyPathInput,
-                    lastResultSummary = state.lastManualQuerySummary,
-                    onPathInputChanged = onManualPathInputChanged,
-                    onQueryPath = onQueryManualPath,
-                    onOpenStaging = onOpenStaging
-                )
+                Spacer(Modifier.height(2.dp))
 
-                if (state.step1Completed) {
-                    val timing = state.step1DurationMs?.let { String.format(Locale.US, "%.0fms", it) } ?: ""
-                    val preview = state.customGlobals.take(6).joinToString(", ")
-                    CapturedSnippetBox(
-                        accent = ElectricCyan,
-                        text = "Found ${state.customGlobals.size} custom globals" +
-                            (if (timing.isNotEmpty()) " ($timing)" else "") +
-                            " • ${state.stagingBuffer.size} staged" +
-                            if (preview.isNotEmpty()) "\nGlobals: $preview" else "",
-                        actionLabel = "Search & Pin in Staging (${state.stagingBuffer.size}) ›",
-                        onActionClick = onOpenStaging
-                    )
-                }
-            }
-
-            // STEP 2 — Lock On to Live Player Coordinates (WASM Float Heap Mode & JS Objects Mode)
-            WizardStepCard(
-                title = stringResource(R.string.wizard_step_2_title),
-                badge = state.step2Badge,
-                accent = SignalEmerald
-            ) {
-                Step2ModeSelectorRow(
-                    selectedMode = state.step2ScanMode,
-                    onSelectMode = onSelectStep2ScanMode
-                )
-
-                if (state.step2ScanMode == Step2ScanMode.WASM_FLOAT_HEAP) {
-                    Step2FloatModeControls(
-                        floatState = state.wasmFloatDelta,
-                        onCaptureFloatBaseline = onRunFloatBaseline,
-                        onScanFloatDeltas = onRunFloatDeltaScan,
-                        onResetFloatDelta = onResetFloatDelta,
-                        onLockCoords = onLockFloatCoords,
-                        onUnlockCoords = onUnlockFloatCoords,
-                        onFindPointers = onFindWasmPointers,
-                        onVerifyPointers = onVerifyWasmPointers,
-                        onToggleWatchPointers = onToggleWatchWasmPointers,
-                        onStreamPointerToHud = onStreamPointerToHud,
-                        onPrunePointers = onPruneWasmPointers,
-                        onTogglePinPointerChain = onTogglePinPointerChain,
-                        onExportMemoryMap = onExportWasmMemoryMap,
-                        onCopyText = onCopyPayload
-                    )
-                } else {
-                    StepActionButton(
-                        label = stringResource(R.string.step_2a_capture_baseline),
-                        icon = Icons.Default.TrackChanges,
-                        accent = SignalEmerald,
-                        enabled = true,
-                        filled = state.baselineCaptured,
-                        testTag = "step_2a_baseline_button",
-                        onClick = onRunStep2A
-                    )
-                    Text(
-                        text = stringResource(R.string.wizard_step_2a_instruction),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    Spacer(Modifier.height(2.dp))
-
-                    StepActionButton(
-                        label = stringResource(R.string.step_2b_compute_delta),
-                        icon = Icons.Default.Timeline,
-                        accent = SignalEmerald,
-                        enabled = true,
-                        filled = state.livePlayerCoords != null,
-                        testTag = "step_2b_delta_button",
-                        onClick = onRunStep2B
-                    )
-                    Text(
-                        text = stringResource(R.string.wizard_step_2b_instruction),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    state.livePlayerCoords?.let { coords ->
-                        LivePlayerCoordsReadout(
-                            coords = coords,
-                            propertyKeys = state.playerPropertyKeys,
-                            tickCount = state.livePollTickCount,
-                            isLive = state.livePollActive
-                        )
-                    }
-                }
-            }
-
-            // STEP 3 — Visual Entity Inspection (WASM Nearby Entities + JS Fallback)
-            WizardStepCard(
-                title = stringResource(R.string.wizard_step_3_title),
-                badge = state.step3Badge,
-                accent = TelemetryViolet
-            ) {
-                val canRunStep3 = !state.discoveredPlayerPath.isNullOrBlank() || state.hasLiveWasmPlayerAnchor
                 StepActionButton(
-                    label = stringResource(R.string.step_3_scan_entities),
-                    icon = Icons.Default.ViewInAr,
-                    accent = TelemetryViolet,
-                    enabled = canRunStep3,
-                    filled = state.discoveredEntities.isNotEmpty(),
-                    testTag = "step_3_entities_button",
-                    onClick = onRunStep3
+                    label = stringResource(R.string.step_2b_compute_delta),
+                    icon = Icons.Default.Timeline,
+                    accent = SignalEmerald,
+                    enabled = true,
+                    filled = state.livePlayerCoords != null,
+                    testTag = "step_2b_delta_button",
+                    onClick = onRunStep2B
                 )
                 Text(
-                    text = stringResource(
-                        if (state.step2ScanMode == Step2ScanMode.WASM_FLOAT_HEAP || state.hasLiveWasmPlayerAnchor) {
-                            R.string.wasm_step3_instruction
-                        } else {
-                            R.string.wizard_step_3_instruction
-                        }
-                    ),
+                    text = stringResource(R.string.wizard_step_2b_instruction),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                if (!state.discoveredEntityArrayPath.isNullOrBlank() && state.discoveredEntities.isNotEmpty()) {
-                    val sampleLine = state.discoveredEntities.take(2).joinToString("\n") { e ->
-                        "• ${e.name} world(${fmtCoord(e.worldX)}, ${fmtCoord(e.worldY)}, ${fmtCoord(e.worldZ)}) • ${fmtCoord(e.distanceToPlayer)}u"
-                    }
-                    CapturedSnippetBox(
-                        accent = TelemetryViolet,
-                        text = "Source: ${state.discoveredEntityArrayPath} (${state.discoveredEntities.size} detected)\n$sampleLine",
-                        actionLabel = "Open Entity Console (${state.discoveredEntities.size}) ›",
-                        onActionClick = onOpenEntities
-                    )
-                }
-            }
-
-            // STEP 4 — Export Handoff File
-            WizardStepCard(
-                title = stringResource(R.string.wizard_step_4_title),
-                badge = state.step4Badge,
-                accent = AssetAmber
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    StepActionButton(
-                        label = stringResource(R.string.step_4_export_report),
-                        icon = Icons.Default.Download,
-                        accent = AssetAmber,
-                        enabled = !state.isExporting,
-                        isBusy = state.isExporting,
-                        filled = state.step4Badge == WizardStepBadge.READY || state.step4Badge == WizardStepBadge.CAPTURED,
-                        testTag = "step_5_export_report_button",
-                        onClick = onExportReport,
-                        modifier = Modifier.weight(1f)
-                    )
-
-                    if (state.lastExport?.success == true && state.lastExport.contentUri != null) {
-                        OutlinedButton(
-                            onClick = onShareReport,
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(1.dp, SignalEmerald),
-                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
-                            modifier = Modifier
-                                .heightIn(min = 48.dp)
-                                .testTag("share_report_button")
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Share,
-                                contentDescription = stringResource(R.string.cd_share_report),
-                                tint = SignalEmerald,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(Modifier.width(4.dp))
-                            Text(
-                                text = stringResource(R.string.action_share_report),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = SignalEmerald
-                            )
-                        }
-                    }
-                }
-
-                Text(
-                    text = stringResource(R.string.wizard_step_4_instruction),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                if (state.lastExport?.success == true) {
-                    CapturedSnippetBox(
-                        accent = SignalEmerald,
-                        text = "Saved to ${state.lastExport.displayPath} • ${state.pinnedCandidateCount} pinned • ${state.discoveredEntities.size} entities"
+                state.livePlayerCoords?.let { coords ->
+                    LivePlayerCoordsReadout(
+                        coords = coords,
+                        propertyKeys = state.playerPropertyKeys,
+                        tickCount = state.livePollTickCount,
+                        isLive = state.livePollActive
                     )
                 }
             }
         }
 
-        // Latest Log Ticker Bar
-        val latest = state.logs.lastOrNull()
-        if (latest != null) {
-            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(ObsidianSurface)
-                    .clickable(onClick = onOpenLogs)
-                    .padding(horizontal = 10.dp, vertical = 6.dp)
-                    .testTag("latest_log_ticker"),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                val accent = categoryAccentColor(latest.category)
-                Surface(
-                    color = accent.copy(alpha = 0.2f),
-                    shape = RoundedCornerShape(4.dp)
+        // 3. Inline Live Float Candidates (flows naturally inside single-scroll Coords tab)
+        if (state.wasmFloatDelta.candidates.isNotEmpty()) {
+            InlineLiveFloatCandidatesCard(
+                floatState = state.wasmFloatDelta,
+                onToggleExpanded = onToggleFloatWatcherExpanded,
+                onTogglePinCandidate = onTogglePinFloatCandidate,
+                onPinTopTriplet = onPinTopFloatTriplet,
+                onLockCoords = onLockFloatCoords,
+                onFindPointers = onFindWasmPointers,
+                onInspectNeighbors = onInspectFloatNeighbors,
+                onStopWatch = onStopFloatWatch,
+                onCopyText = onCopyPayload
+            )
+        }
+
+        // 4. Collapsible Advanced Scope, Manual Path Inspector, Step 3 Shortcut & Report Export
+        Surface(
+            shape = RoundedCornerShape(10.dp),
+            color = ObsidianSurface,
+            border = BorderStroke(1.dp, ObsidianBorder),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .clickable { advancedExpanded = !advancedExpanded }
+                        .padding(horizontal = 12.dp, vertical = 10.dp)
+                        .testTag("toggle_advanced_tools_button"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    Icon(
+                        imageVector = Icons.Default.Tune,
+                        contentDescription = null,
+                        tint = ElectricCyan,
+                        modifier = Modifier.size(18.dp)
+                    )
                     Text(
-                        text = latest.category.tag,
-                        style = MaterialTheme.typography.labelSmall,
+                        text = stringResource(R.string.advanced_legacy_tools_title),
+                        style = MaterialTheme.typography.titleSmall,
                         fontWeight = FontWeight.Bold,
-                        color = accent,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                        color = MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Icon(
+                        imageVector = if (advancedExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp)
                     )
                 }
-                Text(
-                    text = latest.summary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
+
+                AnimatedVisibility(
+                    visible = advancedExpanded,
+                    enter = expandVertically() + fadeIn(),
+                    exit = shrinkVertically() + fadeOut()
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+
+                        // Step 1 — JS Scope & Manual Property Inspector
+                        StepActionButton(
+                            label = stringResource(R.string.step_1_inspect_scope),
+                            icon = Icons.Default.Radar,
+                            accent = ElectricCyan,
+                            enabled = true,
+                            isBusy = state.scopeBatchProgress.isActive && !state.scopeBatchProgress.isPaused,
+                            testTag = "step_1_inspect_scope_button",
+                            onClick = onRunStep1
+                        )
+                        if (state.scopeBatchProgress.isActive || state.scopeBatchProgress.isPaused) {
+                            BatchScanProgressBanner(
+                                progress = state.scopeBatchProgress,
+                                onPause = onPauseStep1,
+                                onResume = onResumeStep1,
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+                        if (state.detectedGameNamespaces.isNotEmpty()) {
+                            CapturedSnippetBox(
+                                accent = SignalEmerald,
+                                text = "Auto-detected roots: ${state.detectedGameNamespaces.joinToString(", ")}",
+                                actionLabel = "View in Staging (${state.stagingBuffer.size}) ›",
+                                onActionClick = onOpenStaging
+                            )
+                        }
+                        Step1ManualPropertyInspectorBox(
+                            pathInput = state.manualPropertyPathInput,
+                            lastResultSummary = state.lastManualQuerySummary,
+                            onPathInputChanged = onManualPathInputChanged,
+                            onQueryPath = onQueryManualPath,
+                            onOpenStaging = onOpenStaging
+                        )
+
+                        // Step 3 — Quick Entity Scan button
+                        val canRunStep3 = !state.discoveredPlayerPath.isNullOrBlank() || state.hasLiveWasmPlayerAnchor
+                        StepActionButton(
+                            label = stringResource(R.string.step_3_scan_entities),
+                            icon = Icons.Default.ViewInAr,
+                            accent = TelemetryViolet,
+                            enabled = canRunStep3,
+                            filled = state.discoveredEntities.isNotEmpty(),
+                            testTag = "step_3_entities_button",
+                            onClick = {
+                                onRunStep3()
+                                onOpenEntities()
+                            }
+                        )
+
+                        // Step 4 — Export Handoff Report (.json)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            StepActionButton(
+                                label = stringResource(R.string.step_4_export_report),
+                                icon = Icons.Default.Download,
+                                accent = AssetAmber,
+                                enabled = !state.isExporting,
+                                isBusy = state.isExporting,
+                                filled = state.step4Badge == WizardStepBadge.READY || state.step4Badge == WizardStepBadge.CAPTURED,
+                                testTag = "step_5_export_report_button",
+                                onClick = onExportReport,
+                                modifier = Modifier.weight(1f)
+                            )
+                            if (state.lastExport?.success == true && state.lastExport.contentUri != null) {
+                                OutlinedButton(
+                                    onClick = onShareReport,
+                                    shape = RoundedCornerShape(8.dp),
+                                    border = BorderStroke(1.dp, SignalEmerald),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                                    modifier = Modifier
+                                        .heightIn(min = 48.dp)
+                                        .testTag("share_report_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Share,
+                                        contentDescription = stringResource(R.string.cd_share_report),
+                                        tint = SignalEmerald,
+                                        modifier = Modifier.size(16.dp)
+                                    )
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(
+                                        text = stringResource(R.string.action_share_report),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        color = SignalEmerald
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(12.dp))
+    }
+}
+
+/**
+ * TAB 3 — Prober (Dedicated Full-Height Workspace):
+ * 2-mode segmented toggle between Entity Struct Prober (HP/MP/FP/Names) and Full-Heap Value Tracker.
+ */
+@Composable
+private fun ProberTabContainer(
+    state: DiagnosticsUiState,
+    onSelectSubTab: (ProberSubTab) -> Unit,
+    onSelectStructProbeField: (WasmStructFieldKind) -> Unit,
+    onStructProbeInputChanged: (String) -> Unit,
+    onRunStructProbe: () -> Unit,
+    onRunStructRefine: () -> Unit,
+    onRunAutoProbeNames: () -> Unit,
+    onBindStructCandidate: (WasmStructProbeCandidate) -> Unit,
+    onClearBoundStructField: (WasmStructFieldKind) -> Unit,
+    onClearAllBoundStructFields: () -> Unit,
+    onGoToCoords: () -> Unit,
+    onWasmValueChanged: (String) -> Unit,
+    onRunWasmScan: () -> Unit,
+    onRunWasmFilter: () -> Unit,
+    onInspectWasmCandidate: (heapType: String, index: Int) -> Unit,
+    onStopWasmPoll: () -> Unit,
+    onResetWasmTracker: () -> Unit,
+    onExportWasmMemoryMap: () -> Unit,
+    onShareWasmMemoryMap: () -> Unit,
+    onCopyPayload: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier.background(ObsidianBg)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianSurface)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ConsoleSubTabSegmentPill(
+                label = stringResource(R.string.subtab_struct_prober),
+                selected = state.activeProberSubTab == ProberSubTab.STRUCT_PROBER,
+                accent = TelemetryViolet,
+                testTag = "prober_subtab_struct",
+                onClick = { onSelectSubTab(ProberSubTab.STRUCT_PROBER) },
+                modifier = Modifier.weight(1f)
+            )
+            val heapLabel = if (state.wasmHeap.totalMatches > 0) {
+                "${stringResource(R.string.subtab_full_heap)} (${state.wasmHeap.totalMatches})"
+            } else {
+                stringResource(R.string.subtab_full_heap)
+            }
+            ConsoleSubTabSegmentPill(
+                label = heapLabel,
+                selected = state.activeProberSubTab == ProberSubTab.FULL_HEAP,
+                accent = SignalEmerald,
+                testTag = "prober_subtab_full_heap",
+                onClick = { onSelectSubTab(ProberSubTab.FULL_HEAP) },
+                modifier = Modifier.weight(1f)
+            )
+        }
+        HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+
+        when (state.activeProberSubTab) {
+            ProberSubTab.STRUCT_PROBER -> {
+                StructProberWorkspace(
+                    prober = state.structProber,
+                    hasPlayerAnchor = state.hasLiveWasmPlayerAnchor,
+                    trackedMobCount = state.discoveredEntities.size,
+                    onSelectField = onSelectStructProbeField,
+                    onInputChanged = onStructProbeInputChanged,
+                    onRunProbe = onRunStructProbe,
+                    onRunRefine = onRunStructRefine,
+                    onRunAutoProbeNames = onRunAutoProbeNames,
+                    onBindCandidate = onBindStructCandidate,
+                    onClearField = onClearBoundStructField,
+                    onClearAllFields = onClearAllBoundStructFields,
+                    onGoToCoords = onGoToCoords,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
                 )
-                Text(
-                    text = "Logs ›",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = ElectricCyan
+            }
+
+            ProberSubTab.FULL_HEAP -> {
+                WasmHeapTrackerView(
+                    state = state,
+                    onValueInputChanged = onWasmValueChanged,
+                    onRunInitialScan = onRunWasmScan,
+                    onRunFilterDelta = onRunWasmFilter,
+                    onInspectCandidate = onInspectWasmCandidate,
+                    onStopNeighborPoll = onStopWasmPoll,
+                    onResetTracker = onResetWasmTracker,
+                    onExportMemoryMap = onExportWasmMemoryMap,
+                    onShareMemoryMap = onShareWasmMemoryMap,
+                    onCopyText = onCopyPayload,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                )
+            }
+        }
+    }
+}
+
+/**
+ * TAB 4 — Logs / Assets / Staging:
+ * 3-segment switcher consolidating Logs, Binary Assets cache, and Candidate Staging Buffer.
+ */
+@Composable
+private fun LogsAssetsTabContainer(
+    state: DiagnosticsUiState,
+    onSelectSubTab: (LogsAssetsSubTab) -> Unit,
+    onSelectFilter: (LogCategory) -> Unit,
+    onExportLogDumpTxt: () -> Unit,
+    onExportLogDumpJson: () -> Unit,
+    onShareLogDump: () -> Unit,
+    onClearAssetCache: () -> Unit,
+    onTogglePinCandidate: (String) -> Unit,
+    onTogglePinnedOnly: () -> Unit,
+    onStagingSearchQueryChanged: (String) -> Unit,
+    onClearUnpinnedCandidates: () -> Unit,
+    onLockCandidateForLivePolling: (String) -> Unit,
+    onPauseBatchScan: () -> Unit,
+    onResumeBatchScan: () -> Unit,
+    onCopyPayload: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier = modifier.background(ObsidianBg)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianSurface)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ConsoleSubTabSegmentPill(
+                label = "${stringResource(R.string.tab_logs)} (${state.logs.size})",
+                selected = state.activeLogsAssetsSubTab == LogsAssetsSubTab.LOGS,
+                accent = SignalEmerald,
+                testTag = "subtab_logs_button",
+                onClick = { onSelectSubTab(LogsAssetsSubTab.LOGS) },
+                modifier = Modifier.weight(1f)
+            )
+            ConsoleSubTabSegmentPill(
+                label = "${stringResource(R.string.tab_assets)} (${state.interceptedAssets.size})",
+                selected = state.activeLogsAssetsSubTab == LogsAssetsSubTab.ASSETS,
+                accent = ElectricCyan,
+                testTag = "subtab_assets_button",
+                onClick = { onSelectSubTab(LogsAssetsSubTab.ASSETS) },
+                modifier = Modifier.weight(1f)
+            )
+            ConsoleSubTabSegmentPill(
+                label = "${stringResource(R.string.tab_staging)} (${state.stagingBuffer.size})",
+                selected = state.activeLogsAssetsSubTab == LogsAssetsSubTab.STAGING,
+                accent = AssetAmber,
+                testTag = "subtab_staging_button",
+                onClick = { onSelectSubTab(LogsAssetsSubTab.STAGING) },
+                modifier = Modifier.weight(1f)
+            )
+        }
+        HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+
+        when (state.activeLogsAssetsSubTab) {
+            LogsAssetsSubTab.LOGS -> {
+                LiveLogConsoleView(
+                    state = state,
+                    onSelectFilter = onSelectFilter,
+                    onExportLogDumpTxt = onExportLogDumpTxt,
+                    onExportLogDumpJson = onExportLogDumpJson,
+                    onShareLogDump = onShareLogDump,
+                    onCopyPayload = onCopyPayload,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                )
+            }
+
+            LogsAssetsSubTab.ASSETS -> {
+                AssetMetadataInspectorView(
+                    state = state,
+                    onClearAssetCache = onClearAssetCache,
+                    onExportAssetDumpJson = onExportLogDumpJson,
+                    onCopyMetadata = onCopyPayload,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                )
+            }
+
+            LogsAssetsSubTab.STAGING -> {
+                StagingBufferView(
+                    state = state,
+                    onTogglePin = onTogglePinCandidate,
+                    onTogglePinnedOnly = onTogglePinnedOnly,
+                    onSearchQueryChanged = onStagingSearchQueryChanged,
+                    onClearUnpinned = onClearUnpinnedCandidates,
+                    onTrackLive = onLockCandidateForLivePolling,
+                    onPauseBatchScan = onPauseBatchScan,
+                    onResumeBatchScan = onResumeBatchScan,
+                    onCopyPath = onCopyPayload,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
                 )
             }
         }
@@ -1084,8 +1229,8 @@ private fun WizardStepCard(
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(
-            modifier = Modifier.padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1339,8 +1484,8 @@ private fun Step1ManualPropertyInspectorBox(
             .testTag("step_1_manual_property_inspector")
     ) {
         Column(
-            modifier = Modifier.padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -1350,7 +1495,7 @@ private fun Step1ManualPropertyInspectorBox(
                     imageVector = Icons.Default.Search,
                     contentDescription = null,
                     tint = ElectricCyan,
-                    modifier = Modifier.size(15.dp)
+                    modifier = Modifier.size(16.dp)
                 )
                 Text(
                     text = stringResource(R.string.step_1_manual_query_title),
@@ -1363,7 +1508,7 @@ private fun Step1ManualPropertyInspectorBox(
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedTextField(
                     value = pathInput,
@@ -1423,12 +1568,12 @@ private fun Step1ManualPropertyInspectorBox(
                 modifier = Modifier
                     .fillMaxWidth()
                     .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 quickRoots.forEach { samplePath ->
                     Surface(
                         onClick = { onQueryPath(samplePath) },
-                        shape = RoundedCornerShape(5.dp),
+                        shape = RoundedCornerShape(6.dp),
                         color = ObsidianSurfaceElevated,
                         border = BorderStroke(1.dp, ObsidianBorder)
                     ) {
@@ -1437,8 +1582,7 @@ private fun Step1ManualPropertyInspectorBox(
                             style = MaterialTheme.typography.labelSmall,
                             fontFamily = JetBrainsMonoFontFamily,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            fontSize = 10.sp,
-                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 4.dp)
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
                         )
                     }
                 }
@@ -1496,16 +1640,16 @@ private fun ManualJsExecutionDrawer(
 
     Surface(
         color = ObsidianSurfaceElevated,
-        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.4f)),
-        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.45f)),
+        shape = RoundedCornerShape(9.dp),
         modifier = Modifier
             .fillMaxWidth()
-            .padding(horizontal = 8.dp, vertical = 4.dp)
+            .padding(horizontal = 10.dp, vertical = 6.dp)
             .testTag("manual_js_drawer")
     ) {
         Column(
-            modifier = Modifier.padding(8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            modifier = Modifier.padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1532,7 +1676,7 @@ private fun ManualJsExecutionDrawer(
                 IconButton(
                     onClick = onClose,
                     modifier = Modifier
-                        .size(32.dp)
+                        .size(36.dp)
                         .testTag("close_js_drawer_button")
                 ) {
                     Icon(
@@ -1561,7 +1705,7 @@ private fun ManualJsExecutionDrawer(
                             text = title,
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
                         )
                     }
                 }
@@ -1570,7 +1714,7 @@ private fun ManualJsExecutionDrawer(
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 OutlinedTextField(
                     value = script,

@@ -21,6 +21,8 @@ import android.webkit.WebViewClient
 import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -60,30 +62,37 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.DiagnosticsEffect
+import com.example.DiagnosticsUiState
 import com.example.DiagnosticsViewModel
 import com.example.LogCategory
 import com.example.R
@@ -100,17 +109,21 @@ import com.example.ui.theme.SignalEmerald
 fun DiagnosticsScreen(
     viewModel: DiagnosticsViewModel = viewModel()
 ) {
-    val state by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val focusManager = LocalFocusManager.current
+
+    // Synchronously attach ApplicationContext BEFORE collecting state or mounting WebView
+    // so synchronous SharedPreferences pointer & schema stores load saved sites on frame 1.
+    remember(viewModel, context) {
+        viewModel.attachContext(context)
+        true
+    }
+
+    val state by viewModel.uiState.collectAsStateWithLifecycle()
 
     var webViewRef by remember { mutableStateOf<WebView?>(null) }
     val defaultMobileUa = remember(context) {
         runCatching { WebSettings.getDefaultUserAgent(context) }.getOrDefault("")
-    }
-
-    LaunchedEffect(viewModel, context) {
-        viewModel.attachContext(context)
     }
 
     val telemetryBridge = remember(viewModel) {
@@ -227,13 +240,21 @@ fun DiagnosticsScreen(
                 .imePadding()
         ) {
             val isWideScreen = maxWidth >= 840.dp
+            val density = LocalDensity.current
+            val totalHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
+            val totalWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
+            val currentSplit by rememberUpdatedState(state.consoleSplitFraction)
 
             if (isWideScreen) {
-                // Expanded / Tablet / Landscape Canonical Side-by-Side Split (60% WebView / 40% Console)
+                // Expanded / Tablet / Landscape Draggable Side-by-Side Split
+                val consoleWeight = state.consoleSplitFraction.coerceIn(0.24f, 0.78f)
+                val webViewWeight = (1f - consoleWeight).coerceAtLeast(0.22f)
+
                 Row(modifier = Modifier.fillMaxSize()) {
                     DiagnosticWebViewContainer(
                         activeUrl = state.activeUrl,
                         isDesktopMode = state.isDesktopMode,
+                        savedSiteCount = state.savedSiteProfiles.size,
                         defaultMobileUa = defaultMobileUa,
                         telemetryBridge = telemetryBridge,
                         onWebViewCreated = { webViewRef = it },
@@ -247,110 +268,39 @@ fun DiagnosticsScreen(
                             viewModel.onTelemetryFromBridge(LogCategory.ERROR.tag, msg)
                         },
                         modifier = Modifier
-                            .weight(if (state.isConsoleExpanded) 0.42f else 0.60f)
+                            .weight(webViewWeight)
                             .fillMaxHeight()
                     )
-                    VerticalDivider(color = ObsidianBorder, thickness = 1.dp)
-                    TelemetryConsolePanel(
+
+                    LandscapeDraggableSplitHandle(
+                        onDragDeltaPx = { dragX ->
+                            // Dragging left widens the right-side console
+                            val next = (currentSplit - (dragX / totalWidthPx)).coerceIn(0.24f, 0.78f)
+                            viewModel.onSetConsoleSplitFraction(next)
+                        }
+                    )
+
+                    WiredTelemetryConsolePanel(
                         state = state,
-                        onRunStep1 = viewModel::runStep1InspectScope,
-                        onPauseStep1 = viewModel::pauseStep1BatchScan,
-                        onResumeStep1 = viewModel::resumeStep1BatchScan,
-                        onManualPathInputChanged = viewModel::onManualPathInputChanged,
-                        onQueryManualPath = { override ->
-                            focusManager.clearFocus()
-                            viewModel.onQueryManualPropertyPath(override)
-                        },
-                        onRunStep2A = viewModel::runStep2ACaptureBaseline,
-                        onRunStep2B = viewModel::runStep2BComputeDelta,
-                        onRunStep3 = viewModel::runStep3ScanEntities,
-                        onExportReport = {
-                            viewModel.requestExportReport(
-                                context = context,
-                                armBridge = telemetryBridge::armExport,
-                                disarmBridge = telemetryBridge::disarmExport
-                            )
-                        },
-                        onShareReport = viewModel::onShareLastReport,
-                        onExportLogDumpTxt = { viewModel.exportFullLogDump(context, asJson = false) },
-                        onExportLogDumpJson = { viewModel.exportFullLogDump(context, asJson = true) },
-                        onShareLogDump = viewModel::onShareLastLogDump,
-                        onSelectConsoleTab = viewModel::onSelectConsoleTab,
-                        onSelectFilter = viewModel::onSelectFilter,
-                        onTogglePinCandidate = viewModel::onTogglePinCandidate,
-                        onTogglePinnedOnly = viewModel::onTogglePinnedOnlyFilter,
-                        onStagingSearchQueryChanged = viewModel::onStagingSearchQueryChanged,
-                        onClearUnpinnedCandidates = viewModel::onClearUnpinnedCandidates,
-                        onLockCandidateForLivePolling = viewModel::onLockCandidateForLivePolling,
-                        onPinExternalPath = viewModel::onPinExternalPath,
-                        onToggleJsDrawer = { viewModel.onToggleJsDrawer() },
-                        onManualJsChanged = viewModel::onManualJsInputChanged,
-                        onExecuteManualJs = viewModel::onExecuteManualScript,
-                        onClearAssetCache = { viewModel.onClearAssetCache(context) },
-                        onClearLogs = viewModel::onClearLogs,
-                        onToggleExpanded = viewModel::onToggleConsoleExpanded,
-                        onCopyPayload = { text -> copyToClipboard(context, text) },
-                        onWasmValueChanged = viewModel::onWasmTargetValueChanged,
-                        onRunWasmScan = {
-                            focusManager.clearFocus()
-                            viewModel.runWasmHeapInitialScan()
-                        },
-                        onRunWasmFilter = {
-                            focusManager.clearFocus()
-                            viewModel.runWasmHeapFilterDelta()
-                        },
-                        onInspectWasmCandidate = viewModel::onInspectWasmCandidate,
-                        onStopWasmPoll = viewModel::onStopWasmNeighborPolling,
-                        onResetWasmTracker = viewModel::onResetWasmHeapTracker,
-                        onExportWasmMemoryMap = { viewModel.exportWasmMemoryMapJson(context) },
-                        onShareWasmMemoryMap = viewModel::onShareLastWasmMemoryMap,
-                        onSelectStep2ScanMode = viewModel::onSelectStep2ScanMode,
-                        onRunFloatBaseline = viewModel::runWasmFloatBaselineSnapshot,
-                        onRunFloatDeltaScan = viewModel::runWasmFloatDeltaScan,
-                        onResetFloatDelta = viewModel::onResetWasmFloatDelta,
-                        onToggleFloatWatcherExpanded = viewModel::onToggleFloatWatcherExpanded,
-                        onTogglePinFloatCandidate = viewModel::onTogglePinWasmFloatCandidate,
-                        onPinTopFloatTriplet = viewModel::onPinTopWasmFloatTriplet,
-                        onInspectFloatNeighbors = viewModel::onInspectWasmFloatNeighbors,
-                        onStopFloatWatch = viewModel::onStopWasmFloatWatch,
-                        onLockFloatCoords = viewModel::onLockWasmFloatCoords,
-                        onUnlockFloatCoords = viewModel::onUnlockWasmFloatCoords,
-                        onFindWasmPointers = { viewModel.runWasmPointerScan() },
-                        onVerifyWasmPointers = viewModel::runVerifyWasmPointerChains,
-                        onToggleWatchWasmPointers = viewModel::onToggleWatchWasmPointers,
-                        onStreamPointerToHud = viewModel::onStreamPointerChainToHud,
-                        onPruneWasmPointers = viewModel::onPruneZeroAndStalePointers,
-                        onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
-                        onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
-                        onToggleStructProberExpanded = viewModel::onToggleStructProberExpanded,
-                        onSelectStructProbeField = viewModel::onSelectStructProbeField,
-                        onStructProbeInputChanged = viewModel::onStructProbeInputChanged,
-                        onRunStructProbe = {
-                            focusManager.clearFocus()
-                            viewModel.runStructFieldProbe(refineExisting = false)
-                        },
-                        onRunStructRefine = {
-                            focusManager.clearFocus()
-                            viewModel.runStructFieldProbe(refineExisting = true)
-                        },
-                        onRunAutoProbeNames = {
-                            focusManager.clearFocus()
-                            viewModel.runAutoProbeEntityNames()
-                        },
-                        onBindStructCandidate = { cand -> viewModel.onBindStructFieldCandidate(cand) },
-                        onClearBoundStructField = viewModel::onClearBoundStructField,
-                        onClearAllBoundStructFields = viewModel::onClearAllBoundStructFields,
+                        viewModel = viewModel,
+                        context = context,
+                        telemetryBridge = telemetryBridge,
+                        onClearFocus = { focusManager.clearFocus() },
                         modifier = Modifier
-                            .weight(if (state.isConsoleExpanded) 0.58f else 0.40f)
+                            .weight(consoleWeight)
                             .fillMaxHeight()
                     )
                 }
             } else {
-                // Mobile Portrait Split View: Top ~60% WebView / Bottom ~40% Diagnostic Wizard & Console
+                // Mobile Portrait Draggable Split View + Full-Height Expandable Tools Sheet
+                val consoleWeight = state.consoleSplitFraction.coerceIn(0.14f, 0.88f)
+                val webViewWeight = (1f - consoleWeight).coerceAtLeast(0.12f)
+
                 Column(modifier = Modifier.fillMaxSize()) {
                     DiagnosticWebViewContainer(
                         activeUrl = state.activeUrl,
                         isDesktopMode = state.isDesktopMode,
+                        savedSiteCount = state.savedSiteProfiles.size,
                         defaultMobileUa = defaultMobileUa,
                         telemetryBridge = telemetryBridge,
                         onWebViewCreated = { webViewRef = it },
@@ -364,107 +314,284 @@ fun DiagnosticsScreen(
                             viewModel.onTelemetryFromBridge(LogCategory.ERROR.tag, msg)
                         },
                         modifier = Modifier
-                            .weight(if (state.isConsoleExpanded) 0.34f else 0.58f)
+                            .weight(webViewWeight)
                             .fillMaxWidth()
                     )
-                    HorizontalDivider(color = ObsidianBorder, thickness = 1.5.dp)
-                    TelemetryConsolePanel(
+
+                    PortraitDraggableSplitHandle(
+                        splitFraction = consoleWeight,
+                        onDragDeltaPx = { dragY ->
+                            // Dragging upward increases console height fraction
+                            val next = (currentSplit - (dragY / totalHeightPx)).coerceIn(0.14f, 0.88f)
+                            viewModel.onSetConsoleSplitFraction(next)
+                        },
+                        onSnapMini = viewModel::onSnapConsoleMini,
+                        onSnapSplit = viewModel::onSnapConsoleSplit,
+                        onSnapFull = viewModel::onSnapConsoleFull
+                    )
+
+                    WiredTelemetryConsolePanel(
                         state = state,
-                        onRunStep1 = viewModel::runStep1InspectScope,
-                        onPauseStep1 = viewModel::pauseStep1BatchScan,
-                        onResumeStep1 = viewModel::resumeStep1BatchScan,
-                        onManualPathInputChanged = viewModel::onManualPathInputChanged,
-                        onQueryManualPath = { override ->
-                            focusManager.clearFocus()
-                            viewModel.onQueryManualPropertyPath(override)
-                        },
-                        onRunStep2A = viewModel::runStep2ACaptureBaseline,
-                        onRunStep2B = viewModel::runStep2BComputeDelta,
-                        onRunStep3 = viewModel::runStep3ScanEntities,
-                        onExportReport = {
-                            viewModel.requestExportReport(
-                                context = context,
-                                armBridge = telemetryBridge::armExport,
-                                disarmBridge = telemetryBridge::disarmExport
-                            )
-                        },
-                        onShareReport = viewModel::onShareLastReport,
-                        onExportLogDumpTxt = { viewModel.exportFullLogDump(context, asJson = false) },
-                        onExportLogDumpJson = { viewModel.exportFullLogDump(context, asJson = true) },
-                        onShareLogDump = viewModel::onShareLastLogDump,
-                        onSelectConsoleTab = viewModel::onSelectConsoleTab,
-                        onSelectFilter = viewModel::onSelectFilter,
-                        onTogglePinCandidate = viewModel::onTogglePinCandidate,
-                        onTogglePinnedOnly = viewModel::onTogglePinnedOnlyFilter,
-                        onStagingSearchQueryChanged = viewModel::onStagingSearchQueryChanged,
-                        onClearUnpinnedCandidates = viewModel::onClearUnpinnedCandidates,
-                        onLockCandidateForLivePolling = viewModel::onLockCandidateForLivePolling,
-                        onPinExternalPath = viewModel::onPinExternalPath,
-                        onToggleJsDrawer = { viewModel.onToggleJsDrawer() },
-                        onManualJsChanged = viewModel::onManualJsInputChanged,
-                        onExecuteManualJs = viewModel::onExecuteManualScript,
-                        onClearAssetCache = { viewModel.onClearAssetCache(context) },
-                        onClearLogs = viewModel::onClearLogs,
-                        onToggleExpanded = viewModel::onToggleConsoleExpanded,
-                        onCopyPayload = { text -> copyToClipboard(context, text) },
-                        onWasmValueChanged = viewModel::onWasmTargetValueChanged,
-                        onRunWasmScan = {
-                            focusManager.clearFocus()
-                            viewModel.runWasmHeapInitialScan()
-                        },
-                        onRunWasmFilter = {
-                            focusManager.clearFocus()
-                            viewModel.runWasmHeapFilterDelta()
-                        },
-                        onInspectWasmCandidate = viewModel::onInspectWasmCandidate,
-                        onStopWasmPoll = viewModel::onStopWasmNeighborPolling,
-                        onResetWasmTracker = viewModel::onResetWasmHeapTracker,
-                        onExportWasmMemoryMap = { viewModel.exportWasmMemoryMapJson(context) },
-                        onShareWasmMemoryMap = viewModel::onShareLastWasmMemoryMap,
-                        onSelectStep2ScanMode = viewModel::onSelectStep2ScanMode,
-                        onRunFloatBaseline = viewModel::runWasmFloatBaselineSnapshot,
-                        onRunFloatDeltaScan = viewModel::runWasmFloatDeltaScan,
-                        onResetFloatDelta = viewModel::onResetWasmFloatDelta,
-                        onToggleFloatWatcherExpanded = viewModel::onToggleFloatWatcherExpanded,
-                        onTogglePinFloatCandidate = viewModel::onTogglePinWasmFloatCandidate,
-                        onPinTopFloatTriplet = viewModel::onPinTopWasmFloatTriplet,
-                        onInspectFloatNeighbors = viewModel::onInspectWasmFloatNeighbors,
-                        onStopFloatWatch = viewModel::onStopWasmFloatWatch,
-                        onLockFloatCoords = viewModel::onLockWasmFloatCoords,
-                        onUnlockFloatCoords = viewModel::onUnlockWasmFloatCoords,
-                        onFindWasmPointers = { viewModel.runWasmPointerScan() },
-                        onVerifyWasmPointers = viewModel::runVerifyWasmPointerChains,
-                        onToggleWatchWasmPointers = viewModel::onToggleWatchWasmPointers,
-                        onStreamPointerToHud = viewModel::onStreamPointerChainToHud,
-                        onPruneWasmPointers = viewModel::onPruneZeroAndStalePointers,
-                        onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
-                        onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
-                        onToggleStructProberExpanded = viewModel::onToggleStructProberExpanded,
-                        onSelectStructProbeField = viewModel::onSelectStructProbeField,
-                        onStructProbeInputChanged = viewModel::onStructProbeInputChanged,
-                        onRunStructProbe = {
-                            focusManager.clearFocus()
-                            viewModel.runStructFieldProbe(refineExisting = false)
-                        },
-                        onRunStructRefine = {
-                            focusManager.clearFocus()
-                            viewModel.runStructFieldProbe(refineExisting = true)
-                        },
-                        onRunAutoProbeNames = {
-                            focusManager.clearFocus()
-                            viewModel.runAutoProbeEntityNames()
-                        },
-                        onBindStructCandidate = { cand -> viewModel.onBindStructFieldCandidate(cand) },
-                        onClearBoundStructField = viewModel::onClearBoundStructField,
-                        onClearAllBoundStructFields = viewModel::onClearAllBoundStructFields,
+                        viewModel = viewModel,
+                        context = context,
+                        telemetryBridge = telemetryBridge,
+                        onClearFocus = { focusManager.clearFocus() },
                         modifier = Modifier
-                            .weight(if (state.isConsoleExpanded) 0.66f else 0.42f)
+                            .weight(consoleWeight)
                             .fillMaxWidth()
                     )
                 }
             }
         }
     }
+}
+
+@Composable
+private fun PortraitDraggableSplitHandle(
+    splitFraction: Float,
+    onDragDeltaPx: (Float) -> Unit,
+    onSnapMini: () -> Unit,
+    onSnapSplit: () -> Unit,
+    onSnapFull: () -> Unit
+) {
+    val dragCd = stringResource(R.string.cd_drag_split_handle)
+    val isMini = splitFraction <= 0.19f
+    val isFull = splitFraction >= 0.78f
+    val isSplit = !isMini && !isFull
+
+    Surface(
+        color = ObsidianSurfaceElevated,
+        modifier = Modifier
+            .fillMaxWidth()
+            .semantics { contentDescription = dragCd }
+            .pointerInput(Unit) {
+                detectVerticalDragGestures { change, dragAmount ->
+                    change.consume()
+                    onDragDeltaPx(dragAmount)
+                }
+            }
+            .testTag("portrait_split_drag_handle")
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            HorizontalDivider(color = ElectricCyan.copy(alpha = 0.45f), thickness = 1.dp)
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                SplitSnapChip(
+                    label = stringResource(R.string.split_snap_mini),
+                    selected = isMini,
+                    testTag = "split_snap_mini_button",
+                    onClick = onSnapMini
+                )
+
+                // Center tactile drag grip pill
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(26.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .width(46.dp)
+                            .height(5.dp)
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(ElectricCyan.copy(alpha = 0.65f))
+                    )
+                }
+
+                SplitSnapChip(
+                    label = stringResource(R.string.split_snap_half),
+                    selected = isSplit,
+                    testTag = "split_snap_half_button",
+                    onClick = onSnapSplit
+                )
+                SplitSnapChip(
+                    label = stringResource(R.string.split_snap_full),
+                    selected = isFull,
+                    testTag = "split_snap_full_button",
+                    onClick = onSnapFull
+                )
+            }
+            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+        }
+    }
+}
+
+@Composable
+private fun SplitSnapChip(
+    label: String,
+    selected: Boolean,
+    testTag: String,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(6.dp),
+        color = if (selected) ElectricCyan.copy(alpha = 0.24f) else ObsidianBg,
+        border = BorderStroke(
+            1.dp,
+            if (selected) ElectricCyan else ObsidianBorder
+        ),
+        modifier = Modifier
+            .heightIn(min = 28.dp)
+            .testTag(testTag)
+    ) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                color = if (selected) ElectricCyan else MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 10.sp
+            )
+        }
+    }
+}
+
+@Composable
+private fun LandscapeDraggableSplitHandle(
+    onDragDeltaPx: (Float) -> Unit
+) {
+    val dragCd = stringResource(R.string.cd_drag_split_handle)
+    Box(
+        modifier = Modifier
+            .fillMaxHeight()
+            .width(16.dp)
+            .background(ObsidianSurfaceElevated)
+            .semantics { contentDescription = dragCd }
+            .pointerInput(Unit) {
+                detectHorizontalDragGestures { change, dragAmount ->
+                    change.consume()
+                    onDragDeltaPx(dragAmount)
+                }
+            }
+            .testTag("landscape_split_drag_handle"),
+        contentAlignment = Alignment.Center
+    ) {
+        Box(
+            modifier = Modifier
+                .width(4.dp)
+                .height(48.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(ElectricCyan.copy(alpha = 0.65f))
+        )
+    }
+}
+
+@Composable
+private fun WiredTelemetryConsolePanel(
+    state: DiagnosticsUiState,
+    viewModel: DiagnosticsViewModel,
+    context: Context,
+    telemetryBridge: TelemetryBridge,
+    onClearFocus: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    TelemetryConsolePanel(
+        state = state,
+        onRunStep1 = viewModel::runStep1InspectScope,
+        onPauseStep1 = viewModel::pauseStep1BatchScan,
+        onResumeStep1 = viewModel::resumeStep1BatchScan,
+        onManualPathInputChanged = viewModel::onManualPathInputChanged,
+        onQueryManualPath = { override ->
+            onClearFocus()
+            viewModel.onQueryManualPropertyPath(override)
+        },
+        onRunStep2A = viewModel::runStep2ACaptureBaseline,
+        onRunStep2B = viewModel::runStep2BComputeDelta,
+        onRunStep3 = viewModel::runStep3ScanEntities,
+        onExportReport = {
+            viewModel.requestExportReport(
+                context = context,
+                armBridge = telemetryBridge::armExport,
+                disarmBridge = telemetryBridge::disarmExport
+            )
+        },
+        onShareReport = viewModel::onShareLastReport,
+        onExportLogDumpTxt = { viewModel.exportFullLogDump(context, asJson = false) },
+        onExportLogDumpJson = { viewModel.exportFullLogDump(context, asJson = true) },
+        onShareLogDump = viewModel::onShareLastLogDump,
+        onSelectConsoleTab = viewModel::onSelectConsoleTab,
+        onSelectProberSubTab = viewModel::onSelectProberSubTab,
+        onSelectLogsAssetsSubTab = viewModel::onSelectLogsAssetsSubTab,
+        onOpenSavedSiteProfile = { profile ->
+            onClearFocus()
+            viewModel.onOpenSavedSiteProfile(profile)
+        },
+        onDeleteSavedSiteProfile = viewModel::onDeleteSavedSiteProfile,
+        onSelectFilter = viewModel::onSelectFilter,
+        onTogglePinCandidate = viewModel::onTogglePinCandidate,
+        onTogglePinnedOnly = viewModel::onTogglePinnedOnlyFilter,
+        onStagingSearchQueryChanged = viewModel::onStagingSearchQueryChanged,
+        onClearUnpinnedCandidates = viewModel::onClearUnpinnedCandidates,
+        onLockCandidateForLivePolling = viewModel::onLockCandidateForLivePolling,
+        onPinExternalPath = viewModel::onPinExternalPath,
+        onToggleJsDrawer = { viewModel.onToggleJsDrawer() },
+        onManualJsChanged = viewModel::onManualJsInputChanged,
+        onExecuteManualJs = viewModel::onExecuteManualScript,
+        onClearAssetCache = { viewModel.onClearAssetCache(context) },
+        onClearLogs = viewModel::onClearLogs,
+        onExpandFromMini = viewModel::onSnapConsoleSplit,
+        onCopyPayload = { text -> copyToClipboard(context, text) },
+        onWasmValueChanged = viewModel::onWasmTargetValueChanged,
+        onRunWasmScan = {
+            onClearFocus()
+            viewModel.runWasmHeapInitialScan()
+        },
+        onRunWasmFilter = {
+            onClearFocus()
+            viewModel.runWasmHeapFilterDelta()
+        },
+        onInspectWasmCandidate = viewModel::onInspectWasmCandidate,
+        onStopWasmPoll = viewModel::onStopWasmNeighborPolling,
+        onResetWasmTracker = viewModel::onResetWasmHeapTracker,
+        onExportWasmMemoryMap = { viewModel.exportWasmMemoryMapJson(context) },
+        onShareWasmMemoryMap = viewModel::onShareLastWasmMemoryMap,
+        onSelectStep2ScanMode = viewModel::onSelectStep2ScanMode,
+        onRunFloatBaseline = viewModel::runWasmFloatBaselineSnapshot,
+        onRunFloatDeltaScan = viewModel::runWasmFloatDeltaScan,
+        onResetFloatDelta = viewModel::onResetWasmFloatDelta,
+        onToggleFloatWatcherExpanded = viewModel::onToggleFloatWatcherExpanded,
+        onTogglePinFloatCandidate = viewModel::onTogglePinWasmFloatCandidate,
+        onPinTopFloatTriplet = viewModel::onPinTopWasmFloatTriplet,
+        onInspectFloatNeighbors = viewModel::onInspectWasmFloatNeighbors,
+        onStopFloatWatch = viewModel::onStopWasmFloatWatch,
+        onLockFloatCoords = viewModel::onLockWasmFloatCoords,
+        onUnlockFloatCoords = viewModel::onUnlockWasmFloatCoords,
+        onFindWasmPointers = { viewModel.runWasmPointerScan() },
+        onVerifyWasmPointers = viewModel::runVerifyWasmPointerChains,
+        onToggleWatchWasmPointers = viewModel::onToggleWatchWasmPointers,
+        onStreamPointerToHud = viewModel::onStreamPointerChainToHud,
+        onPruneWasmPointers = viewModel::onPruneZeroAndStalePointers,
+        onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
+        onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
+        onSelectStructProbeField = viewModel::onSelectStructProbeField,
+        onStructProbeInputChanged = viewModel::onStructProbeInputChanged,
+        onRunStructProbe = {
+            onClearFocus()
+            viewModel.runStructFieldProbe(refineExisting = false)
+        },
+        onRunStructRefine = {
+            onClearFocus()
+            viewModel.runStructFieldProbe(refineExisting = true)
+        },
+        onRunAutoProbeNames = {
+            onClearFocus()
+            viewModel.runAutoProbeEntityNames()
+        },
+        onBindStructCandidate = { cand -> viewModel.onBindStructFieldCandidate(cand) },
+        onClearBoundStructField = viewModel::onClearBoundStructField,
+        onClearAllBoundStructFields = viewModel::onClearAllBoundStructFields,
+        modifier = modifier
+    )
 }
 
 @Composable
@@ -643,6 +770,7 @@ private fun CompactUrlNavigationBar(
 private fun DiagnosticWebViewContainer(
     activeUrl: String,
     isDesktopMode: Boolean,
+    savedSiteCount: Int,
     defaultMobileUa: String,
     telemetryBridge: TelemetryBridge,
     onWebViewCreated: (WebView) -> Unit,
@@ -773,12 +901,12 @@ private fun DiagnosticWebViewContainer(
                 border = BorderStroke(1.dp, ObsidianBorder),
                 modifier = Modifier
                     .align(Alignment.Center)
-                    .padding(24.dp)
+                    .padding(20.dp)
             ) {
                 Column(
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     Text(
                         text = "WebView Container Ready",
@@ -786,14 +914,18 @@ private fun DiagnosticWebViewContainer(
                         color = ElectricCyan
                     )
                     Text(
-                        text = if (isDesktopMode) "Mode: Desktop UA • Hardware Accelerated • Remote Debug OFF"
-                        else "Mode: Mobile UA • Hardware Accelerated • Remote Debug OFF",
+                        text = if (isDesktopMode) "Desktop UA • Hardware Accelerated • Remote Debug OFF"
+                        else "Mobile UA • Hardware Accelerated • Remote Debug OFF",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        text = "Enter any https:// URL in the bar above and tap Go.",
-                        style = MaterialTheme.typography.bodyMedium,
+                        text = if (savedSiteCount > 0) {
+                            "Enter a URL above or tap Open & Verify on your saved site below."
+                        } else {
+                            "Enter any https:// URL in the bar above and tap Go."
+                        },
+                        style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                 }

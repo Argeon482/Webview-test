@@ -56,13 +56,31 @@ enum class WizardStepBadge(val displayText: String) {
 }
 
 enum class ConsoleTab {
-    WIZARD,
-    WASM_HEAP,
-    STAGING,
+    COORDS,
     ENTITIES,
-    ASSETS,
-    LOGS
+    PROBER,
+    LOGS_ASSETS
 }
+
+enum class ProberSubTab {
+    STRUCT_PROBER,
+    FULL_HEAP
+}
+
+enum class LogsAssetsSubTab {
+    LOGS,
+    ASSETS,
+    STAGING
+}
+
+@Immutable
+data class SavedSiteProfile(
+    val hostKey: String,
+    val lastUrl: String,
+    val pointerCount: Int,
+    val boundStructFieldCount: Int = 0,
+    val pointerExpressions: List<String> = emptyList()
+)
 
 enum class Step2ScanMode {
     WASM_FLOAT_HEAP,
@@ -524,7 +542,10 @@ data class DiagnosticsUiState(
     val isDesktopMode: Boolean = true,
     val scanStatus: AsyncScanStatus = AsyncScanStatus.IDLE,
     val scanStatusDetail: String = "",
-    val activeConsoleTab: ConsoleTab = ConsoleTab.WIZARD,
+    val activeConsoleTab: ConsoleTab = ConsoleTab.COORDS,
+    val activeProberSubTab: ProberSubTab = ProberSubTab.STRUCT_PROBER,
+    val activeLogsAssetsSubTab: LogsAssetsSubTab = LogsAssetsSubTab.LOGS,
+    val savedSiteProfiles: List<SavedSiteProfile> = emptyList(),
     // Multi-Scan Candidate Staging Buffer
     val scanCounter: Int = 0,
     val stagingBuffer: List<CandidateStagingItem> = emptyList(),
@@ -568,6 +589,7 @@ data class DiagnosticsUiState(
     val isJsDrawerOpen: Boolean = false,
     val manualJsInput: String = "",
     val isConsoleExpanded: Boolean = false,
+    val consoleSplitFraction: Float = 0.48f,
     val isExporting: Boolean = false,
     val lastExport: ExportReportOutcome? = null,
     val isExportingLogDump: Boolean = false,

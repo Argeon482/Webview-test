@@ -47,6 +47,7 @@ class DiagnosticsViewModel : ViewModel() {
     private var pendingExportContext: Context? = null
     private var sitePointerStore: SitePointerStore? = null
     private var siteStructSchemaStore: SiteStructSchemaStore? = null
+    private var lastValidUrl: String = ""
 
     fun attachContext(context: Context) {
         val appCtx = context.applicationContext
@@ -59,9 +60,11 @@ class DiagnosticsViewModel : ViewModel() {
             siteStructSchemaStore = SiteStructSchemaStore(appCtx)
             initialized = true
         }
+        refreshSavedSiteProfiles()
         if (initialized) {
             val currentUrl = _uiState.value.activeUrl
             if (currentUrl != "about:blank") {
+                lastValidUrl = currentUrl
                 restoreSavedPointersForUrl(currentUrl, autoVerify = false)
             }
         }
@@ -69,10 +72,79 @@ class DiagnosticsViewModel : ViewModel() {
 
     internal fun setSitePointerStoreForTesting(store: SitePointerStore) {
         sitePointerStore = store
+        refreshSavedSiteProfiles()
     }
 
     internal fun setSiteStructSchemaStoreForTesting(store: SiteStructSchemaStore) {
         siteStructSchemaStore = store
+        refreshSavedSiteProfiles()
+    }
+
+    private fun effectivePersistenceUrl(state: DiagnosticsUiState = _uiState.value): String {
+        val candidates = listOf(state.activeUrl, lastValidUrl, state.urlInput)
+        return candidates.firstOrNull { SitePointerStore.normalizeHostKey(it) != null }.orEmpty()
+    }
+
+    private fun refreshSavedSiteProfiles() {
+        val pointerRecords = sitePointerStore?.listSavedSites().orEmpty()
+        val schemaCounts = siteStructSchemaStore?.listSavedSchemaHosts().orEmpty()
+
+        val profilesByHost = LinkedHashMap<String, SavedSiteProfile>()
+        pointerRecords.forEach { rec ->
+            profilesByHost[rec.hostKey] = SavedSiteProfile(
+                hostKey = rec.hostKey,
+                lastUrl = rec.lastUrl,
+                pointerCount = rec.pointers.size,
+                boundStructFieldCount = schemaCounts[rec.hostKey] ?: 0,
+                pointerExpressions = rec.pointers.take(3).map { it.expression }
+            )
+        }
+        schemaCounts.forEach { (host, count) ->
+            if (!profilesByHost.containsKey(host)) {
+                profilesByHost[host] = SavedSiteProfile(
+                    hostKey = host,
+                    lastUrl = "https://$host",
+                    pointerCount = 0,
+                    boundStructFieldCount = count,
+                    pointerExpressions = emptyList()
+                )
+            }
+        }
+        _uiState.update { it.copy(savedSiteProfiles = profilesByHost.values.toList()) }
+    }
+
+    fun onOpenSavedSiteProfile(profile: SavedSiteProfile) {
+        val target = profile.lastUrl.ifBlank { "https://${profile.hostKey}" }
+        _uiState.update {
+            it.copy(
+                urlInput = target,
+                activeConsoleTab = ConsoleTab.COORDS
+            )
+        }
+        onLoadUrlRequested()
+    }
+
+    fun onDeleteSavedSiteProfile(hostKey: String) {
+        sitePointerStore?.clearPointersForHost(hostKey)
+        siteStructSchemaStore?.clearSchemaForHost(hostKey)
+        refreshSavedSiteProfiles()
+        val activeHost = SitePointerStore.normalizeHostKey(_uiState.value.activeUrl)
+        if (activeHost == hostKey) {
+            _uiState.update { state ->
+                state.copy(
+                    wasmFloatDelta = state.wasmFloatDelta.copy(
+                        savedPointerCountForHost = 0,
+                        pointerChains = state.wasmFloatDelta.pointerChains.map {
+                            it.copy(isSavedLocally = false, isPinned = false)
+                        }
+                    ),
+                    structProber = state.structProber.copy(
+                        schema = WasmEntityStructSchema(hostKey = hostKey, isSavedLocally = false)
+                    )
+                )
+            }
+        }
+        _effects.tryEmit(DiagnosticsEffect.ShowToast("Cleared saved pointers & offsets for $hostKey"))
     }
 
     fun onUrlInputChanged(input: String) {
@@ -84,6 +156,9 @@ class DiagnosticsViewModel : ViewModel() {
         when (val validation = normalizeAndValidateUrl(raw)) {
             is UrlValidationResult.Valid -> {
                 val targetUrl = validation.normalizedUrl
+                if (SitePointerStore.normalizeHostKey(targetUrl) != null) {
+                    lastValidUrl = targetUrl
+                }
                 val savedForTarget = sitePointerStore?.loadPointersForUrl(targetUrl).orEmpty()
                 val savedSchema = siteStructSchemaStore?.loadSchemaForUrl(targetUrl) ?: WasmEntityStructSchema()
                 seenAssetUrls.clear()
@@ -181,10 +256,51 @@ class DiagnosticsViewModel : ViewModel() {
     }
 
     fun onSelectConsoleTab(tab: ConsoleTab) {
-        _uiState.update { it.copy(activeConsoleTab = tab) }
+        _uiState.update { state ->
+            // Automatically expand from Mini HUD when user taps a tab
+            val nextSplit = if (state.consoleSplitFraction < 0.25f) 0.48f else state.consoleSplitFraction
+            state.copy(
+                activeConsoleTab = tab,
+                consoleSplitFraction = nextSplit,
+                isConsoleExpanded = nextSplit >= 0.72f
+            )
+        }
+    }
+
+    fun onSelectProberSubTab(subTab: ProberSubTab) {
+        _uiState.update { it.copy(activeProberSubTab = subTab) }
+    }
+
+    fun onSelectLogsAssetsSubTab(subTab: LogsAssetsSubTab) {
+        _uiState.update { it.copy(activeLogsAssetsSubTab = subTab) }
+    }
+
+    fun onSetConsoleSplitFraction(fraction: Float) {
+        val clamped = fraction.coerceIn(0.14f, 0.88f)
+        _uiState.update {
+            it.copy(
+                consoleSplitFraction = clamped,
+                isConsoleExpanded = clamped >= 0.72f
+            )
+        }
+    }
+
+    fun onSnapConsoleMini() {
+        onSetConsoleSplitFraction(0.15f)
+    }
+
+    fun onSnapConsoleSplit() {
+        onSetConsoleSplitFraction(0.48f)
+    }
+
+    fun onSnapConsoleFull() {
+        onSetConsoleSplitFraction(0.88f)
     }
 
     fun onPageStarted(url: String) {
+        if (SitePointerStore.normalizeHostKey(url) != null) {
+            lastValidUrl = url
+        }
         _uiState.update {
             it.copy(
                 activeUrl = url,
@@ -208,6 +324,9 @@ class DiagnosticsViewModel : ViewModel() {
     }
 
     fun onPageFinished(url: String, title: String?) {
+        if (SitePointerStore.normalizeHostKey(url) != null) {
+            lastValidUrl = url
+        }
         _uiState.update {
             it.copy(
                 activeUrl = url,
@@ -835,12 +954,12 @@ class DiagnosticsViewModel : ViewModel() {
     ) {
         val state = _uiState.value
         val field = state.structProber.activeField
-        val activeUrl = state.activeUrl
-        val hostKey = SitePointerStore.normalizeHostKey(activeUrl).orEmpty()
+        val persistUrl = effectivePersistenceUrl(state)
+        val persistHost = SitePointerStore.normalizeHostKey(persistUrl).orEmpty()
 
         var nextSchema = state.structProber.schema
             .withField(field, candidate.toFieldOffset())
-            .copy(hostKey = hostKey)
+            .copy(hostKey = persistHost)
 
         // Auto-bind adjacent Max stat when binding HP / MP / FP if none bound yet
         val autoMaxKind = when (field) {
@@ -865,8 +984,13 @@ class DiagnosticsViewModel : ViewModel() {
             autoBoundMaxMsg = " (+ auto ${autoMaxKind.shortLabel} ${maxField.displayExpression})"
         }
 
-        val persistedSchema = siteStructSchemaStore?.saveSchemaForUrl(activeUrl, nextSchema)
-            ?: nextSchema.copy(isSavedLocally = nextSchema.hasAnyBound)
+        val persistedSchema: WasmEntityStructSchema = (
+            if (persistHost.isNotEmpty()) {
+                siteStructSchemaStore?.saveSchemaForUrl(persistUrl, nextSchema)
+            } else {
+                null
+            }
+        ) ?: nextSchema.copy(isSavedLocally = false)
 
         val nowTs = formatTimestamp(System.currentTimeMillis())
         val stagingPath = "WASM_STRUCT.${field.shortLabel}: ${candidate.expression}"
@@ -886,29 +1010,35 @@ class DiagnosticsViewModel : ViewModel() {
                 stagingBuffer = mergedStaging,
                 structProber = current.structProber.copy(
                     schema = persistedSchema,
-                    statusMessage = "Bound ${field.shortLabel} -> ${candidate.expression}$autoBoundMaxMsg (saved for ${hostKey.ifBlank { "session" }})."
+                    statusMessage = "Bound ${field.shortLabel} -> ${candidate.expression}$autoBoundMaxMsg (saved for ${persistHost.ifBlank { "session" }})."
                 )
             )
         }
+        refreshSavedSiteProfiles()
 
         val schemaJson = SiteStructSchemaStore.serializeSchema(persistedSchema)
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmStructProberScripts.buildSyncStructSchemaScript(schemaJson)))
         appendLog(
             LogCategory.WASM,
             "Bound ${field.shortLabel} offset -> ${candidate.expression}$autoBoundMaxMsg",
-            "$detail | Saved locally for host=$hostKey"
+            "$detail | Saved locally for host=$persistHost"
         )
         _effects.tryEmit(
-            DiagnosticsEffect.ShowToast("Bound ${field.shortLabel} (${candidate.expression}) — streaming live!")
+            DiagnosticsEffect.ShowToast("Bound ${field.shortLabel} (${candidate.expression}) — saved to disk!")
         )
     }
 
     fun onClearBoundStructField(field: WasmStructFieldKind) {
         val state = _uiState.value
-        val activeUrl = state.activeUrl
+        val persistUrl = effectivePersistenceUrl(state)
         val updated = state.structProber.schema.withField(field, null)
-        val persisted = siteStructSchemaStore?.saveSchemaForUrl(activeUrl, updated)
-            ?: updated.copy(isSavedLocally = updated.hasAnyBound)
+        val persisted: WasmEntityStructSchema = (
+            if (persistUrl.isNotBlank()) {
+                siteStructSchemaStore?.saveSchemaForUrl(persistUrl, updated)
+            } else {
+                null
+            }
+        ) ?: updated.copy(isSavedLocally = updated.hasAnyBound)
 
         _uiState.update { current ->
             val nextVitals = current.playerVitals?.let { pv ->
@@ -931,16 +1061,19 @@ class DiagnosticsViewModel : ViewModel() {
                 )
             )
         }
+        refreshSavedSiteProfiles()
 
         val schemaJson = SiteStructSchemaStore.serializeSchema(persisted)
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmStructProberScripts.buildSyncStructSchemaScript(schemaJson)))
-        appendLog(LogCategory.WASM, "Cleared bound ${field.shortLabel} struct offset", "Schema updated for ${state.activeUrl}")
+        appendLog(LogCategory.WASM, "Cleared bound ${field.shortLabel} struct offset", "Schema updated for $persistUrl")
     }
 
     fun onClearAllBoundStructFields() {
-        val activeUrl = _uiState.value.activeUrl
-        siteStructSchemaStore?.clearSchemaForUrl(activeUrl)
-        val hostKey = SitePointerStore.normalizeHostKey(activeUrl).orEmpty()
+        val persistUrl = effectivePersistenceUrl(_uiState.value)
+        if (persistUrl.isNotBlank()) {
+            siteStructSchemaStore?.clearSchemaForUrl(persistUrl)
+        }
+        val hostKey = SitePointerStore.normalizeHostKey(persistUrl).orEmpty()
         _uiState.update { current ->
             current.copy(
                 playerVitals = null,
@@ -952,6 +1085,7 @@ class DiagnosticsViewModel : ViewModel() {
                 )
             )
         }
+        refreshSavedSiteProfiles()
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmStructProberScripts.buildSyncStructSchemaScript("{}")))
     }
 
@@ -1429,7 +1563,12 @@ class DiagnosticsViewModel : ViewModel() {
     }
 
     fun onInspectWasmFloatNeighbors(heapIndex: Int) {
-        _uiState.update { it.copy(activeConsoleTab = ConsoleTab.WASM_HEAP) }
+        _uiState.update {
+            it.copy(
+                activeConsoleTab = ConsoleTab.PROBER,
+                activeProberSubTab = ProberSubTab.FULL_HEAP
+            )
+        }
         onInspectWasmCandidate("HEAPF32", heapIndex)
     }
 
@@ -1935,77 +2074,80 @@ class DiagnosticsViewModel : ViewModel() {
     }
 
     fun onTogglePinWasmPointerChain(chainId: String) {
+        val snapshot = _uiState.value
+        val existingChain = snapshot.wasmFloatDelta.pointerChains.firstOrNull { it.id == chainId } ?: return
         val nowTs = formatTimestamp(System.currentTimeMillis())
-        val activeUrl = _uiState.value.activeUrl
-        var toggledChain: WasmPointerChain? = null
-        var nowPinned = false
+        val persistUrl = effectivePersistenceUrl(snapshot)
+        val hostKey = SitePointerStore.normalizeHostKey(persistUrl)
+        val nowPinned = !existingChain.isPinned
+        val store = sitePointerStore
+
+        // Perform synchronous disk persistence OUTSIDE _uiState.update to avoid CAS retries or silent drops
+        val savedOnDisk: Boolean
+        val persistedCount: Int
+        val updatedChain = existingChain.copy(
+            isPinned = nowPinned,
+            isSavedLocally = nowPinned && store != null && hostKey != null
+        )
+        if (store != null && hostKey != null) {
+            val savedList = if (nowPinned) {
+                store.savePointerForUrl(persistUrl, updatedChain)
+            } else {
+                store.removePointerForUrl(persistUrl, chainId)
+            }
+            persistedCount = savedList.size
+            savedOnDisk = nowPinned && savedList.any { it.id == chainId }
+        } else {
+            savedOnDisk = false
+            persistedCount = snapshot.wasmFloatDelta.pointerChains.count {
+                if (it.id == chainId) false else it.isSavedLocally
+            }
+        }
+
+        val finalChain = updatedChain.copy(isSavedLocally = savedOnDisk)
 
         _uiState.update { state ->
             val updatedChains = state.wasmFloatDelta.pointerChains.map { chain ->
-                if (chain.id == chainId) {
-                    nowPinned = !chain.isPinned
-                    val next = chain.copy(
-                        isPinned = nowPinned,
-                        isSavedLocally = nowPinned && SitePointerStore.normalizeHostKey(activeUrl) != null
-                    )
-                    toggledChain = next
-                    next
-                } else {
-                    chain
-                }
+                if (chain.id == chainId) finalChain else chain
             }
-            val chain = toggledChain
-            val mergedStaging = if (chain != null) {
-                val stagingKey = "WASM_PTR: ${chain.expression}"
-                val regionTag = if (chain.isLikelyStatic) "STATIC" else "HEAP"
-                val detail = "[L${chain.depth} $regionTag ${chain.status.label}] -> ${formatHexAddress(chain.resolvedTargetAddress)} • (${String.format(Locale.US, "%.2f", chain.resolvedX)}, ${String.format(Locale.US, "%.2f", chain.resolvedY)}, ${String.format(Locale.US, "%.2f", chain.resolvedZ)})"
-                if (nowPinned) {
-                    mergeIntoStagingBuffer(
-                        existing = state.stagingBuffer,
-                        incoming = listOf(stagingKey to detail),
-                        sourceStep = "Pointer Chain",
-                        scanNumber = state.scanCounter.coerceAtLeast(1),
-                        timestamp = nowTs,
-                        forcePin = true
-                    )
-                } else {
-                    state.stagingBuffer.map { item ->
-                        if (item.path == stagingKey) item.copy(isPinned = false) else item
-                    }
-                }
+            val stagingKey = "WASM_PTR: ${finalChain.expression}"
+            val regionTag = if (finalChain.isLikelyStatic) "STATIC" else "HEAP"
+            val detail = "[L${finalChain.depth} $regionTag ${finalChain.status.label}] -> ${formatHexAddress(finalChain.resolvedTargetAddress)} • (${String.format(Locale.US, "%.2f", finalChain.resolvedX)}, ${String.format(Locale.US, "%.2f", finalChain.resolvedY)}, ${String.format(Locale.US, "%.2f", finalChain.resolvedZ)})"
+            val mergedStaging = if (nowPinned) {
+                mergeIntoStagingBuffer(
+                    existing = state.stagingBuffer,
+                    incoming = listOf(stagingKey to detail),
+                    sourceStep = "Pointer Chain",
+                    scanNumber = state.scanCounter.coerceAtLeast(1),
+                    timestamp = nowTs,
+                    forcePin = true
+                )
             } else {
-                state.stagingBuffer
-            }
-
-            val savedCount = toggledChain?.let { c ->
-                val store = sitePointerStore
-                if (store != null && SitePointerStore.normalizeHostKey(activeUrl) != null) {
-                    if (nowPinned) store.savePointerForUrl(activeUrl, c).size
-                    else store.removePointerForUrl(activeUrl, c.id).size
-                } else {
-                    updatedChains.count { it.isSavedLocally }
+                state.stagingBuffer.map { item ->
+                    if (item.path == stagingKey) item.copy(isPinned = false) else item
                 }
-            } ?: state.wasmFloatDelta.savedPointerCountForHost
+            }
 
             state.copy(
                 stagingBuffer = sortStagingBuffer(mergedStaging),
                 wasmFloatDelta = state.wasmFloatDelta.copy(
                     pointerChains = updatedChains,
-                    savedPointerCountForHost = savedCount
+                    savedPointerCountForHost = persistedCount
                 )
             )
         }
+        refreshSavedSiteProfiles()
 
-        toggledChain?.let { chain ->
-            val host = SitePointerStore.normalizeHostKey(activeUrl)
-            val toast = if (nowPinned) {
-                if (host != null) "Saved ${chain.expression} for $host (auto-verifies on reload)"
-                else "Bookmarked pointer chain ${chain.expression}"
+        val toast = if (nowPinned) {
+            if (savedOnDisk && hostKey != null) {
+                "Saved ${finalChain.expression} to disk for $hostKey (auto-verifies on reload)"
             } else {
-                "Removed saved pointer chain ${chain.expression}"
+                "Bookmarked ${finalChain.expression} (load a site URL to persist across restarts)"
             }
-            _effects.tryEmit(DiagnosticsEffect.ShowToast(toast))
+        } else {
+            "Removed saved pointer chain ${finalChain.expression}"
         }
+        _effects.tryEmit(DiagnosticsEffect.ShowToast(toast))
     }
 
     private fun buildPointerChainsPayloadJson(chains: List<WasmPointerChain>): String {
@@ -2356,7 +2498,8 @@ class DiagnosticsViewModel : ViewModel() {
     }
 
     fun onToggleConsoleExpanded() {
-        _uiState.update { it.copy(isConsoleExpanded = !it.isConsoleExpanded) }
+        val nextExpanded = !_uiState.value.isConsoleExpanded
+        onSetConsoleSplitFraction(if (nextExpanded) 0.88f else 0.48f)
     }
 
     fun onClearLogs() {

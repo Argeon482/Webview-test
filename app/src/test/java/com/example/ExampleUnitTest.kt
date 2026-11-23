@@ -258,6 +258,15 @@ class ExampleUnitTest {
       assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
     }
   }
+
+  @Test
+  fun registrableDomainExtractionNormalizesSubdomainsAndMultiPartTlds() {
+    assertEquals("flyff.com", SitePointerStore.extractRegistrableDomain("universe.flyff.com"))
+    assertEquals("flyff.com", SitePointerStore.extractRegistrableDomain("play.universe.flyff.com"))
+    assertEquals("example.co.uk", SitePointerStore.extractRegistrableDomain("game.example.co.uk"))
+    assertNull(SitePointerStore.extractRegistrableDomain("localhost"))
+  }
 }
+
 
 

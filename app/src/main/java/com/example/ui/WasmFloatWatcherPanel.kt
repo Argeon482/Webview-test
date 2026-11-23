@@ -643,7 +643,7 @@ private fun LockedAxisTile(
 }
 
 @Composable
-private fun PersistentPointerChainsCard(
+fun PersistentPointerChainsCard(
     floatState: WasmFloatDeltaState,
     onVerifyPointers: () -> Unit,
     onToggleWatchPointers: () -> Unit,
@@ -1179,12 +1179,11 @@ private fun WasmPointerChainRow(
 }
 
 /**
- * Persistent Live Float Watcher docked at the bottom of the diagnostic console.
- * Streams live 200ms decimal values for top filtered `window.HEAPF32` X/Y/Z candidate offsets
- * with one-tap pinning to Staging and direct jump to ±16B Neighboring Memory Inspector.
+ * Inline Live Float Watcher card rendered directly inside the `Coords` tab's single vertical scroll
+ * stream (no nested scroll trap, no docked overlay stealing height from Entities/Prober/Logs).
  */
 @Composable
-fun LiveFloatWatcherBottomBar(
+fun InlineLiveFloatCandidatesCard(
     floatState: WasmFloatDeltaState,
     onToggleExpanded: () -> Unit,
     onTogglePinCandidate: (heapIndex: Int) -> Unit,
@@ -1203,42 +1202,46 @@ fun LiveFloatWatcherBottomBar(
     val accent = if (locked != null) AssetAmber else if (floatState.isLiveWatching) SignalEmerald else ElectricCyan
 
     Surface(
-        color = ObsidianSurfaceElevated,
+        shape = RoundedCornerShape(10.dp),
+        color = ObsidianSurface,
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.65f)),
         modifier = modifier
             .fillMaxWidth()
             .testTag("live_float_watcher_bottom_bar")
     ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            HorizontalDivider(color = accent.copy(alpha = 0.65f), thickness = 1.5.dp)
-
-            // Header bar with live tick badge, Pin X/Y/Z, Stop, and Expand/Collapse
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            // Header row with Expand/Collapse & Live badge
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable(onClick = onToggleExpanded)
-                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                    .heightIn(min = 44.dp)
+                    .clickable(onClick = onToggleExpanded),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Icon(
                     imageVector = Icons.Default.MyLocation,
                     contentDescription = null,
                     tint = accent,
-                    modifier = Modifier.size(14.dp)
+                    modifier = Modifier.size(16.dp)
                 )
                 Text(
-                    text = stringResource(R.string.wasm_float_watcher_title),
-                    style = MaterialTheme.typography.labelSmall,
+                    text = "${stringResource(R.string.wasm_float_watcher_title)} (${floatState.candidates.size})",
+                    style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold,
                     color = accent,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
-
                 Surface(
                     color = accent.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(4.dp),
+                    shape = RoundedCornerShape(5.dp),
                     border = BorderStroke(1.dp, accent.copy(alpha = 0.5f))
                 ) {
                     Text(
@@ -1247,139 +1250,22 @@ fun LiveFloatWatcherBottomBar(
                         fontFamily = JetBrainsMonoFontFamily,
                         fontWeight = FontWeight.Bold,
                         color = accent,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                        fontSize = 10.sp,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
                 }
-
-                // Prominent Lock Coords / Find Pointers action in docked bottom watcher header
-                if (locked == null) {
-                    Surface(
-                        onClick = { onLockCoords(null) },
-                        shape = RoundedCornerShape(5.dp),
-                        color = AssetAmber,
-                        modifier = Modifier.testTag("float_watcher_lock_coords_button")
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(3.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Lock,
-                                contentDescription = null,
-                                tint = ObsidianBg,
-                                modifier = Modifier.size(11.dp)
-                            )
-                            Text(
-                                text = stringResource(R.string.action_lock_coords),
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = ObsidianBg,
-                                fontSize = 9.sp
-                            )
-                        }
-                    }
-                } else {
-                    Surface(
-                        onClick = onFindPointers,
-                        shape = RoundedCornerShape(5.dp),
-                        color = TelemetryViolet,
-                        modifier = Modifier.testTag("float_watcher_find_pointers_button")
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(3.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.AccountTree,
-                                contentDescription = null,
-                                tint = ObsidianBg,
-                                modifier = Modifier.size(11.dp)
-                            )
-                            Text(
-                                text = stringResource(R.string.action_find_pointers),
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = ObsidianBg,
-                                fontSize = 9.sp
-                            )
-                        }
-                    }
-                }
-
-                Surface(
-                    onClick = onPinTopTriplet,
-                    shape = RoundedCornerShape(5.dp),
-                    color = AssetAmber.copy(alpha = 0.16f),
-                    border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.65f)),
-                    modifier = Modifier.testTag("float_watcher_pin_xyz_button")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(3.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Bookmark,
-                            contentDescription = null,
-                            tint = AssetAmber,
-                            modifier = Modifier.size(11.dp)
-                        )
-                        Text(
-                            text = stringResource(R.string.wasm_float_pin_top),
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = AssetAmber,
-                            fontSize = 9.sp
-                        )
-                    }
-                }
-
-                if (floatState.isLiveWatching) {
-                    Surface(
-                        onClick = onStopWatch,
-                        shape = RoundedCornerShape(5.dp),
-                        color = ObsidianBg,
-                        border = BorderStroke(1.dp, ObsidianBorder),
-                        modifier = Modifier.testTag("float_watcher_stop_button")
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 3.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(2.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Stop,
-                                contentDescription = stringResource(R.string.wasm_float_stop_watch),
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(11.dp)
-                            )
-                            Text(
-                                text = stringResource(R.string.wasm_float_stop_watch),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontSize = 9.sp
-                            )
-                        }
-                    }
-                }
-
                 Icon(
-                    imageVector = if (floatState.isWatcherExpanded) Icons.Default.ExpandMore else Icons.Default.ExpandLess,
+                    imageVector = if (floatState.isWatcherExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(18.dp)
+                    modifier = Modifier.size(20.dp)
                 )
             }
 
-            // Always-visible X / Y / Z Candidate Live Decimal Tiles
+            // Always-visible X / Y / Z Live Decimal Tiles
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(start = 8.dp, end = 8.dp, bottom = 6.dp),
-                horizontalArrangement = Arrangement.spacedBy(5.dp)
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 topTriplet.forEachIndexed { idx, candidate ->
                     val axisLabel = candidate.axisHint.ifBlank { listOf("X", "Y", "Z").getOrElse(idx) { "F$idx" } }
@@ -1396,38 +1282,161 @@ fun LiveFloatWatcherBottomBar(
                 }
             }
 
-            // Expandable Scrollable List of Top Filtered Float Offsets with Pin & ±16B Inspect
+            // Spacious Action Bar: Lock / Find Pointers + Pin X/Y/Z + Stop
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (locked == null) {
+                    Surface(
+                        onClick = { onLockCoords(null) },
+                        shape = RoundedCornerShape(7.dp),
+                        color = AssetAmber,
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 44.dp)
+                            .testTag("float_watcher_lock_coords_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = null,
+                                tint = ObsidianBg,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(Modifier.width(5.dp))
+                            Text(
+                                text = stringResource(R.string.action_lock_coords),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = ObsidianBg
+                            )
+                        }
+                    }
+                } else {
+                    Surface(
+                        onClick = onFindPointers,
+                        shape = RoundedCornerShape(7.dp),
+                        color = TelemetryViolet,
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 44.dp)
+                            .testTag("float_watcher_find_pointers_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AccountTree,
+                                contentDescription = null,
+                                tint = ObsidianBg,
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(Modifier.width(5.dp))
+                            Text(
+                                text = stringResource(R.string.action_find_pointers),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = ObsidianBg
+                            )
+                        }
+                    }
+                }
+
+                Surface(
+                    onClick = onPinTopTriplet,
+                    shape = RoundedCornerShape(7.dp),
+                    color = AssetAmber.copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.65f)),
+                    modifier = Modifier
+                        .heightIn(min = 44.dp)
+                        .testTag("float_watcher_pin_xyz_button")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Bookmark,
+                            contentDescription = null,
+                            tint = AssetAmber,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = stringResource(R.string.wasm_float_pin_top),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = AssetAmber
+                        )
+                    }
+                }
+
+                if (floatState.isLiveWatching) {
+                    Surface(
+                        onClick = onStopWatch,
+                        shape = RoundedCornerShape(7.dp),
+                        color = ObsidianBg,
+                        border = BorderStroke(1.dp, ObsidianBorder),
+                        modifier = Modifier
+                            .heightIn(min = 44.dp)
+                            .testTag("float_watcher_stop_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Stop,
+                                contentDescription = stringResource(R.string.wasm_float_stop_watch),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = stringResource(R.string.wasm_float_stop_watch),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Expandable non-nested inline list of candidate offsets
             AnimatedVisibility(
                 visible = floatState.isWatcherExpanded,
                 enter = expandVertically() + fadeIn(),
                 exit = shrinkVertically() + fadeOut()
             ) {
-                Column(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("float_watcher_candidate_list"),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
                     HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.7f), thickness = 1.dp)
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 136.dp)
-                            .background(ObsidianBg)
-                            .testTag("float_watcher_candidate_list"),
-                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp)
-                    ) {
-                        val lockedSet = setOfNotNull(locked?.xIndex, locked?.yIndex, locked?.zIndex)
-                        items(floatState.candidates, key = { it.heapIndex }) { candidate ->
-                            FloatCandidateWatchRow(
-                                candidate = candidate,
-                                isLocked = lockedSet.contains(candidate.heapIndex),
-                                onLockAsAnchor = { onLockCoords(candidate.heapIndex) },
-                                onTogglePin = { onTogglePinCandidate(candidate.heapIndex) },
-                                onInspectNeighbors = { onInspectNeighbors(candidate.heapIndex) },
-                                onCopy = {
-                                    onCopyText(
-                                        "window.HEAPF32[${candidate.heapIndex}] (${DiagnosticsViewModel.formatHexAddress(candidate.byteAddress)}) cur=${fmtDec(candidate.currentValue)} base=${fmtDec(candidate.baselineValue)}"
-                                    )
-                                }
-                            )
-                        }
+                    val lockedSet = setOfNotNull(locked?.xIndex, locked?.yIndex, locked?.zIndex)
+                    floatState.candidates.take(24).forEach { candidate ->
+                        FloatCandidateWatchRow(
+                            candidate = candidate,
+                            isLocked = lockedSet.contains(candidate.heapIndex),
+                            onLockAsAnchor = { onLockCoords(candidate.heapIndex) },
+                            onTogglePin = { onTogglePinCandidate(candidate.heapIndex) },
+                            onInspectNeighbors = { onInspectNeighbors(candidate.heapIndex) },
+                            onCopy = {
+                                onCopyText(
+                                    "window.HEAPF32[${candidate.heapIndex}] (${DiagnosticsViewModel.formatHexAddress(candidate.byteAddress)}) cur=${fmtDec(candidate.currentValue)} base=${fmtDec(candidate.baselineValue)}"
+                                )
+                            }
+                        )
                     }
                 }
             }
@@ -1576,21 +1585,23 @@ private fun FloatCandidateWatchRow(
             // Inspect ±16B neighbors around this float
             Surface(
                 onClick = onInspectNeighbors,
-                shape = RoundedCornerShape(5.dp),
+                shape = RoundedCornerShape(6.dp),
                 color = TelemetryViolet.copy(alpha = 0.16f),
                 border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.55f)),
-                modifier = Modifier.testTag("float_inspect_neighbors_${candidate.heapIndex}")
+                modifier = Modifier
+                    .heightIn(min = 40.dp)
+                    .testTag("float_inspect_neighbors_${candidate.heapIndex}")
             ) {
                 Row(
-                    modifier = Modifier.padding(horizontal = 5.dp, vertical = 4.dp),
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(2.dp)
+                    horizontalArrangement = Arrangement.spacedBy(3.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.Memory,
                         contentDescription = stringResource(R.string.cd_inspect_float_neighbors),
                         tint = TelemetryViolet,
-                        modifier = Modifier.size(12.dp)
+                        modifier = Modifier.size(13.dp)
                     )
                     Text(
                         text = "±16B",
@@ -1598,7 +1609,7 @@ private fun FloatCandidateWatchRow(
                         fontFamily = JetBrainsMonoFontFamily,
                         fontWeight = FontWeight.Bold,
                         color = TelemetryViolet,
-                        fontSize = 8.sp
+                        fontSize = 9.sp
                     )
                 }
             }
@@ -1607,14 +1618,14 @@ private fun FloatCandidateWatchRow(
             IconButton(
                 onClick = onLockAsAnchor,
                 modifier = Modifier
-                    .size(30.dp)
+                    .size(40.dp)
                     .testTag("float_lock_button_${candidate.heapIndex}")
             ) {
                 Icon(
                     imageVector = Icons.Default.Lock,
                     contentDescription = stringResource(R.string.cd_lock_float_candidate),
                     tint = if (isLocked) AssetAmber else ElectricCyan,
-                    modifier = Modifier.size(15.dp)
+                    modifier = Modifier.size(17.dp)
                 )
             }
 
@@ -1622,14 +1633,14 @@ private fun FloatCandidateWatchRow(
             IconButton(
                 onClick = onTogglePin,
                 modifier = Modifier
-                    .size(30.dp)
+                    .size(40.dp)
                     .testTag("float_pin_button_${candidate.heapIndex}")
             ) {
                 Icon(
                     imageVector = if (candidate.isPinned) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
                     contentDescription = stringResource(R.string.cd_pin_float_candidate),
                     tint = if (candidate.isPinned) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(16.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
         }

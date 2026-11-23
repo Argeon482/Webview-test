@@ -27,7 +27,8 @@ class TelemetryBridge(
     private val onWasmNeighborsUpdated: (jsonPayload: String) -> Unit = {},
     private val onWasmFloatCandidatesUpdated: (jsonPayload: String) -> Unit = {},
     private val onWasmPointersUpdated: (jsonPayload: String) -> Unit = {},
-    private val onWasmEntitiesUpdated: (jsonPayload: String) -> Unit = {}
+    private val onWasmEntitiesUpdated: (jsonPayload: String) -> Unit = {},
+    private val onWasmTargetUpdated: (jsonPayload: String) -> Unit = {}
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exportArmed = AtomicBoolean(false)
@@ -38,6 +39,7 @@ class TelemetryBridge(
     private val lastWasmFloatMs = AtomicLong(0L)
     private val lastWasmPointerMs = AtomicLong(0L)
     private val lastWasmEntityMs = AtomicLong(0L)
+    private val lastWasmTargetMs = AtomicLong(0L)
 
     fun armExport() {
         exportArmed.set(true)
@@ -184,6 +186,22 @@ class TelemetryBridge(
         val safeJson = sanitizePayload(jsonPayload, MAX_LOG_PAYLOAD_CHARS)
         mainHandler.post {
             onWasmEntitiesUpdated(safeJson)
+        }
+    }
+
+    /**
+     * Receives live 200 ms read-only Selected Target pointer & decoded mob stats snapshots.
+     */
+    @JavascriptInterface
+    fun updateWasmTarget(jsonPayload: String) {
+        val now = System.currentTimeMillis()
+        val prev = lastWasmTargetMs.get()
+        if (now - prev < MIN_WASM_TICK_INTERVAL_MS) return
+        if (!lastWasmTargetMs.compareAndSet(prev, now)) return
+
+        val safeJson = sanitizePayload(jsonPayload, MAX_WASM_TICK_PAYLOAD_CHARS)
+        mainHandler.post {
+            onWasmTargetUpdated(safeJson)
         }
     }
 

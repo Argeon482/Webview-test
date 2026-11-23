@@ -87,7 +87,9 @@ import com.example.ProberSubTab
 import com.example.R
 import com.example.SavedSiteProfile
 import com.example.Step2ScanMode
+import com.example.TargetScanFilterMode
 import com.example.WasmStructFieldKind
+import com.example.WasmStructProbeAnchor
 import com.example.WasmStructProbeCandidate
 import com.example.WizardStepBadge
 import com.example.ui.theme.AlertCoral
@@ -164,11 +166,22 @@ fun TelemetryConsolePanel(
     onPruneWasmPointers: () -> Unit,
     onTogglePinPointerChain: (String) -> Unit,
     onToggleWasmEntitiesLive: () -> Unit,
+    onToggleTrackEntity: (String) -> Unit,
+    onClearTrackedEntity: () -> Unit,
+    onCaptureSelectedTarget: () -> Unit,
+    onFilterSelectedTarget: (TargetScanFilterMode) -> Unit,
+    onLockSelectedTargetSlot: (Long) -> Unit,
+    onStopSelectedTargetWatch: () -> Unit,
+    onResetSelectedTargetScan: () -> Unit,
+    onProbeSelectedTargetField: (WasmStructFieldKind) -> Unit,
+    onAssignSelectedTargetToEntities: () -> Unit,
+    onSelectStructProbeAnchor: (WasmStructProbeAnchor) -> Unit,
     onSelectStructProbeField: (WasmStructFieldKind) -> Unit,
     onStructProbeInputChanged: (String) -> Unit,
     onRunStructProbe: () -> Unit,
     onRunStructRefine: () -> Unit,
     onRunAutoProbeNames: () -> Unit,
+    onRunAggroStructProbe: (isAggroedNow: Boolean, refineExisting: Boolean) -> Unit,
     onBindStructCandidate: (WasmStructProbeCandidate) -> Unit,
     onClearBoundStructField: (WasmStructFieldKind) -> Unit,
     onClearAllBoundStructFields: () -> Unit,
@@ -268,10 +281,16 @@ fun TelemetryConsolePanel(
                             state = state,
                             onRescanEntities = onRunStep3,
                             onToggleLiveEntities = onToggleWasmEntitiesLive,
+                            onOpenTargetFinder = {
+                                onSelectProberSubTab(ProberSubTab.TARGET_FINDER)
+                                onSelectConsoleTab(ConsoleTab.PROBER)
+                            },
                             onOpenProber = {
                                 onSelectProberSubTab(ProberSubTab.STRUCT_PROBER)
                                 onSelectConsoleTab(ConsoleTab.PROBER)
                             },
+                            onToggleTrackEntity = onToggleTrackEntity,
+                            onClearTrackedEntity = onClearTrackedEntity,
                             onPinPath = { path, detail -> onPinExternalPath(path, "Step 3", detail) },
                             onCopyPayload = onCopyPayload,
                             modifier = Modifier
@@ -284,11 +303,20 @@ fun TelemetryConsolePanel(
                         ProberTabContainer(
                             state = state,
                             onSelectSubTab = onSelectProberSubTab,
+                            onCaptureSelectedTarget = onCaptureSelectedTarget,
+                            onFilterSelectedTarget = onFilterSelectedTarget,
+                            onLockSelectedTargetSlot = onLockSelectedTargetSlot,
+                            onStopSelectedTargetWatch = onStopSelectedTargetWatch,
+                            onResetSelectedTargetScan = onResetSelectedTargetScan,
+                            onProbeSelectedTargetField = onProbeSelectedTargetField,
+                            onAssignSelectedTargetToEntities = onAssignSelectedTargetToEntities,
+                            onSelectStructProbeAnchor = onSelectStructProbeAnchor,
                             onSelectStructProbeField = onSelectStructProbeField,
                             onStructProbeInputChanged = onStructProbeInputChanged,
                             onRunStructProbe = onRunStructProbe,
                             onRunStructRefine = onRunStructRefine,
                             onRunAutoProbeNames = onRunAutoProbeNames,
+                            onRunAggroStructProbe = onRunAggroStructProbe,
                             onBindStructCandidate = onBindStructCandidate,
                             onClearBoundStructField = onClearBoundStructField,
                             onClearAllBoundStructFields = onClearAllBoundStructFields,
@@ -556,6 +584,9 @@ private fun FourTabHeaderBar(
 
             if (state.wasmFloatDelta.isWatchingPointers) {
                 StatusMicroBadge(text = "PTR 200ms", accent = TelemetryViolet)
+            }
+            if (state.targetScanner.isWatchingTarget) {
+                StatusMicroBadge(text = "TGT 200ms", accent = AssetAmber)
             }
             if (state.wasmFloatDelta.isLiveWatching) {
                 StatusMicroBadge(text = "FLOAT 200ms", accent = SignalEmerald)
@@ -1002,17 +1033,27 @@ private fun CoordsSingleScrollTab(
 
 /**
  * TAB 3 — Prober (Dedicated Full-Height Workspace):
- * 2-mode segmented toggle between Entity Struct Prober (HP/MP/FP/Names) and Full-Heap Value Tracker.
+ * 3-mode segmented toggle between Selected Target Finder, Entity Struct Prober (HP/MP/FP/Name/Aggro),
+ * and Full-Heap Value Tracker.
  */
 @Composable
 private fun ProberTabContainer(
     state: DiagnosticsUiState,
     onSelectSubTab: (ProberSubTab) -> Unit,
+    onCaptureSelectedTarget: () -> Unit,
+    onFilterSelectedTarget: (TargetScanFilterMode) -> Unit,
+    onLockSelectedTargetSlot: (Long) -> Unit,
+    onStopSelectedTargetWatch: () -> Unit,
+    onResetSelectedTargetScan: () -> Unit,
+    onProbeSelectedTargetField: (WasmStructFieldKind) -> Unit,
+    onAssignSelectedTargetToEntities: () -> Unit,
+    onSelectStructProbeAnchor: (WasmStructProbeAnchor) -> Unit,
     onSelectStructProbeField: (WasmStructFieldKind) -> Unit,
     onStructProbeInputChanged: (String) -> Unit,
     onRunStructProbe: () -> Unit,
     onRunStructRefine: () -> Unit,
     onRunAutoProbeNames: () -> Unit,
+    onRunAggroStructProbe: (isAggroedNow: Boolean, refineExisting: Boolean) -> Unit,
     onBindStructCandidate: (WasmStructProbeCandidate) -> Unit,
     onClearBoundStructField: (WasmStructFieldKind) -> Unit,
     onClearAllBoundStructFields: () -> Unit,
@@ -1037,6 +1078,21 @@ private fun ProberTabContainer(
             horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            val targetLabel = if (state.targetScanner.liveTarget?.hasTarget == true) {
+                "${stringResource(R.string.subtab_target_finder)} •"
+            } else if (state.targetScanner.totalCandidates > 0) {
+                "${stringResource(R.string.subtab_target_finder)} (${state.targetScanner.totalCandidates})"
+            } else {
+                stringResource(R.string.subtab_target_finder)
+            }
+            ConsoleSubTabSegmentPill(
+                label = targetLabel,
+                selected = state.activeProberSubTab == ProberSubTab.TARGET_FINDER,
+                accent = AssetAmber,
+                testTag = "prober_subtab_target",
+                onClick = { onSelectSubTab(ProberSubTab.TARGET_FINDER) },
+                modifier = Modifier.weight(1f)
+            )
             ConsoleSubTabSegmentPill(
                 label = stringResource(R.string.subtab_struct_prober),
                 selected = state.activeProberSubTab == ProberSubTab.STRUCT_PROBER,
@@ -1062,20 +1118,49 @@ private fun ProberTabContainer(
         HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
         when (state.activeProberSubTab) {
+            ProberSubTab.TARGET_FINDER -> {
+                TargetScannerWorkspace(
+                    targetState = state.targetScanner,
+                    onCaptureMobA = onCaptureSelectedTarget,
+                    onFilterTarget = onFilterSelectedTarget,
+                    onLockTargetSlot = onLockSelectedTargetSlot,
+                    onStopTargetWatch = onStopSelectedTargetWatch,
+                    onResetTargetScan = onResetSelectedTargetScan,
+                    onProbeTargetField = onProbeSelectedTargetField,
+                    onAssignTargetToEntities = onAssignSelectedTargetToEntities,
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                )
+            }
+
             ProberSubTab.STRUCT_PROBER -> {
+                val liveTarget = state.targetScanner.liveTarget
+                val hasSelectedTargetAnchor =
+                    liveTarget != null && liveTarget.hasTarget && liveTarget.effectiveAnchorAddress > 0L
+                val selectedTargetLabel = liveTarget?.takeIf { it.hasTarget }?.let { t ->
+                    t.resolvedName?.takeIf { it.isNotBlank() }
+                        ?: t.matchedEntityId?.takeIf { it.isNotBlank() }
+                        ?: "0x${t.effectiveAnchorAddress.toString(16).uppercase().padStart(8, '0')}"
+                }
                 StructProberWorkspace(
                     prober = state.structProber,
                     hasPlayerAnchor = state.hasLiveWasmPlayerAnchor,
+                    hasSelectedTargetAnchor = hasSelectedTargetAnchor,
+                    selectedTargetLabel = selectedTargetLabel,
                     trackedMobCount = state.discoveredEntities.size,
+                    onSelectAnchor = onSelectStructProbeAnchor,
                     onSelectField = onSelectStructProbeField,
                     onInputChanged = onStructProbeInputChanged,
                     onRunProbe = onRunStructProbe,
                     onRunRefine = onRunStructRefine,
                     onRunAutoProbeNames = onRunAutoProbeNames,
+                    onRunAggroProbe = onRunAggroStructProbe,
                     onBindCandidate = onBindStructCandidate,
                     onClearField = onClearBoundStructField,
                     onClearAllFields = onClearAllBoundStructFields,
                     onGoToCoords = onGoToCoords,
+                    onGoToTargetFinder = { onSelectSubTab(ProberSubTab.TARGET_FINDER) },
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()

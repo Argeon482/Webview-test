@@ -154,6 +154,9 @@ fun DiagnosticsScreen(
             },
             onWasmEntitiesUpdated = { jsonPayload ->
                 viewModel.onWasmEntitiesUpdatedFromBridge(jsonPayload)
+            },
+            onWasmTargetUpdated = { jsonPayload ->
+                viewModel.onWasmTargetUpdatedFromBridge(jsonPayload)
             }
         )
     }
@@ -573,6 +576,16 @@ private fun WiredTelemetryConsolePanel(
         onPruneWasmPointers = viewModel::onPruneZeroAndStalePointers,
         onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
         onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
+        onToggleTrackEntity = viewModel::onToggleTrackEntityForLocationVerify,
+        onClearTrackedEntity = viewModel::onClearTrackedEntity,
+        onCaptureSelectedTarget = viewModel::onCaptureSelectedTarget,
+        onFilterSelectedTarget = viewModel::onFilterSelectedTarget,
+        onLockSelectedTargetSlot = viewModel::onLockSelectedTargetSlot,
+        onStopSelectedTargetWatch = viewModel::onStopSelectedTargetWatch,
+        onResetSelectedTargetScan = viewModel::onResetSelectedTargetScan,
+        onProbeSelectedTargetField = viewModel::onProbeSelectedTargetInStructProber,
+        onAssignSelectedTargetToEntities = viewModel::onAssignSelectedTargetToEntityList,
+        onSelectStructProbeAnchor = viewModel::onSelectStructProbeAnchor,
         onSelectStructProbeField = viewModel::onSelectStructProbeField,
         onStructProbeInputChanged = viewModel::onStructProbeInputChanged,
         onRunStructProbe = {
@@ -586,6 +599,10 @@ private fun WiredTelemetryConsolePanel(
         onRunAutoProbeNames = {
             onClearFocus()
             viewModel.runAutoProbeEntityNames()
+        },
+        onRunAggroStructProbe = { isAggroedNow, refineExisting ->
+            onClearFocus()
+            viewModel.runAggroStructProbe(isAggroedNow = isAggroedNow, refineExisting = refineExisting)
         },
         onBindStructCandidate = { cand -> viewModel.onBindStructFieldCandidate(cand) },
         onClearBoundStructField = viewModel::onClearBoundStructField,

@@ -786,7 +786,301 @@ class DiagnosticsViewModel : ViewModel() {
         }
     }
 
-    // Read-Only WASM Entity Struct Field Prober (Player & Mob HP / MP / FP + Mob/Player Names)
+    fun onToggleTrackEntityForLocationVerify(entityKey: String) {
+        _uiState.update { state ->
+            val nextKey = if (state.trackedEntityKey == entityKey) null else entityKey
+            state.copy(trackedEntityKey = nextKey)
+        }
+    }
+
+    fun onClearTrackedEntity() {
+        _uiState.update { it.copy(trackedEntityKey = null) }
+    }
+
+    // Read-Only Selected Target Differential Scanner (Mob A -> Diff Mob / Same Mob / Deselected 0 / Same-Type)
+    fun onCaptureSelectedTarget() {
+        val playerAddr = resolveActivePlayerCoordByteAddress(_uiState.value)
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Target Finder: capturing candidate pointer slots…",
+                targetScanner = state.targetScanner.copy(
+                    isScanning = true,
+                    statusMessage = "Capturing Mob A candidate pointer & ID slots in HEAPU32…"
+                )
+            )
+        }
+        _effects.tryEmit(
+            DiagnosticsEffect.EvaluateJs(
+                WasmSelectedTargetScripts.buildCaptureSelectedTargetScript(playerByteAddress = playerAddr)
+            )
+        )
+    }
+
+    fun onFilterSelectedTarget(mode: TargetScanFilterMode) {
+        val state = _uiState.value
+        if (state.targetScanner.scanRound <= 0) {
+            val msg = "Select Mob A in-game and tap '1. Scan Mob A' first."
+            _uiState.update { it.copy(targetScanner = it.targetScanner.copy(statusMessage = msg)) }
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        val playerAddr = resolveActivePlayerCoordByteAddress(state)
+        _uiState.update { current ->
+            current.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Target Finder: filtering (${mode.label})…",
+                targetScanner = current.targetScanner.copy(
+                    isScanning = true,
+                    statusMessage = "Filtering ${current.targetScanner.totalCandidates} slot(s) for ${mode.label}…"
+                )
+            )
+        }
+        _effects.tryEmit(
+            DiagnosticsEffect.EvaluateJs(
+                WasmSelectedTargetScripts.buildFilterSelectedTargetScript(
+                    mode = mode,
+                    playerByteAddress = playerAddr
+                )
+            )
+        )
+    }
+
+    fun onLockSelectedTargetSlot(slotByteAddress: Long) {
+        if (slotByteAddress <= 0L) return
+        val playerAddr = resolveActivePlayerCoordByteAddress(_uiState.value)
+        val slotHex = formatHexAddress(slotByteAddress)
+        _uiState.update { state ->
+            state.copy(
+                targetScanner = state.targetScanner.copy(
+                    lockedSlotAddress = slotByteAddress,
+                    isWatchingTarget = true,
+                    statusMessage = "Watching selected target slot $slotHex live (200ms read-only)…"
+                )
+            )
+        }
+        _effects.tryEmit(
+            DiagnosticsEffect.EvaluateJs(
+                WasmSelectedTargetScripts.buildLockTargetSlotScript(
+                    slotByteAddress = slotByteAddress,
+                    playerByteAddress = playerAddr
+                )
+            )
+        )
+        appendLog(
+            LogCategory.WASM,
+            "Locked Selected Target slot $slotHex (200ms read-only watch)",
+            "Slot byte address=$slotByteAddress"
+        )
+    }
+
+    fun onStopSelectedTargetWatch() {
+        _uiState.update { state ->
+            state.copy(
+                targetScanner = state.targetScanner.copy(
+                    isWatchingTarget = false,
+                    statusMessage = "Selected target live watch paused."
+                )
+            )
+        }
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmSelectedTargetScripts.buildStopTargetWatchScript()))
+    }
+
+    fun onResetSelectedTargetScan() {
+        _uiState.update { state ->
+            state.copy(
+                targetScanner = WasmTargetScannerState(
+                    statusMessage = "Target Finder reset. Select Mob A in-game and tap '1. Scan Mob A'."
+                ),
+                discoveredEntities = state.discoveredEntities.map { it.copy(isActiveGameTarget = false) }
+            )
+        }
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmSelectedTargetScripts.buildResetTargetScanScript()))
+    }
+
+    fun onWasmTargetUpdatedFromBridge(jsonPayload: String) {
+        val json = try {
+            JSONObject(jsonPayload)
+        } catch (_: Exception) {
+            return
+        }
+        if (json.optString("stage", "") != "WASM_TARGET_WATCH_TICK") return
+
+        fun optNullableInt(key: String): Int? =
+            if (json.has(key) && !json.isNull(key)) json.optInt(key) else null
+        fun optNullableDouble(key: String): Double? =
+            if (json.has(key) && !json.isNull(key)) json.optDouble(key).takeIf { it.isFinite() } else null
+        fun optNullableBool(key: String): Boolean? =
+            if (json.has(key) && !json.isNull(key)) json.optBoolean(key) else null
+        fun optNullableString(key: String): String? =
+            if (json.has(key) && !json.isNull(key)) json.optString(key, "").takeIf { it.isNotBlank() } else null
+
+        val snap = LiveSelectedTargetSnapshot(
+            slotByteAddress = json.optLong("slotByteAddress", 0L),
+            slotHex = json.optString("slotHex", formatHexAddress(json.optLong("slotByteAddress", 0L))),
+            targetStructAddress = json.optLong("targetStructAddress", 0L),
+            targetCoordAddress = json.optLong("targetCoordAddress", 0L),
+            hasTarget = json.optBoolean("hasTarget", false),
+            matchedEntityId = optNullableString("matchedEntityId"),
+            resolvedName = optNullableString("resolvedName"),
+            hp = optNullableInt("hp"),
+            maxHp = optNullableInt("maxHp"),
+            aggroRawValue = optNullableInt("aggroRawValue"),
+            isAggro = optNullableBool("isAggro"),
+            worldX = optNullableDouble("worldX"),
+            worldY = optNullableDouble("worldY"),
+            worldZ = optNullableDouble("worldZ"),
+            distanceToPlayer = optNullableDouble("distanceToPlayer"),
+            tickCount = json.optInt("tick", 1)
+        )
+
+        _uiState.update { state ->
+            val updatedEntities = state.discoveredEntities.map { ent ->
+                val matchesTarget = snap.hasTarget && (
+                    (snap.targetCoordAddress > 0L && ent.coordByteAddress > 0L && kotlin.math.abs(ent.coordByteAddress - snap.targetCoordAddress) <= 64L) ||
+                        (snap.matchedEntityId != null && ent.id == snap.matchedEntityId)
+                    )
+                if (matchesTarget) {
+                    ent.copy(
+                        isActiveGameTarget = true,
+                        resolvedName = snap.resolvedName ?: ent.resolvedName,
+                        hp = snap.hp ?: ent.hp,
+                        maxHp = snap.maxHp ?: ent.maxHp,
+                        aggroRawValue = snap.aggroRawValue ?: ent.aggroRawValue,
+                        isAggro = snap.isAggro ?: ent.isAggro
+                    )
+                } else if (ent.isActiveGameTarget) {
+                    ent.copy(isActiveGameTarget = false)
+                } else {
+                    ent
+                }
+            }
+            state.copy(
+                discoveredEntities = updatedEntities,
+                targetScanner = state.targetScanner.copy(
+                    isWatchingTarget = true,
+                    lockedSlotAddress = snap.slotByteAddress.takeIf { it > 0L } ?: state.targetScanner.lockedSlotAddress,
+                    liveTarget = snap
+                )
+            )
+        }
+    }
+
+    fun onProbeSelectedTargetInStructProber(field: WasmStructFieldKind) {
+        _uiState.update { state ->
+            state.copy(
+                activeConsoleTab = ConsoleTab.PROBER,
+                activeProberSubTab = ProberSubTab.STRUCT_PROBER,
+                structProber = state.structProber.copy(
+                    probeAnchor = WasmStructProbeAnchor.SELECTED_TARGET,
+                    activeField = field,
+                    candidates = emptyList(),
+                    probeRound = 0,
+                    statusMessage = "Anchored to Selected Target mob — probe ${field.shortLabel} read-only."
+                )
+            )
+        }
+    }
+
+    /**
+     * Strictly read-only: links/assigns the currently locked Selected Target's decoded Name, HP,
+     * Aggro status, and world position onto the matching entry in the Entities list (or adds it
+     * to the Entities list & read-only JS tracker if it wasn't scanned yet).
+     */
+    fun onAssignSelectedTargetToEntityList() {
+        val state = _uiState.value
+        val target = state.targetScanner.liveTarget
+        if (target == null || !target.hasTarget) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Select a mob in-game with a locked Target slot first."))
+            return
+        }
+
+        val coordAddr = target.effectiveAnchorAddress
+        val hexStruct = formatHexAddress(target.targetStructAddress.takeIf { it > 0L } ?: coordAddr)
+        val hexCoord = formatHexAddress(coordAddr)
+        val targetPath = "HEAPF32[${(coordAddr / 4L).toInt()}] @ $hexCoord"
+        val targetName = target.resolvedName ?: "Targeted Mob ($hexStruct)"
+
+        var assignedSelectionKey: String? = null
+        _uiState.update { current ->
+            val existingIdx = current.discoveredEntities.indexOfFirst { ent ->
+                (coordAddr > 0L && ent.coordByteAddress > 0L && kotlin.math.abs(ent.coordByteAddress - coordAddr) <= 64L) ||
+                    (target.matchedEntityId != null && ent.id == target.matchedEntityId)
+            }
+
+            val updatedList = if (existingIdx >= 0) {
+                current.discoveredEntities.mapIndexed { idx, ent ->
+                    if (idx == existingIdx) {
+                        val merged = ent.copy(
+                            resolvedName = target.resolvedName ?: ent.resolvedName,
+                            hp = target.hp ?: ent.hp,
+                            maxHp = target.maxHp ?: ent.maxHp,
+                            aggroRawValue = target.aggroRawValue ?: ent.aggroRawValue,
+                            isAggro = target.isAggro ?: ent.isAggro,
+                            worldX = target.worldX ?: ent.worldX,
+                            worldY = target.worldY ?: ent.worldY,
+                            worldZ = target.worldZ ?: ent.worldZ,
+                            distanceToPlayer = target.distanceToPlayer ?: ent.distanceToPlayer,
+                            isActiveGameTarget = true
+                        )
+                        assignedSelectionKey = merged.selectionKey
+                        merged
+                    } else {
+                        ent.copy(isActiveGameTarget = false)
+                    }
+                }
+            } else {
+                val created = DiscoveredEntitySample(
+                    name = targetName,
+                    id = target.matchedEntityId ?: hexStruct,
+                    path = targetPath,
+                    worldX = target.worldX ?: 0.0,
+                    worldY = target.worldY ?: 0.0,
+                    worldZ = target.worldZ ?: 0.0,
+                    distanceToPlayer = target.distanceToPlayer ?: 0.0,
+                    screenX = 0.0,
+                    screenY = 0.0,
+                    inViewport = true,
+                    sampleKeys = listOf("WASM_STRUCT", "struct=$hexStruct", "SELECTED_TARGET"),
+                    coordByteAddress = coordAddr,
+                    heapIndex = (coordAddr / 4L).toInt(),
+                    resolvedName = target.resolvedName,
+                    hp = target.hp,
+                    maxHp = target.maxHp,
+                    aggroRawValue = target.aggroRawValue,
+                    isAggro = target.isAggro,
+                    isActiveGameTarget = true
+                )
+                assignedSelectionKey = created.selectionKey
+                listOf(created) + current.discoveredEntities.map { it.copy(isActiveGameTarget = false) }
+            }
+
+            current.copy(
+                discoveredEntities = updatedList,
+                lastEntityCount = updatedList.size,
+                trackedEntityKey = assignedSelectionKey,
+                activeConsoleTab = ConsoleTab.ENTITIES,
+                discoveredEntityArrayPath = current.discoveredEntityArrayPath ?: "WASM Selected Target + Nearby Entities"
+            )
+        }
+
+        if (coordAddr > 0L) {
+            _effects.tryEmit(
+                DiagnosticsEffect.EvaluateJs(
+                    WasmSelectedTargetScripts.buildRegisterTargetInTrackedEntitiesScript(
+                        coordByteAddress = coordAddr,
+                        structByteAddress = target.targetStructAddress,
+                        label = targetName
+                    )
+                )
+            )
+        }
+        val msg = "Assigned $targetName to Entity List (read-only location tracker active)."
+        _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+        appendLog(LogCategory.ENTITY, msg, "coord=$hexCoord struct=$hexStruct hp=${target.hp} aggro=${target.isAggro}")
+    }
+
+    // Read-Only WASM Entity Struct Field Prober (Player & Mob HP / MP / FP / Name / Aggro)
     fun onToggleStructProberExpanded() {
         _uiState.update { state ->
             state.copy(
@@ -797,11 +1091,31 @@ class DiagnosticsViewModel : ViewModel() {
         }
     }
 
-    fun onSelectStructProbeField(field: WasmStructFieldKind) {
+    fun onSelectStructProbeAnchor(anchor: WasmStructProbeAnchor) {
         _uiState.update { state ->
-            val switchedCategory = state.structProber.activeField.isNameField != field.isNameField
             state.copy(
                 structProber = state.structProber.copy(
+                    probeAnchor = anchor,
+                    candidates = emptyList(),
+                    probeRound = 0,
+                    statusMessage = ""
+                )
+            )
+        }
+    }
+
+    fun onSelectStructProbeField(field: WasmStructFieldKind) {
+        _uiState.update { state ->
+            val switchedCategory = state.structProber.activeField.isNameField != field.isNameField ||
+                state.structProber.activeField.isAggroField != field.isAggroField
+            val nextAnchor = if (field.isAggroField && state.targetScanner.liveTarget?.hasTarget == true) {
+                WasmStructProbeAnchor.SELECTED_TARGET
+            } else {
+                state.structProber.probeAnchor
+            }
+            state.copy(
+                structProber = state.structProber.copy(
+                    probeAnchor = nextAnchor,
                     activeField = field,
                     queryInput = if (switchedCategory) "" else state.structProber.queryInput,
                     candidates = if (state.structProber.activeField != field) emptyList() else state.structProber.candidates,
@@ -838,19 +1152,95 @@ class DiagnosticsViewModel : ViewModel() {
         return fd.lockedCoords?.xByteAddress ?: 0L
     }
 
+    private fun resolveActiveStructProbeAnchorAddress(state: DiagnosticsUiState): Pair<Long, Boolean> {
+        return if (state.structProber.probeAnchor == WasmStructProbeAnchor.SELECTED_TARGET) {
+            val targetAddr = state.targetScanner.liveTarget?.takeIf { it.hasTarget }?.effectiveAnchorAddress ?: 0L
+            targetAddr to true
+        } else {
+            resolveActivePlayerCoordByteAddress(state) to false
+        }
+    }
+
+    fun runAggroStructProbe(isAggroedNow: Boolean, refineExisting: Boolean = false) {
+        val state = _uiState.value
+        val prober = state.structProber
+        val targetAddr = state.targetScanner.liveTarget?.takeIf { it.hasTarget }?.effectiveAnchorAddress ?: 0L
+        val playerAddr = resolveActivePlayerCoordByteAddress(state)
+        if (targetAddr <= 0L) {
+            val msg = "Lock a Selected Target mob in Target Finder first so Aggro status can be probed."
+            _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+
+        val existingJson = if (refineExisting && prober.activeField == WasmStructFieldKind.AGGRO && prober.candidates.isNotEmpty()) {
+            val arr = JSONArray()
+            prober.candidates.forEach { c ->
+                arr.put(
+                    JSONObject()
+                        .put("relOffsetBytes", c.relOffsetBytes)
+                        .put("valueType", c.valueType.name)
+                )
+            }
+            arr.toString()
+        } else {
+            null
+        }
+
+        val stateLabel = if (isAggroedNow) "AGGROED (attacking)" else "PASSIVE (idle)"
+        _uiState.update { current ->
+            current.copy(
+                structProber = current.structProber.copy(
+                    probeAnchor = WasmStructProbeAnchor.SELECTED_TARGET,
+                    activeField = WasmStructFieldKind.AGGRO,
+                    isProbing = true,
+                    statusMessage = if (existingJson != null) {
+                        "Refining ${prober.candidates.size} Aggro candidate(s) while mob is $stateLabel…"
+                    } else {
+                        "Probing Selected Target (${formatHexAddress(targetAddr)}) while mob is $stateLabel…"
+                    }
+                )
+            )
+        }
+
+        _effects.tryEmit(
+            DiagnosticsEffect.EvaluateJs(
+                WasmStructProberScripts.buildProbeAggroOffsetsScript(
+                    targetAnchorByteAddress = targetAddr,
+                    playerByteAddress = playerAddr,
+                    isAggroedNow = isAggroedNow,
+                    existingCandidatesJson = existingJson
+                )
+            )
+        )
+    }
+
     fun runStructFieldProbe(refineExisting: Boolean = false) {
         val state = _uiState.value
         val prober = state.structProber
         val field = prober.activeField
-        val playerAddr = resolveActivePlayerCoordByteAddress(state)
+        val (anchorAddr, isTargetAnchor) = resolveActiveStructProbeAnchorAddress(state)
 
-        if (field.isNameField) {
-            runNameStructProbeInternal(playerAddr = playerAddr, query = prober.queryInput.trim())
+        if (field.isAggroField) {
+            runAggroStructProbe(isAggroedNow = true, refineExisting = refineExisting)
             return
         }
 
-        if (playerAddr <= 0L) {
-            val msg = "Lock coordinates or stream a verified live player pointer first."
+        if (field.isNameField) {
+            runNameStructProbeInternal(
+                anchorAddr = anchorAddr,
+                anchorIsTarget = isTargetAnchor,
+                query = prober.queryInput.trim()
+            )
+            return
+        }
+
+        if (anchorAddr <= 0L) {
+            val msg = if (isTargetAnchor) {
+                "Lock a Selected Target mob in Target Finder first."
+            } else {
+                "Lock coordinates or stream a verified live player pointer first."
+            }
             _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
             _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
             return
@@ -858,7 +1248,7 @@ class DiagnosticsViewModel : ViewModel() {
 
         val targetVal = prober.queryInput.trim().toDoubleOrNull()
         if (targetVal == null || !targetVal.isFinite()) {
-            val msg = "Enter your current ${field.shortLabel} value (e.g. 4338) first."
+            val msg = "Enter current ${field.shortLabel} value (e.g. 4338) first."
             _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
             _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
             return
@@ -878,6 +1268,7 @@ class DiagnosticsViewModel : ViewModel() {
             null
         }
 
+        val anchorLabel = if (isTargetAnchor) "selected mob" else "player"
         _uiState.update { current ->
             current.copy(
                 structProber = current.structProber.copy(
@@ -885,7 +1276,7 @@ class DiagnosticsViewModel : ViewModel() {
                     statusMessage = if (existingJson != null) {
                         "Refining ${prober.candidates.size} ${field.shortLabel} candidate(s) for $targetVal…"
                     } else {
-                        "Probing player struct around ${formatHexAddress(playerAddr)} for ${field.shortLabel}=$targetVal…"
+                        "Probing $anchorLabel struct around ${formatHexAddress(anchorAddr)} for ${field.shortLabel}=$targetVal…"
                     }
                 )
             )
@@ -895,9 +1286,10 @@ class DiagnosticsViewModel : ViewModel() {
             DiagnosticsEffect.EvaluateJs(
                 WasmStructProberScripts.buildProbeStatOffsetsScript(
                     fieldKind = field,
-                    playerByteAddress = playerAddr,
+                    playerByteAddress = anchorAddr,
                     targetValue = targetVal,
-                    existingCandidatesJson = existingJson
+                    existingCandidatesJson = existingJson,
+                    anchorIsTarget = isTargetAnchor
                 )
             )
         )
@@ -905,35 +1297,40 @@ class DiagnosticsViewModel : ViewModel() {
 
     fun runAutoProbeEntityNames() {
         val state = _uiState.value
-        val playerAddr = resolveActivePlayerCoordByteAddress(state)
+        val (anchorAddr, isTargetAnchor) = resolveActiveStructProbeAnchorAddress(state)
         _uiState.update { current ->
             current.copy(
                 structProber = current.structProber.copy(
                     activeField = WasmStructFieldKind.NAME,
                     isProbing = true,
-                    statusMessage = "Auto-probing inline UTF-8, char*, and std::string fields on player & nearby mobs…"
+                    statusMessage = "Auto-probing inline UTF-8, char*, and std::string fields…"
                 )
             )
         }
-        runNameStructProbeInternal(playerAddr = playerAddr, query = "")
+        runNameStructProbeInternal(anchorAddr = anchorAddr, anchorIsTarget = isTargetAnchor, query = "")
     }
 
-    private fun runNameStructProbeInternal(playerAddr: Long, query: String) {
-        if (playerAddr <= 0L && _uiState.value.discoveredEntities.isEmpty()) {
-            val msg = "Activate a live player pointer or scan nearby entities first."
+    private fun runNameStructProbeInternal(
+        anchorAddr: Long,
+        anchorIsTarget: Boolean,
+        query: String
+    ) {
+        if (anchorAddr <= 0L && _uiState.value.discoveredEntities.isEmpty()) {
+            val msg = "Activate a live player/target pointer or scan nearby entities first."
             _uiState.update { it.copy(structProber = it.structProber.copy(isProbing = false, statusMessage = msg)) }
             _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
             return
         }
+        val anchorLabel = if (anchorIsTarget) "selected mob & nearby mobs" else "player & nearby mobs"
         _uiState.update { current ->
             current.copy(
                 structProber = current.structProber.copy(
                     activeField = WasmStructFieldKind.NAME,
                     isProbing = true,
                     statusMessage = if (query.isNotBlank()) {
-                        "Searching player & mob structs for \"$query\"…"
+                        "Searching $anchorLabel for \"$query\"…"
                     } else {
-                        "Auto-probing inline UTF-8, char*, and std::string fields on player & nearby mobs…"
+                        "Auto-probing inline UTF-8, char*, and std::string fields on $anchorLabel…"
                     }
                 )
             )
@@ -941,8 +1338,9 @@ class DiagnosticsViewModel : ViewModel() {
         _effects.tryEmit(
             DiagnosticsEffect.EvaluateJs(
                 WasmStructProberScripts.buildProbeNameOffsetsScript(
-                    playerByteAddress = playerAddr,
-                    nameQuery = query
+                    playerByteAddress = anchorAddr,
+                    nameQuery = query,
+                    anchorIsTarget = anchorIsTarget
                 )
             )
         )
@@ -1050,6 +1448,7 @@ class DiagnosticsViewModel : ViewModel() {
                     WasmStructFieldKind.FP -> pv.copy(fp = null, observedPeakFp = null)
                     WasmStructFieldKind.MAX_FP -> pv.copy(maxFp = null)
                     WasmStructFieldKind.NAME -> pv.copy(playerName = null)
+                    WasmStructFieldKind.AGGRO -> pv
                 }
                 if (cleared.hasAnyContent) cleared else null
             }
@@ -3027,6 +3426,54 @@ class DiagnosticsViewModel : ViewModel() {
                 }
             }
 
+            "WASM_TARGET_SCAN_RESULT" -> {
+                val errorMsg = json.optString("error", "")
+                if (errorMsg.isNotBlank()) {
+                    _uiState.update { state ->
+                        state.copy(
+                            scanStatus = AsyncScanStatus.ERROR,
+                            scanStatusDetail = errorMsg.take(60),
+                            targetScanner = state.targetScanner.copy(
+                                isScanning = false,
+                                statusMessage = errorMsg
+                            )
+                        )
+                    }
+                    _effects.tryEmit(DiagnosticsEffect.ShowToast(errorMsg))
+                    "Target Finder: $errorMsg"
+                } else {
+                    val action = json.optString("action", "SCAN")
+                    val round = json.optInt("round", 1)
+                    val durationMs = json.optDouble("durationMs", 0.0)
+                    val total = json.optInt("totalCandidates", 0)
+                    val parsed = parseSelectedTargetCandidates(json.optJSONArray("candidates"))
+                    val msg = when {
+                        action == "CAPTURE" ->
+                            "Captured $total candidate slots (${durationMs}ms). Now select a different mob, deselect, or stay on same mob and tap a filter button."
+                        total == 0 ->
+                            "0 slots survived $action (${durationMs}ms). Tap Reset and recapture while targeting Mob A."
+                        total <= 6 ->
+                            "Narrowed to $total slot(s) (${durationMs}ms)! Tap 'Watch Live' on the top candidate to verify as you switch mobs."
+                        else ->
+                            "$total slots left after $action (${durationMs}ms) — switch mobs or deselect and filter again."
+                    }
+                    _uiState.update { state ->
+                        state.copy(
+                            scanStatus = AsyncScanStatus.COMPLETED,
+                            scanStatusDetail = "Target Finder: $total left (${durationMs}ms)",
+                            targetScanner = state.targetScanner.copy(
+                                isScanning = false,
+                                scanRound = round,
+                                totalCandidates = total,
+                                candidates = parsed,
+                                statusMessage = msg
+                            )
+                        )
+                    }
+                    "Target Finder ($action, R$round, ${durationMs}ms): $total candidate(s)"
+                }
+            }
+
             "WASM_STRUCT_PROBE_RESULTS" -> {
                 val fieldKind = WasmStructFieldKind.fromRaw(json.optString("fieldKind", "HP"))
                 val isRefine = json.optBoolean("isRefine", false)
@@ -3049,10 +3496,14 @@ class DiagnosticsViewModel : ViewModel() {
                     val msg = when {
                         parsed.isEmpty() && fieldKind.isNameField ->
                             "0 name fields matched (${durationMs}ms). Try Auto-Probe without a filter or scan nearby entities first."
+                        parsed.isEmpty() && fieldKind.isAggroField ->
+                            "0 aggro flag/pointer offsets matched (${durationMs}ms). Ensure target mob is locked and try Passive -> Aggroed refine."
                         parsed.isEmpty() ->
                             "0 ${fieldKind.shortLabel} matches in struct window (${durationMs}ms). Verify exact stat value."
                         parsed.size == 1 ->
                             "Exact ${fieldKind.shortLabel} candidate isolated: ${parsed.first().expression} (${durationMs}ms) — tap Bind!"
+                        fieldKind.isAggroField ->
+                            "Found $totalFound Aggro offset(s) in ${durationMs}ms — switch mob between Passive & Aggroed and tap Refine, or Bind PLAYER_PTR."
                         fieldKind.isNameField ->
                             "Found $totalFound name offset(s) in ${durationMs}ms — check mob previews & tap Bind."
                         else ->
@@ -3567,6 +4018,7 @@ class DiagnosticsViewModel : ViewModel() {
                 val resolvedName = if (obj.has("resolvedName") && !obj.isNull("resolvedName")) {
                     obj.optString("resolvedName", "").takeIf { it.isNotBlank() }
                 } else null
+                val isAggro = if (obj.has("isAggro") && !obj.isNull("isAggro")) obj.optBoolean("isAggro") else null
                 add(
                     DiscoveredEntitySample(
                         name = obj.optString("name", "WASM Entity #${i + 1}"),
@@ -3588,7 +4040,48 @@ class DiagnosticsViewModel : ViewModel() {
                         mp = optNullableInt("mp"),
                         maxMp = optNullableInt("maxMp"),
                         fp = optNullableInt("fp"),
-                        maxFp = optNullableInt("maxFp")
+                        maxFp = optNullableInt("maxFp"),
+                        aggroRawValue = optNullableInt("aggroRawValue"),
+                        isAggro = isAggro,
+                        isActiveGameTarget = obj.optBoolean("isActiveGameTarget", false)
+                    )
+                )
+            }
+        }
+    }
+
+    private fun parseSelectedTargetCandidates(array: JSONArray?): List<SelectedTargetCandidate> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val slotAddr = obj.optLong("slotByteAddress", 0L)
+                if (slotAddr <= 0L) continue
+                fun optNullableInt(key: String): Int? =
+                    if (obj.has(key) && !obj.isNull(key)) obj.optInt(key) else null
+                fun optNullableDouble(key: String): Double? =
+                    if (obj.has(key) && !obj.isNull(key)) obj.optDouble(key).takeIf { it.isFinite() } else null
+                fun optNullableString(key: String): String? =
+                    if (obj.has(key) && !obj.isNull(key)) obj.optString(key, "").takeIf { it.isNotBlank() } else null
+
+                add(
+                    SelectedTargetCandidate(
+                        slotByteAddress = slotAddr,
+                        slotHex = obj.optString("slotHex", formatHexAddress(slotAddr)),
+                        currentValue = obj.optLong("currentValue", 0L),
+                        currentHex = obj.optString("currentHex", formatHexAddress(obj.optLong("currentValue", 0L))),
+                        isPointerLike = obj.optBoolean("isPointerLike", false),
+                        nearPlayerOffsetBytes = optNullableInt("nearPlayerOffsetBytes"),
+                        matchedEntityId = optNullableString("matchedEntityId"),
+                        matchedEntityName = optNullableString("matchedEntityName"),
+                        resolvedCoordAddress = obj.optLong("resolvedCoordAddress", 0L),
+                        resolvedX = optNullableDouble("resolvedX"),
+                        resolvedY = optNullableDouble("resolvedY"),
+                        resolvedZ = optNullableDouble("resolvedZ"),
+                        previewName = optNullableString("previewName"),
+                        previewHp = optNullableInt("previewHp"),
+                        previewMaxHp = optNullableInt("previewMaxHp"),
+                        previewAggroRaw = optNullableInt("previewAggroRaw")
                     )
                 )
             }

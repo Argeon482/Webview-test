@@ -56,6 +56,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
 import com.example.WasmStructFieldKind
+import com.example.WasmStructProbeAnchor
 import com.example.WasmStructProbeCandidate
 import com.example.WasmStructProberState
 import com.example.ui.theme.AlertCoral
@@ -70,13 +71,14 @@ import com.example.ui.theme.SignalEmerald
 import com.example.ui.theme.TelemetryViolet
 
 /**
- * Semantic accent color for each entity struct field (`HP`, `MP`, `FP`, `Name`).
+ * Semantic accent color for each entity struct field (`HP`, `MP`, `FP`, `Name`, `Aggro`).
  */
 fun structFieldAccent(kind: WasmStructFieldKind): Color = when (kind) {
     WasmStructFieldKind.HP, WasmStructFieldKind.MAX_HP -> AlertCoral
     WasmStructFieldKind.MP, WasmStructFieldKind.MAX_MP -> ElectricCyan
     WasmStructFieldKind.FP, WasmStructFieldKind.MAX_FP -> AssetAmber
     WasmStructFieldKind.NAME -> TelemetryViolet
+    WasmStructFieldKind.AGGRO -> AlertCoral
 }
 
 /**
@@ -159,21 +161,28 @@ fun VitalGaugePill(
 fun StructProberWorkspace(
     prober: WasmStructProberState,
     hasPlayerAnchor: Boolean,
+    hasSelectedTargetAnchor: Boolean,
+    selectedTargetLabel: String?,
     trackedMobCount: Int,
+    onSelectAnchor: (WasmStructProbeAnchor) -> Unit,
     onSelectField: (WasmStructFieldKind) -> Unit,
     onInputChanged: (String) -> Unit,
     onRunProbe: () -> Unit,
     onRunRefine: () -> Unit,
     onRunAutoProbeNames: () -> Unit,
+    onRunAggroProbe: (isAggroedNow: Boolean, refineExisting: Boolean) -> Unit,
     onBindCandidate: (WasmStructProbeCandidate) -> Unit,
     onClearField: (WasmStructFieldKind) -> Unit,
     onClearAllFields: () -> Unit,
     onGoToCoords: () -> Unit,
+    onGoToTargetFinder: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val activeField = prober.activeField
     val activeAccent = structFieldAccent(activeField)
     val schema = prober.schema
+    val isTargetAnchor = prober.probeAnchor == WasmStructProbeAnchor.SELECTED_TARGET
+    val activeAnchorReady = if (isTargetAnchor) hasSelectedTargetAnchor else hasPlayerAnchor
 
     Column(
         modifier = modifier
@@ -184,69 +193,91 @@ fun StructProberWorkspace(
             .testTag("struct_prober_panel"),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // 1. Live Anchor & Cross-Check Status Banner
+        // 1. Probe Anchor Switcher (Player Struct vs Selected Target Mob) + Status Banner
         Surface(
             shape = RoundedCornerShape(10.dp),
-            color = if (hasPlayerAnchor) SignalEmerald.copy(alpha = 0.10f) else AssetAmber.copy(alpha = 0.10f),
+            color = if (activeAnchorReady) SignalEmerald.copy(alpha = 0.10f) else AssetAmber.copy(alpha = 0.10f),
             border = BorderStroke(
                 1.dp,
-                if (hasPlayerAnchor) SignalEmerald.copy(alpha = 0.5f) else AssetAmber.copy(alpha = 0.55f)
+                if (activeAnchorReady) SignalEmerald.copy(alpha = 0.5f) else AssetAmber.copy(alpha = 0.55f)
             ),
             modifier = Modifier.fillMaxWidth()
         ) {
-            Row(
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(
-                    imageVector = if (hasPlayerAnchor) Icons.Default.Memory else Icons.Default.MyLocation,
-                    contentDescription = null,
-                    tint = if (hasPlayerAnchor) SignalEmerald else AssetAmber,
-                    modifier = Modifier.size(20.dp)
-                )
-                Column(
-                    modifier = Modifier.weight(1f),
-                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Text(
-                        text = if (hasPlayerAnchor) {
-                            "Player Anchor Live • $trackedMobCount Nearby Mobs"
-                        } else {
-                            "Waiting for Player Anchor"
-                        },
-                        style = MaterialTheme.typography.titleSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = if (hasPlayerAnchor) SignalEmerald else AssetAmber
+                    ConsoleSubTabSegmentPill(
+                        label = if (hasPlayerAnchor) "Player Struct ✓" else "Player Struct",
+                        selected = !isTargetAnchor,
+                        accent = SignalEmerald,
+                        testTag = "prober_anchor_player",
+                        onClick = { onSelectAnchor(WasmStructProbeAnchor.PLAYER) },
+                        modifier = Modifier.weight(1f)
                     )
-                    Text(
-                        text = if (hasPlayerAnchor) {
-                            "Read-only probing around your live player coordinate address (+1-hop sub-structs)."
+                    ConsoleSubTabSegmentPill(
+                        label = if (hasSelectedTargetAnchor) {
+                            "Target: ${selectedTargetLabel?.take(12) ?: "Mob ✓"}"
                         } else {
-                            stringResource(R.string.prober_no_anchor_banner)
+                            "Selected Target"
                         },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        selected = isTargetAnchor,
+                        accent = ElectricCyan,
+                        testTag = "prober_anchor_target",
+                        onClick = { onSelectAnchor(WasmStructProbeAnchor.SELECTED_TARGET) },
+                        modifier = Modifier.weight(1f)
                     )
                 }
-                if (!hasPlayerAnchor) {
-                    OutlinedButton(
-                        onClick = onGoToCoords,
-                        shape = RoundedCornerShape(8.dp),
-                        border = BorderStroke(1.dp, AssetAmber),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
-                        modifier = Modifier
-                            .heightIn(min = 44.dp)
-                            .testTag("prober_go_to_coords_button")
-                    ) {
-                        Text(
-                            text = stringResource(R.string.action_go_to_coords),
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = AssetAmber
-                        )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        imageVector = if (activeAnchorReady) Icons.Default.Memory else Icons.Default.MyLocation,
+                        contentDescription = null,
+                        tint = if (activeAnchorReady) SignalEmerald else AssetAmber,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = when {
+                            isTargetAnchor && hasSelectedTargetAnchor ->
+                                "Probing Selected Target mob struct • $trackedMobCount nearby mobs cross-checked."
+                            isTargetAnchor ->
+                                "No mob target locked yet. Isolate your Selected Target pointer in Target Finder first."
+                            hasPlayerAnchor ->
+                                "Probing live player struct (+1-hop sub-structs) • $trackedMobCount nearby mobs cross-checked."
+                            else ->
+                                stringResource(R.string.prober_no_anchor_banner)
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f)
+                    )
+                    if (!activeAnchorReady) {
+                        OutlinedButton(
+                            onClick = if (isTargetAnchor) onGoToTargetFinder else onGoToCoords,
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, AssetAmber),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            modifier = Modifier
+                                .heightIn(min = 44.dp)
+                                .testTag("prober_go_to_coords_button")
+                        ) {
+                            Text(
+                                text = if (isTargetAnchor) "Target Finder" else stringResource(R.string.action_go_to_coords),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = AssetAmber
+                            )
+                        }
                     }
                 }
             }
@@ -358,8 +389,11 @@ fun StructProberWorkspace(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = if (activeField.isNameField) "2. Discover Mob & Player Names"
-                    else "2. Probe ${activeField.shortLabel} Value",
+                    text = when {
+                        activeField.isAggroField -> "2. Probe Mob Aggro Status (Passive vs Aggroed)"
+                        activeField.isNameField -> "2. Discover Mob & Player Names"
+                        else -> "2. Probe ${activeField.shortLabel} Value"
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold,
                     color = activeAccent
@@ -367,187 +401,258 @@ fun StructProberWorkspace(
 
                 Text(
                     text = stringResource(
-                        if (activeField.isNameField) R.string.struct_prober_hint_name
-                        else R.string.struct_prober_hint_stat
+                        when {
+                            activeField.isAggroField -> R.string.struct_prober_hint_aggro
+                            activeField.isNameField -> R.string.struct_prober_hint_name
+                            else -> R.string.struct_prober_hint_stat
+                        }
                     ),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
-                // Dedicated full-width input row (never squeezed beside buttons)
-                OutlinedTextField(
-                    value = prober.queryInput,
-                    onValueChange = onInputChanged,
-                    singleLine = true,
-                    placeholder = {
-                        Text(
-                            text = stringResource(
-                                if (activeField.isNameField) R.string.struct_prober_name_placeholder
-                                else R.string.struct_prober_stat_placeholder
-                            ),
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontFamily = JetBrainsMonoFontFamily
-                        )
-                    },
-                    textStyle = MaterialTheme.typography.bodyMedium.copy(
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = MaterialTheme.colorScheme.onSurface
-                    ),
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = if (activeField.isNameField) KeyboardType.Text else KeyboardType.Number,
-                        imeAction = ImeAction.Search
-                    ),
-                    keyboardActions = KeyboardActions(
-                        onSearch = {
-                            if (activeField.isNameField && prober.queryInput.isBlank()) {
-                                onRunAutoProbeNames()
-                            } else {
-                                onRunProbe()
-                            }
-                        }
-                    ),
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = activeAccent,
-                        unfocusedBorderColor = ObsidianBorder,
-                        focusedContainerColor = ObsidianBg,
-                        unfocusedContainerColor = ObsidianBg
-                    ),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 52.dp)
-                        .testTag("struct_prober_input")
-                )
-
-                // Dedicated 48dp Action Button Row
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (activeField.isNameField) {
+                if (activeField.isAggroField) {
+                    val hasPriorAggro = prober.candidates.isNotEmpty()
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
                         Button(
-                            onClick = onRunAutoProbeNames,
-                            enabled = !prober.isProbing && (hasPlayerAnchor || trackedMobCount > 0),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                            onClick = { onRunAggroProbe(false, hasPriorAggro) },
+                            enabled = !prober.isProbing && hasSelectedTargetAnchor,
+                            shape = RoundedCornerShape(9.dp),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = TelemetryViolet,
+                                containerColor = SignalEmerald,
                                 contentColor = ObsidianBg
                             ),
-                            shape = RoundedCornerShape(9.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp),
                             modifier = Modifier
                                 .weight(1f)
                                 .heightIn(min = 48.dp)
-                                .testTag("struct_auto_probe_names_button")
+                                .testTag("struct_probe_aggro_passive")
                         ) {
-                            if (prober.isProbing) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp,
-                                    color = ObsidianBg
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.AutoAwesome,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    text = stringResource(R.string.action_auto_probe_names),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
+                            Text(
+                                text = if (hasPriorAggro) "Refine Passive (0)" else stringResource(R.string.action_probe_passive),
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold
+                            )
                         }
 
-                        if (prober.queryInput.isNotBlank()) {
-                            OutlinedButton(
+                        Button(
+                            onClick = { onRunAggroProbe(true, hasPriorAggro) },
+                            enabled = !prober.isProbing && hasSelectedTargetAnchor,
+                            shape = RoundedCornerShape(9.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = AlertCoral,
+                                contentColor = ObsidianBg
+                            ),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 12.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp)
+                                .testTag("struct_probe_aggro_active")
+                        ) {
+                            Text(
+                                text = if (hasPriorAggro) "Refine Aggroed (!=0)" else stringResource(R.string.action_probe_aggroed),
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                    if (hasPriorAggro) {
+                        OutlinedButton(
+                            onClick = { onRunAggroProbe(false, false) },
+                            enabled = !prober.isProbing && hasSelectedTargetAnchor,
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, ObsidianBorder),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 44.dp)
+                                .testTag("struct_probe_aggro_fresh")
+                        ) {
+                            Text(
+                                text = "Start Fresh Passive Scan",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                } else {
+                    // Dedicated full-width input row (never squeezed beside buttons)
+                    OutlinedTextField(
+                        value = prober.queryInput,
+                        onValueChange = onInputChanged,
+                        singleLine = true,
+                        placeholder = {
+                            Text(
+                                text = stringResource(
+                                    if (activeField.isNameField) R.string.struct_prober_name_placeholder
+                                    else R.string.struct_prober_stat_placeholder
+                                ),
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontFamily = JetBrainsMonoFontFamily
+                            )
+                        },
+                        textStyle = MaterialTheme.typography.bodyMedium.copy(
+                            fontFamily = JetBrainsMonoFontFamily,
+                            color = MaterialTheme.colorScheme.onSurface
+                        ),
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = if (activeField.isNameField) KeyboardType.Text else KeyboardType.Number,
+                            imeAction = ImeAction.Search
+                        ),
+                        keyboardActions = KeyboardActions(
+                            onSearch = {
+                                if (activeField.isNameField && prober.queryInput.isBlank()) {
+                                    onRunAutoProbeNames()
+                                } else {
+                                    onRunProbe()
+                                }
+                            }
+                        ),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = activeAccent,
+                            unfocusedBorderColor = ObsidianBorder,
+                            focusedContainerColor = ObsidianBg,
+                            unfocusedContainerColor = ObsidianBg
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 52.dp)
+                            .testTag("struct_prober_input")
+                    )
+
+                    // Dedicated 48dp Action Button Row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (activeField.isNameField) {
+                            Button(
+                                onClick = onRunAutoProbeNames,
+                                enabled = !prober.isProbing && (activeAnchorReady || trackedMobCount > 0),
+                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = TelemetryViolet,
+                                    contentColor = ObsidianBg
+                                ),
+                                shape = RoundedCornerShape(9.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .testTag("struct_auto_probe_names_button")
+                            ) {
+                                if (prober.isProbing) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp,
+                                        color = ObsidianBg
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.AutoAwesome,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = stringResource(R.string.action_auto_probe_names),
+                                        style = MaterialTheme.typography.labelLarge,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+
+                            if (prober.queryInput.isNotBlank()) {
+                                OutlinedButton(
+                                    onClick = onRunProbe,
+                                    enabled = !prober.isProbing,
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                                    border = BorderStroke(1.dp, TelemetryViolet),
+                                    shape = RoundedCornerShape(9.dp),
+                                    modifier = Modifier
+                                        .weight(0.85f)
+                                        .heightIn(min = 48.dp)
+                                        .testTag("struct_search_names_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Search,
+                                        contentDescription = null,
+                                        tint = TelemetryViolet,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = stringResource(R.string.action_search_names),
+                                        style = MaterialTheme.typography.labelLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        color = TelemetryViolet
+                                    )
+                                }
+                            }
+                        } else {
+                            Button(
                                 onClick = onRunProbe,
-                                enabled = !prober.isProbing,
+                                enabled = !prober.isProbing && activeAnchorReady && prober.queryInput.isNotBlank(),
                                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-                                border = BorderStroke(1.dp, TelemetryViolet),
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = activeAccent,
+                                    contentColor = ObsidianBg
+                                ),
                                 shape = RoundedCornerShape(9.dp),
                                 modifier = Modifier
-                                    .weight(0.85f)
+                                    .weight(1f)
                                     .heightIn(min = 48.dp)
-                                    .testTag("struct_search_names_button")
+                                    .testTag("struct_probe_button")
                             ) {
-                                Icon(
-                                    imageVector = Icons.Default.Search,
-                                    contentDescription = null,
-                                    tint = TelemetryViolet,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    text = stringResource(R.string.action_search_names),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold,
-                                    color = TelemetryViolet
-                                )
+                                if (prober.isProbing) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp,
+                                        color = ObsidianBg
+                                    )
+                                } else {
+                                    Icon(
+                                        imageVector = Icons.Default.Search,
+                                        contentDescription = null,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = stringResource(R.string.action_probe_struct),
+                                        style = MaterialTheme.typography.labelLarge,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
-                        }
-                    } else {
-                        Button(
-                            onClick = onRunProbe,
-                            enabled = !prober.isProbing && hasPlayerAnchor && prober.queryInput.isNotBlank(),
-                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = activeAccent,
-                                contentColor = ObsidianBg
-                            ),
-                            shape = RoundedCornerShape(9.dp),
-                            modifier = Modifier
-                                .weight(1f)
-                                .heightIn(min = 48.dp)
-                                .testTag("struct_probe_button")
-                        ) {
-                            if (prober.isProbing) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp,
-                                    color = ObsidianBg
-                                )
-                            } else {
-                                Icon(
-                                    imageVector = Icons.Default.Search,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    text = stringResource(R.string.action_probe_struct),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
 
-                        if (prober.candidates.isNotEmpty()) {
-                            OutlinedButton(
-                                onClick = onRunRefine,
-                                enabled = !prober.isProbing && prober.queryInput.isNotBlank(),
-                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
-                                border = BorderStroke(1.5.dp, SignalEmerald),
-                                shape = RoundedCornerShape(9.dp),
-                                modifier = Modifier
-                                    .weight(0.9f)
-                                    .heightIn(min = 48.dp)
-                                    .testTag("struct_refine_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.FilterAlt,
-                                    contentDescription = null,
-                                    tint = SignalEmerald,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    text = stringResource(R.string.action_refine_struct),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold,
-                                    color = SignalEmerald
-                                )
+                            if (prober.candidates.isNotEmpty()) {
+                                OutlinedButton(
+                                    onClick = onRunRefine,
+                                    enabled = !prober.isProbing && prober.queryInput.isNotBlank(),
+                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 12.dp),
+                                    border = BorderStroke(1.5.dp, SignalEmerald),
+                                    shape = RoundedCornerShape(9.dp),
+                                    modifier = Modifier
+                                        .weight(0.9f)
+                                        .heightIn(min = 48.dp)
+                                        .testTag("struct_refine_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.FilterAlt,
+                                        contentDescription = null,
+                                        tint = SignalEmerald,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                    Text(
+                                        text = stringResource(R.string.action_refine_struct),
+                                        style = MaterialTheme.typography.labelLarge,
+                                        fontWeight = FontWeight.Bold,
+                                        color = SignalEmerald
+                                    )
+                                }
                             }
                         }
                     }

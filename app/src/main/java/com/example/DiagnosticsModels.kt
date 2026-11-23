@@ -63,6 +63,7 @@ enum class ConsoleTab {
 }
 
 enum class ProberSubTab {
+    TARGET_FINDER,
     STRUCT_PROBER,
     FULL_HEAP
 }
@@ -196,8 +197,14 @@ data class DiscoveredEntitySample(
     val mp: Int? = null,
     val maxMp: Int? = null,
     val fp: Int? = null,
-    val maxFp: Int? = null
+    val maxFp: Int? = null,
+    val aggroRawValue: Int? = null,
+    val isAggro: Boolean? = null,
+    val isActiveGameTarget: Boolean = false
 ) {
+    val selectionKey: String
+        get() = "${path}_${id}"
+
     val displayName: String
         get() = resolvedName?.takeIf { it.isNotBlank() } ?: name
 
@@ -369,7 +376,8 @@ data class WasmFloatDeltaState(
 enum class WasmStructFieldKind(
     val shortLabel: String,
     val jsonKey: String,
-    val isNameField: Boolean = false
+    val isNameField: Boolean = false,
+    val isAggroField: Boolean = false
 ) {
     HP("HP", "hp"),
     MAX_HP("MaxHP", "maxHp"),
@@ -377,7 +385,8 @@ enum class WasmStructFieldKind(
     MAX_MP("MaxMP", "maxMp"),
     FP("FP", "fp"),
     MAX_FP("MaxFP", "maxFp"),
-    NAME("Name", "name", isNameField = true);
+    NAME("Name", "name", isNameField = true),
+    AGGRO("Aggro", "aggro", isAggroField = true);
 
     companion object {
         fun fromRaw(raw: String): WasmStructFieldKind =
@@ -392,6 +401,7 @@ enum class WasmStructValueType(val shortTag: String) {
     INT32("i32"),
     FLOAT32("f32"),
     INT16("i16"),
+    UINT8("u8"),
     INLINE_UTF8("utf8"),
     CHAR_PTR("char*"),
     STD_STRING("std::str");
@@ -441,14 +451,15 @@ data class WasmEntityStructSchema(
     val fp: WasmStructFieldOffset? = null,
     val maxFp: WasmStructFieldOffset? = null,
     val name: WasmStructFieldOffset? = null,
+    val aggro: WasmStructFieldOffset? = null,
     val isSavedLocally: Boolean = false,
     val hostKey: String = ""
 ) {
     val hasAnyBound: Boolean
-        get() = hp != null || maxHp != null || mp != null || maxMp != null || fp != null || maxFp != null || name != null
+        get() = hp != null || maxHp != null || mp != null || maxMp != null || fp != null || maxFp != null || name != null || aggro != null
 
     val boundCount: Int
-        get() = listOfNotNull(hp, maxHp, mp, maxMp, fp, maxFp, name).size
+        get() = listOfNotNull(hp, maxHp, mp, maxMp, fp, maxFp, name, aggro).size
 
     fun fieldFor(kind: WasmStructFieldKind): WasmStructFieldOffset? = when (kind) {
         WasmStructFieldKind.HP -> hp
@@ -458,6 +469,7 @@ data class WasmEntityStructSchema(
         WasmStructFieldKind.FP -> fp
         WasmStructFieldKind.MAX_FP -> maxFp
         WasmStructFieldKind.NAME -> name
+        WasmStructFieldKind.AGGRO -> aggro
     }
 
     fun withField(kind: WasmStructFieldKind, offset: WasmStructFieldOffset?): WasmEntityStructSchema = when (kind) {
@@ -468,6 +480,7 @@ data class WasmEntityStructSchema(
         WasmStructFieldKind.FP -> copy(fp = offset)
         WasmStructFieldKind.MAX_FP -> copy(maxFp = offset)
         WasmStructFieldKind.NAME -> copy(name = offset)
+        WasmStructFieldKind.AGGRO -> copy(aggro = offset)
     }
 }
 
@@ -520,9 +533,81 @@ data class PlayerVitalsSnapshot(
         get() = maxFp?.takeIf { it > 0 } ?: observedPeakFp?.takeIf { it > 0 }
 }
 
+enum class WasmStructProbeAnchor {
+    PLAYER,
+    SELECTED_TARGET
+}
+
+enum class TargetScanFilterMode(val wireName: String, val label: String) {
+    CHANGED_NON_ZERO("CHANGED_NON_ZERO", "Diff Mob"),
+    UNCHANGED("UNCHANGED", "Same Mob"),
+    DESELECTED_ZERO("DESELECTED_ZERO", "Deselected (0)"),
+    SAME_TYPE_RESELECT("SAME_TYPE_RESELECT", "Same-Type Mob")
+}
+
+@Immutable
+data class SelectedTargetCandidate(
+    val slotByteAddress: Long,
+    val slotHex: String,
+    val currentValue: Long,
+    val currentHex: String,
+    val isPointerLike: Boolean,
+    val nearPlayerOffsetBytes: Int? = null,
+    val matchedEntityId: String? = null,
+    val matchedEntityName: String? = null,
+    val resolvedCoordAddress: Long = 0L,
+    val resolvedX: Double? = null,
+    val resolvedY: Double? = null,
+    val resolvedZ: Double? = null,
+    val previewName: String? = null,
+    val previewHp: Int? = null,
+    val previewMaxHp: Int? = null,
+    val previewAggroRaw: Int? = null
+)
+
+@Immutable
+data class LiveSelectedTargetSnapshot(
+    val slotByteAddress: Long,
+    val slotHex: String,
+    val targetStructAddress: Long,
+    val targetCoordAddress: Long,
+    val hasTarget: Boolean,
+    val matchedEntityId: String? = null,
+    val resolvedName: String? = null,
+    val hp: Int? = null,
+    val maxHp: Int? = null,
+    val aggroRawValue: Int? = null,
+    val isAggro: Boolean? = null,
+    val worldX: Double? = null,
+    val worldY: Double? = null,
+    val worldZ: Double? = null,
+    val distanceToPlayer: Double? = null,
+    val tickCount: Int = 0
+) {
+    val effectiveAnchorAddress: Long
+        get() = when {
+            targetCoordAddress > 0L -> targetCoordAddress
+            targetStructAddress > 0L -> targetStructAddress
+            else -> 0L
+        }
+}
+
+@Immutable
+data class WasmTargetScannerState(
+    val isScanning: Boolean = false,
+    val scanRound: Int = 0,
+    val totalCandidates: Int = 0,
+    val candidates: List<SelectedTargetCandidate> = emptyList(),
+    val lockedSlotAddress: Long? = null,
+    val isWatchingTarget: Boolean = false,
+    val liveTarget: LiveSelectedTargetSnapshot? = null,
+    val statusMessage: String = ""
+)
+
 @Immutable
 data class WasmStructProberState(
     val isExpanded: Boolean = true,
+    val probeAnchor: WasmStructProbeAnchor = WasmStructProbeAnchor.PLAYER,
     val activeField: WasmStructFieldKind = WasmStructFieldKind.HP,
     val queryInput: String = "",
     val isProbing: Boolean = false,
@@ -570,7 +655,7 @@ data class DiagnosticsUiState(
     val livePollActive: Boolean = false,
     val livePollTickCount: Int = 0,
     val wasmFloatDelta: WasmFloatDeltaState = WasmFloatDeltaState(),
-    // Step 3 state (Visual Entity Inspection Console + WASM Nearby Entity Scanner)
+    // Step 3 state (Visual Entity Inspection Console + WASM Nearby Entity Scanner + Read-Only Location Tracker)
     val discoveredEntityArrayPath: String? = null,
     val entityProjectionMode: String = "",
     val entityViewportWidth: Int = 0,
@@ -579,7 +664,9 @@ data class DiagnosticsUiState(
     val lastEntityCount: Int = 0,
     val isWasmEntitiesLivePolling: Boolean = false,
     val wasmEntityLiveTickCount: Int = 0,
+    val trackedEntityKey: String? = null,
     val playerVitals: PlayerVitalsSnapshot? = null,
+    val targetScanner: WasmTargetScannerState = WasmTargetScannerState(),
     val structProber: WasmStructProberState = WasmStructProberState(),
     // Step 4/5 Passive asset & console state
     val wasmHeap: WasmHeapTrackerState = WasmHeapTrackerState(),

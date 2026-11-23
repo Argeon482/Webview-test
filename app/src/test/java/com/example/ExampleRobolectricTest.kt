@@ -861,7 +861,107 @@ class ExampleRobolectricTest {
         assertEquals(528, loadedSubdomainSchema.name?.relOffsetBytes)
         assertTrue(loadedSubdomainSchema.isSavedLocally)
     }
+
+    @Test
+    fun `selected target finder narrows slots watches live binds aggro assigns to entity list and toggles read-only location tracker`() {
+        val targetPayloads = mutableListOf<String>()
+        val bridge = TelemetryBridge(
+            onTelemetryReceived = { _, _ -> },
+            onReportPayloadReceived = {},
+            onWasmTargetUpdated = { targetPayloads.add(it) }
+        )
+        bridge.updateWasmTarget("""{"stage":"WASM_TARGET_WATCH_TICK","tick":1,"hasTarget":true,"slotByteAddress":1270000,"slotHex":"0x001360F0","targetStructAddress":65015808,"targetCoordAddress":65015960}""")
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(1, targetPayloads.size)
+
+        val ptrStore = SitePointerStore(InMemoryPointerStorage())
+        val schemaStore = SiteStructSchemaStore(InMemoryPointerStorage())
+        val vm = DiagnosticsViewModel()
+        vm.setSitePointerStoreForTesting(ptrStore)
+        vm.setSiteStructSchemaStoreForTesting(schemaStore)
+
+        val url = "https://universe.flyff.com/play"
+        vm.onUrlInputChanged(url)
+        vm.onLoadUrlRequested()
+
+        // Seed player pointer so anchor exists
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":8.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
+        )
+
+        // 1. Capture Mob A -> Filter Different Mob -> Lock slot
+        vm.onCaptureSelectedTarget()
+        assertTrue(vm.uiState.value.targetScanner.isScanning)
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_TARGET_SCAN_RESULT","action":"CAPTURE","round":1,"durationMs":11.2,"totalCandidates":1240,"candidates":[]}"""
+        )
+        assertFalse(vm.uiState.value.targetScanner.isScanning)
+        assertEquals(1, vm.uiState.value.targetScanner.scanRound)
+        assertEquals(1240, vm.uiState.value.targetScanner.totalCandidates)
+
+        vm.onFilterSelectedTarget(TargetScanFilterMode.CHANGED_NON_ZERO)
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_TARGET_SCAN_RESULT","action":"CHANGED_NON_ZERO","round":2,"durationMs":1.5,"totalCandidates":1,"candidates":[{"slotByteAddress":1270000,"slotHex":"0x001360F0","currentValue":65015808,"currentHex":"0x03E01000","isPointerLike":true,"nearPlayerOffsetBytes":64,"matchedEntityId":"0x03E01000","matchedEntityName":"Small Aibatt","resolvedCoordAddress":65015960,"resolvedX":6970.0,"resolvedY":100.0,"resolvedZ":3315.0,"previewName":"Small Aibatt","previewHp":240,"previewMaxHp":280,"previewAggroRaw":1,"score":1850}]}"""
+        )
+        assertEquals(1, vm.uiState.value.targetScanner.candidates.size)
+        assertEquals(1270000L, vm.uiState.value.targetScanner.candidates.first().slotByteAddress)
+
+        // 2. Lock target slot & receive 200ms live target watch tick
+        vm.onLockSelectedTargetSlot(1270000L)
+        assertTrue(vm.uiState.value.targetScanner.isWatchingTarget)
+        assertEquals(1270000L, vm.uiState.value.targetScanner.lockedSlotAddress)
+
+        vm.onWasmTargetUpdatedFromBridge(
+            """{"stage":"WASM_TARGET_WATCH_TICK","tick":3,"slotByteAddress":1270000,"slotHex":"0x001360F0","targetStructAddress":65015808,"targetCoordAddress":65015960,"hasTarget":true,"matchedEntityId":"0x03E01000","resolvedName":"Small Aibatt","hp":210,"maxHp":280,"aggroRawValue":1,"isAggro":true,"worldX":6970.0,"worldY":100.0,"worldZ":3315.0,"distanceToPlayer":9.45}"""
+        )
+        val liveTarget = vm.uiState.value.targetScanner.liveTarget
+        assertTrue(liveTarget != null && liveTarget.hasTarget)
+        assertEquals("Small Aibatt", liveTarget!!.resolvedName)
+        assertEquals(210, liveTarget.hp)
+        assertEquals(280, liveTarget.maxHp)
+        assertEquals(true, liveTarget.isAggro)
+
+        // 3. Jump to Struct Prober anchored to Selected Target -> Probe Aggro -> Bind & persist per site
+        vm.onProbeSelectedTargetInStructProber(WasmStructFieldKind.AGGRO)
+        assertEquals(ProberSubTab.STRUCT_PROBER, vm.uiState.value.activeProberSubTab)
+        assertEquals(WasmStructProbeAnchor.SELECTED_TARGET, vm.uiState.value.structProber.probeAnchor)
+        assertEquals(WasmStructFieldKind.AGGRO, vm.uiState.value.structProber.activeField)
+
+        vm.runAggroStructProbe(isAggroedNow = true, refineExisting = false)
+        assertTrue(vm.uiState.value.structProber.isProbing)
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"AGGRO","isRefine":false,"durationMs":1.1,"totalFound":1,"candidates":[{"id":"AG_612_UINT8","relOffsetBytes":612,"subOffsetBytes":null,"valueType":"UINT8","expression":"+0x264 [u8]","playerDisplayValue":"AGGRO (1)","playerNumericValue":1,"mobPreviews":["#1=0","#2=1"],"nonZeroMobCount":1}]}"""
+        )
+        vm.onBindStructFieldCandidate(vm.uiState.value.structProber.candidates.first())
+        assertEquals(612, vm.uiState.value.structProber.schema.aggro?.relOffsetBytes)
+        assertEquals(WasmStructValueType.UINT8, vm.uiState.value.structProber.schema.aggro?.valueType)
+        assertEquals(612, schemaStore.loadSchemaForUrl(url).aggro?.relOffsetBytes)
+
+        // 4. Assign selected target to Entities list -> upserts entity with Name/HP/Aggro & activates Read-Only Location Tracker
+        vm.onAssignSelectedTargetToEntityList()
+        assertEquals(ConsoleTab.ENTITIES, vm.uiState.value.activeConsoleTab)
+        val assigned = vm.uiState.value.discoveredEntities.firstOrNull { it.coordByteAddress == 65015960L }
+        assertTrue(assigned != null)
+        assertEquals("Small Aibatt", assigned!!.displayName)
+        assertEquals(210, assigned.hp)
+        assertEquals(true, assigned.isAggro)
+        assertTrue(assigned.isActiveGameTarget)
+        assertEquals(assigned.selectionKey, vm.uiState.value.trackedEntityKey)
+
+        // 5. Tapping the tracked entity again toggles off the read-only location tracker
+        vm.onToggleTrackEntityForLocationVerify(assigned.selectionKey)
+        assertNull(vm.uiState.value.trackedEntityKey)
+        vm.onToggleTrackEntityForLocationVerify(assigned.selectionKey)
+        assertEquals(assigned.selectionKey, vm.uiState.value.trackedEntityKey)
+        vm.onClearTrackedEntity()
+        assertNull(vm.uiState.value.trackedEntityKey)
+    }
 }
+
 
 
 

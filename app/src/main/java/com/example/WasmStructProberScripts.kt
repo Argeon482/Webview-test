@@ -154,6 +154,9 @@ object WasmStructProberScripts {
           }
 
           const vt = desc.valueType || 'INT32';
+          if (vt === 'UINT8') {
+            return heaps.heapU8[addr] >>> 0;
+          }
           if (vt === 'INT32') {
             if ((addr & 3) !== 0 || (addr >>> 2) >= heaps.heap32.length) return null;
             const v = heaps.heap32[addr >>> 2];
@@ -256,11 +259,13 @@ object WasmStructProberScripts {
         fieldKind: WasmStructFieldKind,
         playerByteAddress: Long,
         targetValue: Double,
-        existingCandidatesJson: String? = null
+        existingCandidatesJson: String? = null,
+        anchorIsTarget: Boolean = false
     ): String {
         val safeAddr = playerByteAddress.coerceAtLeast(0L)
         val safeTarget = if (targetValue.isFinite()) targetValue.toString() else "0"
         val refineJson = existingCandidatesJson?.takeIf { it.isNotBlank() } ?: "null"
+        val useLiveTargetExpr = if (anchorIsTarget) "true" else "false"
         return """
         (function() {
           try {
@@ -278,13 +283,23 @@ object WasmStructProberScripts {
               return;
             }
 
-            const playerAddr = __spResolveLivePlayerAddr($safeAddr, heaps);
+            let playerAddr = 0;
+            if ($useLiveTargetExpr) {
+              const liveTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
+                ? window.__wvTargetScan.lastResolvedCoordAddr
+                : 0;
+              playerAddr = liveTargetCoord > 0 ? liveTargetCoord : $safeAddr;
+            } else {
+              playerAddr = __spResolveLivePlayerAddr($safeAddr, heaps);
+            }
             if (playerAddr <= 0) {
               __spEmit('WASM', {
                 stage: 'WASM_STRUCT_PROBE_RESULTS',
                 fieldKind: '${fieldKind.name}',
                 isRefine: ${existingCandidatesJson != null},
-                error: 'No live player pointer or locked coordinate address active yet.',
+                error: $useLiveTargetExpr
+                  ? 'No live selected target locked yet. Select a mob and lock its target slot first.'
+                  : 'No live player pointer or locked coordinate address active yet.',
                 candidates: []
               });
               return;
@@ -477,10 +492,12 @@ object WasmStructProberScripts {
      */
     fun buildProbeNameOffsetsScript(
         playerByteAddress: Long,
-        nameQuery: String = ""
+        nameQuery: String = "",
+        anchorIsTarget: Boolean = false
     ): String {
         val safeAddr = playerByteAddress.coerceAtLeast(0L)
         val escapedQuery = quoteJsString(nameQuery.trim())
+        val useLiveTargetExpr = if (anchorIsTarget) "true" else "false"
         return """
         (function() {
           try {
@@ -498,7 +515,15 @@ object WasmStructProberScripts {
               return;
             }
 
-            const playerAddr = __spResolveLivePlayerAddr($safeAddr, heaps);
+            let playerAddr = 0;
+            if ($useLiveTargetExpr) {
+              const liveTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
+                ? window.__wvTargetScan.lastResolvedCoordAddr
+                : 0;
+              playerAddr = liveTargetCoord > 0 ? liveTargetCoord : $safeAddr;
+            } else {
+              playerAddr = __spResolveLivePlayerAddr($safeAddr, heaps);
+            }
             const trackedMobs = (window.__wvWasmEntities && Array.isArray(window.__wvWasmEntities.tracked))
               ? window.__wvWasmEntities.tracked.slice(0, 5)
               : [];
@@ -507,7 +532,7 @@ object WasmStructProberScripts {
                 stage: 'WASM_STRUCT_PROBE_RESULTS',
                 fieldKind: 'NAME',
                 isRefine: false,
-                error: 'Need an active player pointer or scanned entities before probing names.',
+                error: 'Need an active player/target pointer or scanned entities before probing names.',
                 candidates: []
               });
               return;
@@ -643,6 +668,182 @@ object WasmStructProberScripts {
             try {
               if (window.TelemetryBridge) {
                 window.TelemetryBridge.logTelemetry('ERR', 'Struct name probe error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+        """.trimIndent()
+    }
+
+    /**
+     * Strictly read-only Aggro Status Prober around the active Selected Target mob's struct.
+     *
+     * Supports 2-state differential narrowing:
+     * - [isAggroedNow] = `false` (Passive / Idle): searches for `UINT8 == 0` or `INT32 == 0` slots in `[-2048 .. +6144]`.
+     * - [isAggroedNow] = `true` (Aggroed / Attacking): searches for `UINT8` (`1..8`), `INT32` (`1..16`),
+     *   or `INT32/UINT32` slots pointing to the player struct (`±512B` of `playerByteAddress`).
+     * Refining across Passive -> Aggroed (or vice versa) isolates the exact Aggro flag or target-of-target pointer!
+     */
+    fun buildProbeAggroOffsetsScript(
+        targetAnchorByteAddress: Long,
+        playerByteAddress: Long,
+        isAggroedNow: Boolean,
+        existingCandidatesJson: String? = null
+    ): String {
+        val safeTargetAddr = targetAnchorByteAddress.coerceAtLeast(0L)
+        val safePlayerAddr = playerByteAddress.coerceAtLeast(0L)
+        val refineJson = existingCandidatesJson?.takeIf { it.isNotBlank() } ?: "null"
+        return """
+        (function() {
+          try {
+            $PROBER_HEAP_HELPERS
+            const startMs = performance.now();
+            const heaps = __spResolveHeaps();
+            if (!heaps) {
+              __spEmit('WASM', {
+                stage: 'WASM_STRUCT_PROBE_RESULTS',
+                fieldKind: 'AGGRO',
+                isRefine: ${existingCandidatesJson != null},
+                error: 'Could not locate WASM heap on this page.',
+                candidates: []
+              });
+              return;
+            }
+
+            const liveTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
+              ? window.__wvTargetScan.lastResolvedCoordAddr
+              : 0;
+            const anchorAddr = liveTargetCoord > 0 ? liveTargetCoord : $safeTargetAddr;
+            if (anchorAddr <= 0) {
+              __spEmit('WASM', {
+                stage: 'WASM_STRUCT_PROBE_RESULTS',
+                fieldKind: 'AGGRO',
+                isRefine: ${existingCandidatesJson != null},
+                error: 'Lock a Selected Target mob first so Aggro offsets can be probed on that mob.',
+                candidates: []
+              });
+              return;
+            }
+
+            const playerAddr = __spResolveLivePlayerAddr($safePlayerAddr, heaps);
+            const IS_AGGRO = ${if (isAggroedNow) "true" else "false"};
+            const trackedMobs = (window.__wvWasmEntities && Array.isArray(window.__wvWasmEntities.tracked))
+              ? window.__wvWasmEntities.tracked.slice(0, 3)
+              : [];
+
+            const sampleMobs = function(desc) {
+              const previews = [];
+              let activeCount = 0;
+              for (let m = 0; m < trackedMobs.length; m++) {
+                const v = __spReadField(trackedMobs[m].byteAddr, desc, heaps);
+                if (v !== null && typeof v === 'number') {
+                  if (v !== 0) activeCount++;
+                  previews.push('#' + (m + 1) + '=' + (v === 0 ? '0' : String(v)));
+                }
+              }
+              return { previews: previews, activeCount: activeCount };
+            };
+
+            const results = [];
+            const seen = {};
+            const addCand = function(relOff, vt, rawVal, scoreBoost) {
+              const id = 'A_' + relOff + '_' + vt;
+              if (seen[id]) return;
+              seen[id] = true;
+              const tag = vt === 'UINT8' ? 'u8' : 'i32';
+              const expr = __spSignedHex(relOff) + ' [' + tag + ']';
+              const desc = { relOffsetBytes: relOff, subOffsetBytes: null, valueType: vt };
+              const mobInfo = sampleMobs(desc);
+              const disp = (rawVal === 0)
+                ? '0 (PASSIVE)'
+                : (playerAddr > 0 && Math.abs(rawVal - playerAddr) <= 512)
+                  ? ('PLAYER_PTR (' + rawVal + ')')
+                  : (String(rawVal) + ' (AGGRO)');
+              results.push({
+                id: id,
+                relOffsetBytes: relOff,
+                subOffsetBytes: null,
+                valueType: vt,
+                expression: expr,
+                playerDisplayValue: disp,
+                playerNumericValue: rawVal,
+                adjacentMaxOffsetBytes: null,
+                adjacentMaxValue: null,
+                mobPreviews: mobInfo.previews,
+                nonZeroMobCount: scoreBoost + (IS_AGGRO ? (mobInfo.previews.length - mobInfo.activeCount) : mobInfo.activeCount)
+              });
+            };
+
+            const prior = $refineJson;
+            if (Array.isArray(prior) && prior.length > 0) {
+              for (let i = 0; i < prior.length; i++) {
+                const c = prior[i];
+                const v = __spReadField(anchorAddr, c, heaps);
+                if (v === null || typeof v !== 'number') continue;
+                if (!IS_AGGRO) {
+                  if (v === 0) addCand(c.relOffsetBytes | 0, c.valueType, 0, 10);
+                } else {
+                  const isPlayerPtr = (playerAddr > 0 && Math.abs(v - playerAddr) <= 512);
+                  const isFlag = (v >= 1 && v <= 16);
+                  if (isPlayerPtr || isFlag) {
+                    addCand(c.relOffsetBytes | 0, c.valueType, v, isPlayerPtr ? 50 : 15);
+                  }
+                }
+              }
+            } else {
+              const byteLen = heaps.byteLength;
+              const h32 = heaps.heap32;
+              const hu32 = heaps.heapU32;
+              const u8 = heaps.heapU8;
+              const minA = Math.max(4, anchorAddr - 2048) & ~3;
+              const maxA = Math.min(byteLen - 4, anchorAddr + 6144) & ~3;
+
+              for (let a = minA; a <= maxA && results.length < 96; a += 4) {
+                const rel = a - anchorAddr;
+                if (rel >= 0 && rel <= 12) continue;
+                const u32Val = hu32[a >>> 2] >>> 0;
+                const i32Val = h32[a >>> 2];
+
+                if (IS_AGGRO) {
+                  if (playerAddr > 0 && u32Val >= 4096 && Math.abs(u32Val - playerAddr) <= 512) {
+                    addCand(rel, 'INT32', i32Val, 50);
+                  } else if (i32Val >= 1 && i32Val <= 8) {
+                    addCand(rel, 'INT32', i32Val, 10);
+                  }
+                  const b0 = u8[a];
+                  if (b0 === 1 && i32Val !== 1) {
+                    addCand(rel, 'UINT8', 1, 5);
+                  }
+                } else {
+                  if (i32Val === 0) {
+                    addCand(rel, 'INT32', 0, 4);
+                  } else if (u8[a] === 0 && results.length < 80) {
+                    addCand(rel, 'UINT8', 0, 2);
+                  }
+                }
+              }
+            }
+
+            results.sort(function(a, b) {
+              if (a.nonZeroMobCount !== b.nonZeroMobCount) return b.nonZeroMobCount - a.nonZeroMobCount;
+              return Math.abs(a.relOffsetBytes) - Math.abs(b.relOffsetBytes);
+            });
+
+            const durationMs = Number((performance.now() - startMs).toFixed(1));
+            __spEmit('WASM', {
+              stage: 'WASM_STRUCT_PROBE_RESULTS',
+              fieldKind: 'AGGRO',
+              isRefine: ${existingCandidatesJson != null},
+              durationMs: durationMs,
+              playerByteAddress: anchorAddr,
+              isAggroedNow: IS_AGGRO,
+              totalFound: results.length,
+              candidates: results.slice(0, 32)
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.logTelemetry('ERR', 'Struct aggro probe error: ' + String(err));
               }
             } catch (_) {}
           }

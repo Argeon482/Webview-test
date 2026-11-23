@@ -266,7 +266,87 @@ class ExampleUnitTest {
     assertEquals("example.co.uk", SitePointerStore.extractRegistrableDomain("game.example.co.uk"))
     assertNull(SitePointerStore.extractRegistrableDomain("localhost"))
   }
+
+  @Test
+  fun selectedTargetAndAggroProberScriptsAreNonBlockingAndStrictlyReadOnly() {
+    val captureScript = WasmSelectedTargetScripts.buildCaptureSelectedTargetScript(65011712L)
+    val filterDiffScript = WasmSelectedTargetScripts.buildFilterSelectedTargetScript(
+      mode = TargetScanFilterMode.CHANGED_NON_ZERO,
+      playerByteAddress = 65011712L
+    )
+    val filterDeselectScript = WasmSelectedTargetScripts.buildFilterSelectedTargetScript(
+      mode = TargetScanFilterMode.DESELECTED_ZERO,
+      playerByteAddress = 65011712L
+    )
+    val filterSameTypeScript = WasmSelectedTargetScripts.buildFilterSelectedTargetScript(
+      mode = TargetScanFilterMode.SAME_TYPE_RESELECT,
+      playerByteAddress = 65011712L
+    )
+    val lockWatchScript = WasmSelectedTargetScripts.buildLockTargetSlotScript(
+      slotByteAddress = 1270000L,
+      playerByteAddress = 65011712L
+    )
+    val registerEntityScript = WasmSelectedTargetScripts.buildRegisterTargetInTrackedEntitiesScript(
+      coordByteAddress = 65015960L,
+      structByteAddress = 65015808L,
+      label = "Small Aibatt"
+    )
+    val stopScript = WasmSelectedTargetScripts.buildStopTargetWatchScript()
+    val resetScript = WasmSelectedTargetScripts.buildResetTargetScanScript()
+
+    val aggroPassiveScript = WasmStructProberScripts.buildProbeAggroOffsetsScript(
+      targetAnchorByteAddress = 65015960L,
+      playerByteAddress = 65011712L,
+      isAggroedNow = false
+    )
+    val aggroActiveRefineScript = WasmStructProberScripts.buildProbeAggroOffsetsScript(
+      targetAnchorByteAddress = 65015960L,
+      playerByteAddress = 65011712L,
+      isAggroedNow = true,
+      existingCandidatesJson = """[{"relOffsetBytes":612,"valueType":"UINT8"}]"""
+    )
+
+    // Non-blocking async capture & differential filtering
+    assertTrue(captureScript.contains("(async function()"))
+    assertTrue(captureScript.contains("WASM_TARGET_SCAN_RESULT"))
+    assertTrue(filterDiffScript.contains("CHANGED_NON_ZERO"))
+    assertTrue(filterDeselectScript.contains("DESELECTED_ZERO"))
+    assertTrue(filterSameTypeScript.contains("SAME_TYPE_RESELECT"))
+
+    // 200ms live target watcher & local diagnostic entity registration
+    assertTrue(lockWatchScript.contains("setInterval(pushTargetTick, 200)"))
+    assertTrue(lockWatchScript.contains("updateWasmTarget"))
+    assertTrue(lockWatchScript.contains("WASM_TARGET_WATCH_TICK"))
+    assertTrue(registerEntityScript.contains("window.__wvWasmEntities"))
+    assertTrue(registerEntityScript.contains("Small Aibatt"))
+    assertTrue(stopScript.contains("clearInterval"))
+    assertTrue(resetScript.contains("lockedSlotAddr = 0"))
+
+    // 2-state Passive vs Aggroed struct probing
+    assertTrue(aggroPassiveScript.contains("fieldKind: 'AGGRO'"))
+    assertTrue(aggroActiveRefineScript.contains("isRefine: true"))
+
+    // Strictly read-only: zero writes to WASM linear memory and zero synthetic input events
+    val heapWriteRegex = Regex("""(hf32|hu32|h32|h16|u8|heapF32|heapU32|heap32|heap16|heapU8|HEAPF32|HEAPU32|HEAP32|HEAPU8)\[[^\]]+]\s*=(?!=)""")
+    val syntheticInputRegex = Regex("""(dispatchEvent|MouseEvent|PointerEvent|TouchEvent|KeyboardEvent)""")
+    listOf(
+      captureScript,
+      filterDiffScript,
+      filterDeselectScript,
+      filterSameTypeScript,
+      lockWatchScript,
+      registerEntityScript,
+      stopScript,
+      resetScript,
+      aggroPassiveScript,
+      aggroActiveRefineScript
+    ).forEach { script ->
+      assertFalse("Must not write to WASM heap", heapWriteRegex.containsMatchIn(script))
+      assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
+    }
+  }
 }
+
 
 
 

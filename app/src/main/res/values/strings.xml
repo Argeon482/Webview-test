@@ -158,5 +158,25 @@
     <string name="advanced_legacy_tools_title">Advanced Scope, Manual Path &amp; Export</string>
     <string name="prober_no_anchor_banner">No active WASM player pointer yet. Lock coordinates or verify a saved pointer in the Coords tab first.</string>
     <string name="action_go_to_coords">Go to Coords</string>
+
+    <!-- Selected Target Finder, Aggro Status Prober & Read-Only Entity Location Verification -->
+    <string name="subtab_target_finder">Target</string>
+    <string name="subtab_struct_short">Struct</string>
+    <string name="subtab_heap_short">Heap</string>
+    <string name="target_finder_title">Selected Target Pointer Finder (Read-Only)</string>
+    <string name="target_finder_instructions">1) Select Mob A in-game and tap Scan Mob A. 2) Select Mob B (Diff Mob), deselect (Deselected 0), or stay on the same mob (Same Mob) to isolate the exact target pointer slot.</string>
+    <string name="action_target_capture_a">1. Scan Mob A</string>
+    <string name="action_target_diff_mob">Diff Mob</string>
+    <string name="action_target_deselected">Deselected (0)</string>
+    <string name="action_target_same_mob">Same Mob</string>
+    <string name="action_target_same_type">Same-Type Mob</string>
+    <string name="action_assign_target_to_entities">Assign Target to Entity List</string>
+    <string name="action_open_target_finder">Target Finder</string>
+    <string name="struct_prober_hint_aggro">With a mob selected &amp; locked in Target Finder: tap Passive while it is idle, then aggro it in-game and tap Aggroed (Refine) to isolate the exact Aggro flag or Player-Target pointer.</string>
+    <string name="action_probe_passive">Passive (0)</string>
+    <string name="action_probe_aggroed">Aggroed (!=0)</string>
+    <string name="entity_location_tracker_badge">READ-ONLY LOCATION TRACKER</string>
+    <string name="entity_location_tracker_note">Walk manually in-game toward the heading below — distance drops to 0.0u to verify this entity\'s exact location (no auto-target or auto-move).</string>
 </resources>
+
 

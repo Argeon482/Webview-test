@@ -66,11 +66,10 @@ import com.example.DiagnosticsUiState
 import com.example.DiagnosticsViewModel
 import com.example.DiscoveredEntitySample
 import com.example.LogCategory
+import com.example.PlayerCoordinates
 import com.example.R
 import com.example.ScopeBatchProgress
 import com.example.TelemetryLogEntry
-import com.example.WasmStructFieldKind
-import com.example.WasmStructProbeCandidate
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
 import com.example.ui.theme.ElectricCyan
@@ -505,7 +504,10 @@ fun EntityInspectionConsoleView(
     state: DiagnosticsUiState,
     onRescanEntities: () -> Unit,
     onToggleLiveEntities: () -> Unit,
+    onOpenTargetFinder: () -> Unit,
     onOpenProber: () -> Unit,
+    onToggleTrackEntity: (String) -> Unit,
+    onClearTrackedEntity: () -> Unit,
     onPinPath: (path: String, detail: String) -> Unit,
     onCopyPayload: (String) -> Unit,
     modifier: Modifier = Modifier
@@ -514,6 +516,12 @@ fun EntityInspectionConsoleView(
         state.discoveredEntities.any { it.sampleKeys.contains("WASM_STRUCT") } ||
         state.hasLiveWasmPlayerAnchor ||
         state.structProber.schema.hasAnyBound
+
+    val trackedEntity = remember(state.discoveredEntities, state.trackedEntityKey) {
+        state.trackedEntityKey?.let { key ->
+            state.discoveredEntities.firstOrNull { it.selectionKey == key }
+        }
+    }
 
     Column(modifier = modifier.background(ObsidianBg)) {
         Column(
@@ -526,7 +534,7 @@ fun EntityInspectionConsoleView(
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Column(
                     modifier = Modifier.weight(1f),
@@ -545,7 +553,7 @@ fun EntityInspectionConsoleView(
                         append("${state.discoveredEntities.size} detected")
                         if (state.isWasmEntitiesLivePolling) append(" • LIVE #${state.wasmEntityLiveTickCount}")
                         if (state.structProber.schema.hasAnyBound) {
-                            append(" • ${state.structProber.schema.boundCount} offsets bound")
+                            append(" • ${state.structProber.schema.boundCount} offsets")
                         }
                     }
                     Text(
@@ -558,20 +566,42 @@ fun EntityInspectionConsoleView(
                     )
                 }
 
-                // Quick shortcut straight to the dedicated Prober tab
+                // Quick shortcut to Selected Target Finder
+                Surface(
+                    onClick = onOpenTargetFinder,
+                    shape = RoundedCornerShape(8.dp),
+                    color = AssetAmber.copy(alpha = 0.16f),
+                    border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.65f)),
+                    modifier = Modifier
+                        .heightIn(min = 42.dp)
+                        .testTag("entities_open_target_finder_shortcut")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = stringResource(R.string.action_open_target_finder),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = AssetAmber
+                        )
+                    }
+                }
+
+                // Quick shortcut straight to Struct Prober
                 Surface(
                     onClick = onOpenProber,
                     shape = RoundedCornerShape(8.dp),
                     color = ElectricCyan.copy(alpha = 0.16f),
                     border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f)),
                     modifier = Modifier
-                        .heightIn(min = 44.dp)
+                        .heightIn(min = 42.dp)
                         .testTag("entities_open_prober_shortcut")
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 7.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
                             text = stringResource(R.string.action_probe_hp_names_shortcut),
@@ -661,6 +691,15 @@ fun EntityInspectionConsoleView(
             }
         }
 
+        // Read-Only Entity Location Verification Card (tap any entity below to track distance & heading)
+        if (trackedEntity != null) {
+            ReadOnlyEntityLocationTrackerCard(
+                entity = trackedEntity,
+                playerCoords = state.livePlayerCoords,
+                onDismiss = onClearTrackedEntity
+            )
+        }
+
         HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
         if (state.discoveredEntities.isEmpty()) {
@@ -702,9 +741,12 @@ fun EntityInspectionConsoleView(
                 contentPadding = PaddingValues(10.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(state.discoveredEntities, key = { "${it.path}_${it.id}" }) { entity ->
+                items(state.discoveredEntities, key = { it.selectionKey }) { entity ->
+                    val isTracked = state.trackedEntityKey == entity.selectionKey
                     EntitySampleCard(
                         entity = entity,
+                        isTracked = isTracked,
+                        onToggleTrack = { onToggleTrackEntity(entity.selectionKey) },
                         onPin = {
                             onPinPath(
                                 entity.path,
@@ -716,6 +758,7 @@ fun EntityInspectionConsoleView(
                                 entity.hp?.let { add("HP=$it${entity.maxHp?.let { m -> "/$m" } ?: ""}") }
                                 entity.mp?.let { add("MP=$it${entity.maxMp?.let { m -> "/$m" } ?: ""}") }
                                 entity.fp?.let { add("FP=$it${entity.maxFp?.let { m -> "/$m" } ?: ""}") }
+                                entity.isAggro?.let { add(if (it) "AGGRO" else "PASSIVE") }
                             }.joinToString(" ")
                             onCopyPayload(
                                 "${entity.displayName} (${entity.path})" +
@@ -731,22 +774,154 @@ fun EntityInspectionConsoleView(
     }
 }
 
+/**
+ * Strictly read-only Location Verification HUD card shown when a user taps an entity in the list.
+ * Displays live 3D distance, ΔX/ΔY/ΔZ vector, and compass heading so the user can manually walk
+ * toward the entity in-game and confirm its coordinates hit 0.0u (zero memory writes / zero input injection).
+ */
+@Composable
+private fun ReadOnlyEntityLocationTrackerCard(
+    entity: DiscoveredEntitySample,
+    playerCoords: PlayerCoordinates?,
+    onDismiss: () -> Unit
+) {
+    val dx = if (playerCoords != null) entity.worldX - playerCoords.x else null
+    val dy = if (playerCoords != null) entity.worldY - playerCoords.y else null
+    val dz = if (playerCoords != null) entity.worldZ - playerCoords.z else null
+    val liveDist = if (dx != null && dy != null && dz != null) {
+        kotlin.math.sqrt(dx * dx + dy * dy + dz * dz)
+    } else {
+        entity.distanceToPlayer
+    }
+    val headingText = if (dx != null && dz != null) {
+        formatCompassHeading(dx, dz)
+    } else {
+        "Heading pending player coords"
+    }
+    val isAtMob = liveDist <= 3.5
+
+    Surface(
+        color = if (isAtMob) SignalEmerald.copy(alpha = 0.16f) else ElectricCyan.copy(alpha = 0.12f),
+        border = BorderStroke(1.5.dp, if (isAtMob) SignalEmerald else ElectricCyan),
+        shape = RoundedCornerShape(9.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp, vertical = 6.dp)
+            .testTag("readonly_entity_location_tracker")
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.MyLocation,
+                    contentDescription = null,
+                    tint = if (isAtMob) SignalEmerald else ElectricCyan,
+                    modifier = Modifier.size(16.dp)
+                )
+                Text(
+                    text = entity.displayName,
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Surface(
+                    color = (if (isAtMob) SignalEmerald else ElectricCyan).copy(alpha = 0.22f),
+                    shape = RoundedCornerShape(5.dp)
+                ) {
+                    Text(
+                        text = if (isAtMob) "AT MOB ✓ (${fmt2(liveDist)}u)" else "${fmt2(liveDist)}u • $headingText",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        color = if (isAtMob) SignalEmerald else ElectricCyan,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                    )
+                }
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier
+                        .size(32.dp)
+                        .testTag("dismiss_entity_tracker_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = stringResource(R.string.cd_clear_search),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+
+            if (dx != null && dy != null && dz != null) {
+                Text(
+                    text = "ΔX=${fmtSigned2(dx)}  ΔY=${fmtSigned2(dy)}  ΔZ=${fmtSigned2(dz)}  |  Target (${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)})",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    color = SignalEmerald,
+                    fontSize = 10.sp
+                )
+            }
+            Text(
+                text = stringResource(R.string.entity_location_tracker_note),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 10.sp
+            )
+        }
+    }
+}
+
+private fun formatCompassHeading(dx: Double, dz: Double): String {
+    val angleRad = kotlin.math.atan2(dx, dz)
+    val deg = ((Math.toDegrees(angleRad) % 360.0) + 360.0) % 360.0
+    val dirs = listOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    val idx = (((deg + 22.5) % 360.0) / 45.0).toInt().coerceIn(0, 7)
+    return "${dirs[idx]} ${deg.toInt()}°"
+}
+
+private fun fmtSigned2(value: Double): String {
+    val sign = if (value >= 0.0) "+" else ""
+    return "$sign${String.format(Locale.US, "%.1f", value)}"
+}
+
 @Composable
 private fun EntitySampleCard(
     entity: DiscoveredEntitySample,
+    isTracked: Boolean,
+    onToggleTrack: () -> Unit,
     onPin: () -> Unit,
     onCopy: () -> Unit
 ) {
+    val borderColor = when {
+        isTracked -> ElectricCyan
+        entity.isActiveGameTarget -> SignalEmerald
+        entity.isAggro == true -> AlertCoral.copy(alpha = 0.75f)
+        entity.inViewport -> TelemetryViolet.copy(alpha = 0.6f)
+        else -> ObsidianBorder
+    }
     Surface(
         shape = RoundedCornerShape(8.dp),
-        color = ObsidianSurface,
+        color = when {
+            isTracked -> ElectricCyan.copy(alpha = 0.08f)
+            entity.isActiveGameTarget -> SignalEmerald.copy(alpha = 0.08f)
+            else -> ObsidianSurface
+        },
         border = BorderStroke(
-            1.dp,
-            if (entity.inViewport) TelemetryViolet.copy(alpha = 0.6f) else ObsidianBorder
+            width = if (isTracked || entity.isActiveGameTarget) 1.5.dp else 1.dp,
+            color = borderColor
         ),
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onCopy)
+            .clickable(onClick = onToggleTrack)
             .testTag("entity_sample_${entity.path}")
     ) {
         Column(
@@ -756,7 +931,7 @@ private fun EntitySampleCard(
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                horizontalArrangement = Arrangement.spacedBy(5.dp)
             ) {
                 Text(
                     text = entity.displayName + if (entity.resolvedName == null && entity.id.isNotBlank()) " #${entity.id}" else "",
@@ -767,18 +942,35 @@ private fun EntitySampleCard(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
-                Surface(
-                    color = (if (entity.inViewport) SignalEmerald else ObsidianSurfaceElevated).copy(alpha = 0.2f),
-                    shape = RoundedCornerShape(4.dp)
-                ) {
-                    Text(
-                        text = if (entity.inViewport) "IN VIEW" else "OFFSCREEN",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = if (entity.inViewport) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
-                    )
+                if (entity.isActiveGameTarget) {
+                    Surface(
+                        color = SignalEmerald.copy(alpha = 0.22f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = "TARGET",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = SignalEmerald,
+                            fontSize = 9.sp,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                entity.isAggro?.let { aggro ->
+                    Surface(
+                        color = (if (aggro) AlertCoral else SignalEmerald).copy(alpha = 0.22f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = if (aggro) "AGGRO" else "PASSIVE",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = if (aggro) AlertCoral else SignalEmerald,
+                            fontSize = 9.sp,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                        )
+                    }
                 }
                 Surface(
                     color = ElectricCyan.copy(alpha = 0.16f),
@@ -833,10 +1025,10 @@ private fun EntitySampleCard(
             }
 
             Text(
-                text = entity.path,
+                text = entity.path + if (isTracked) " • TRACKING LOCATION ✓" else " • Tap card to verify location",
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = JetBrainsMonoFontFamily,
-                color = TelemetryViolet,
+                color = if (isTracked) ElectricCyan else TelemetryViolet,
                 fontSize = 10.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis

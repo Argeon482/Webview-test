@@ -145,6 +145,9 @@ object WasmPointerAndEntityScripts {
             if (addr <= 0 || addr >= byteLen) return null;
           }
           const vt = desc.valueType || 'INT32';
+          if (vt === 'UINT8') {
+            return heaps.heapU8[addr] >>> 0;
+          }
           if (vt === 'INT32') {
             if ((addr & 3) !== 0 || (addr >>> 2) >= heaps.heap32.length) return null;
             const v = heaps.heap32[addr >>> 2];
@@ -198,7 +201,7 @@ object WasmPointerAndEntityScripts {
           if (!schema || typeof schema !== 'object' || coordAddr <= 0) return null;
           const out = {};
           let any = false;
-          const fields = ['hp', 'maxHp', 'mp', 'maxMp', 'fp', 'maxFp', 'name'];
+          const fields = ['hp', 'maxHp', 'mp', 'maxMp', 'fp', 'maxFp', 'name', 'aggro'];
           for (let i = 0; i < fields.length; i++) {
             const k = fields[i];
             if (schema[k]) {
@@ -811,6 +814,13 @@ object WasmPointerAndEntityScripts {
               const entityName = 'WASM Entity #' + (i + 1);
               const entityPath = 'HEAPF32[' + e.heapIndex + '] @ ' + hexCoord;
               const decoded = __peReadEntitySchema(e.byteAddr, heaps) || {};
+              const activeTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
+                ? window.__wvTargetScan.lastResolvedCoordAddr : 0;
+              const activeTargetStruct = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedAddr > 0)
+                ? window.__wvTargetScan.lastResolvedAddr : 0;
+              const isActiveTgt = (activeTargetCoord > 0 && Math.abs(e.byteAddr - activeTargetCoord) <= 64) ||
+                (activeTargetStruct > 0 && (e.structBase === activeTargetStruct || Math.abs(e.byteAddr - activeTargetStruct) <= 1024));
+              const aggroRaw = (typeof decoded.aggro === 'number') ? decoded.aggro : null;
 
               entities.push({
                 name: entityName,
@@ -825,6 +835,9 @@ object WasmPointerAndEntityScripts {
                 maxMp: (typeof decoded.maxMp === 'number') ? decoded.maxMp : null,
                 fp: (typeof decoded.fp === 'number') ? decoded.fp : null,
                 maxFp: (typeof decoded.maxFp === 'number') ? decoded.maxFp : null,
+                aggroRawValue: aggroRaw,
+                isAggro: (aggroRaw !== null) ? (aggroRaw !== 0) : null,
+                isActiveGameTarget: isActiveTgt,
                 worldX: Number(e.x.toFixed(3)),
                 worldY: Number(e.y.toFixed(3)),
                 worldZ: Number(e.z.toFixed(3)),
@@ -949,6 +962,13 @@ object WasmPointerAndEntityScripts {
                   const dz = hasPlayer ? (z - pz) : 0;
                   const dist = hasPlayer ? Math.sqrt(dx * dx + dy * dy + dz * dz) : 0;
                   const decoded = __peReadEntitySchema(t.byteAddr, heaps) || {};
+                  const activeTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
+                    ? window.__wvTargetScan.lastResolvedCoordAddr : 0;
+                  const activeTargetStruct = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedAddr > 0)
+                    ? window.__wvTargetScan.lastResolvedAddr : 0;
+                  const isActiveTgt = (activeTargetCoord > 0 && Math.abs(t.byteAddr - activeTargetCoord) <= 64) ||
+                    (activeTargetStruct > 0 && (t.structBase === activeTargetStruct || Math.abs(t.byteAddr - activeTargetStruct) <= 1024));
+                  const aggroRaw = (typeof decoded.aggro === 'number') ? decoded.aggro : null;
                   out.push({
                     name: t.name,
                     id: t.id,
@@ -962,6 +982,9 @@ object WasmPointerAndEntityScripts {
                     maxMp: (typeof decoded.maxMp === 'number') ? decoded.maxMp : null,
                     fp: (typeof decoded.fp === 'number') ? decoded.fp : null,
                     maxFp: (typeof decoded.maxFp === 'number') ? decoded.maxFp : null,
+                    aggroRawValue: aggroRaw,
+                    isAggro: (aggroRaw !== null) ? (aggroRaw !== 0) : null,
+                    isActiveGameTarget: isActiveTgt,
                     worldX: Number(x.toFixed(3)),
                     worldY: Number(y.toFixed(3)),
                     worldZ: Number(z.toFixed(3)),

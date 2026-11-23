@@ -46,10 +46,20 @@ class DiagnosticsViewModel : ViewModel() {
     private var pendingExportJob: Job? = null
     private var pendingExportContext: Context? = null
     private var sitePointerStore: SitePointerStore? = null
+    private var siteStructSchemaStore: SiteStructSchemaStore? = null
 
     fun attachContext(context: Context) {
+        val appCtx = context.applicationContext
+        var initialized = false
         if (sitePointerStore == null) {
-            sitePointerStore = SitePointerStore(context.applicationContext)
+            sitePointerStore = SitePointerStore(appCtx)
+            initialized = true
+        }
+        if (siteStructSchemaStore == null) {
+            siteStructSchemaStore = SiteStructSchemaStore(appCtx)
+            initialized = true
+        }
+        if (initialized) {
             val currentUrl = _uiState.value.activeUrl
             if (currentUrl != "about:blank") {
                 restoreSavedPointersForUrl(currentUrl, autoVerify = false)
@@ -59,6 +69,10 @@ class DiagnosticsViewModel : ViewModel() {
 
     internal fun setSitePointerStoreForTesting(store: SitePointerStore) {
         sitePointerStore = store
+    }
+
+    internal fun setSiteStructSchemaStoreForTesting(store: SiteStructSchemaStore) {
+        siteStructSchemaStore = store
     }
 
     fun onUrlInputChanged(input: String) {
@@ -71,6 +85,7 @@ class DiagnosticsViewModel : ViewModel() {
             is UrlValidationResult.Valid -> {
                 val targetUrl = validation.normalizedUrl
                 val savedForTarget = sitePointerStore?.loadPointersForUrl(targetUrl).orEmpty()
+                val savedSchema = siteStructSchemaStore?.loadSchemaForUrl(targetUrl) ?: WasmEntityStructSchema()
                 seenAssetUrls.clear()
                 _uiState.update {
                     it.copy(
@@ -100,6 +115,13 @@ class DiagnosticsViewModel : ViewModel() {
                         lastEntityCount = 0,
                         isWasmEntitiesLivePolling = false,
                         wasmEntityLiveTickCount = 0,
+                        playerVitals = null,
+                        structProber = WasmStructProberState(
+                            schema = savedSchema,
+                            statusMessage = if (savedSchema.hasAnyBound) {
+                                "Loaded ${savedSchema.boundCount} saved struct offset(s) for ${savedSchema.hostKey}."
+                            } else ""
+                        ),
                         wasmHeap = WasmHeapTrackerState(),
                         wasmFloatDelta = WasmFloatDeltaState(
                             pointerChains = savedForTarget,
@@ -207,6 +229,34 @@ class DiagnosticsViewModel : ViewModel() {
     private fun restoreSavedPointersForUrl(url: String, autoVerify: Boolean) {
         val store = sitePointerStore
         val savedFromDisk = store?.loadPointersForUrl(url).orEmpty()
+        val hostName = SitePointerStore.normalizeHostKey(url).orEmpty()
+        val savedSchema = siteStructSchemaStore?.loadSchemaForUrl(url)
+            ?: _uiState.value.structProber.schema.takeIf { it.hostKey == hostName }
+            ?: WasmEntityStructSchema(hostKey = hostName)
+
+        // Restore & sync saved entity struct schema (HP / MP / FP / Name) immediately on load
+        _uiState.update { state ->
+            val effectiveSchema = if (savedSchema.hasAnyBound) savedSchema else state.structProber.schema
+            state.copy(
+                structProber = state.structProber.copy(
+                    schema = effectiveSchema,
+                    statusMessage = if (savedSchema.hasAnyBound && state.structProber.statusMessage.isBlank()) {
+                        "Restored ${savedSchema.boundCount} saved struct offset(s) for $hostName."
+                    } else state.structProber.statusMessage
+                )
+            )
+        }
+        val activeSchema = _uiState.value.structProber.schema
+        if (activeSchema.hasAnyBound) {
+            _effects.tryEmit(
+                DiagnosticsEffect.EvaluateJs(
+                    WasmStructProberScripts.buildSyncStructSchemaScript(
+                        SiteStructSchemaStore.serializeSchema(activeSchema)
+                    )
+                )
+            )
+        }
+
         val currentState = _uiState.value
         val existingChains = currentState.wasmFloatDelta.pointerChains
         val sameHost = SitePointerStore.normalizeHostKey(currentState.activeUrl) ==
@@ -247,7 +297,6 @@ class DiagnosticsViewModel : ViewModel() {
             }
         }
 
-        val hostName = SitePointerStore.normalizeHostKey(url).orEmpty()
         if (merged.isEmpty()) {
             _uiState.update { state ->
                 state.copy(
@@ -616,6 +665,294 @@ class DiagnosticsViewModel : ViewModel() {
                 wasmEntityLiveTickCount = tick
             )
         }
+    }
+
+    // Read-Only WASM Entity Struct Field Prober (Player & Mob HP / MP / FP + Mob/Player Names)
+    fun onToggleStructProberExpanded() {
+        _uiState.update { state ->
+            state.copy(
+                structProber = state.structProber.copy(
+                    isExpanded = !state.structProber.isExpanded
+                )
+            )
+        }
+    }
+
+    fun onSelectStructProbeField(field: WasmStructFieldKind) {
+        _uiState.update { state ->
+            val switchedCategory = state.structProber.activeField.isNameField != field.isNameField
+            state.copy(
+                structProber = state.structProber.copy(
+                    activeField = field,
+                    queryInput = if (switchedCategory) "" else state.structProber.queryInput,
+                    candidates = if (state.structProber.activeField != field) emptyList() else state.structProber.candidates,
+                    probeRound = if (state.structProber.activeField != field) 0 else state.structProber.probeRound,
+                    statusMessage = ""
+                )
+            )
+        }
+    }
+
+    fun onStructProbeInputChanged(input: String) {
+        val field = _uiState.value.structProber.activeField
+        val sanitized = if (field.isNameField) {
+            input.take(44)
+        } else {
+            input.filter { it.isDigit() || it == '.' || it == '-' }.take(14)
+        }
+        _uiState.update { state ->
+            state.copy(structProber = state.structProber.copy(queryInput = sanitized))
+        }
+    }
+
+    private fun resolveActivePlayerCoordByteAddress(state: DiagnosticsUiState): Long {
+        val fd = state.wasmFloatDelta
+        val hudChain = fd.activeHudPointerId?.let { id ->
+            fd.pointerChains.firstOrNull { it.id == id && it.resolvedTargetAddress > 0L }
+        }
+        if (hudChain != null) return hudChain.resolvedTargetAddress
+        val movingOrLive = fd.pointerChains.firstOrNull {
+            (it.status == WasmPointerStatus.MOVING || it.status == WasmPointerStatus.LIVE) &&
+                it.resolvedTargetAddress > 0L
+        }
+        if (movingOrLive != null) return movingOrLive.resolvedTargetAddress
+        return fd.lockedCoords?.xByteAddress ?: 0L
+    }
+
+    fun runStructFieldProbe(refineExisting: Boolean = false) {
+        val state = _uiState.value
+        val prober = state.structProber
+        val field = prober.activeField
+        val playerAddr = resolveActivePlayerCoordByteAddress(state)
+
+        if (field.isNameField) {
+            runNameStructProbeInternal(playerAddr = playerAddr, query = prober.queryInput.trim())
+            return
+        }
+
+        if (playerAddr <= 0L) {
+            val msg = "Lock coordinates or stream a verified live player pointer first."
+            _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+
+        val targetVal = prober.queryInput.trim().toDoubleOrNull()
+        if (targetVal == null || !targetVal.isFinite()) {
+            val msg = "Enter your current ${field.shortLabel} value (e.g. 4338) first."
+            _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+
+        val existingJson = if (refineExisting && prober.candidates.isNotEmpty()) {
+            val arr = JSONArray()
+            prober.candidates.forEach { c ->
+                val obj = JSONObject()
+                    .put("relOffsetBytes", c.relOffsetBytes)
+                    .put("valueType", c.valueType.name)
+                if (c.subOffsetBytes != null) obj.put("subOffsetBytes", c.subOffsetBytes)
+                arr.put(obj)
+            }
+            arr.toString()
+        } else {
+            null
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                structProber = current.structProber.copy(
+                    isProbing = true,
+                    statusMessage = if (existingJson != null) {
+                        "Refining ${prober.candidates.size} ${field.shortLabel} candidate(s) for $targetVal…"
+                    } else {
+                        "Probing player struct around ${formatHexAddress(playerAddr)} for ${field.shortLabel}=$targetVal…"
+                    }
+                )
+            )
+        }
+
+        _effects.tryEmit(
+            DiagnosticsEffect.EvaluateJs(
+                WasmStructProberScripts.buildProbeStatOffsetsScript(
+                    fieldKind = field,
+                    playerByteAddress = playerAddr,
+                    targetValue = targetVal,
+                    existingCandidatesJson = existingJson
+                )
+            )
+        )
+    }
+
+    fun runAutoProbeEntityNames() {
+        val state = _uiState.value
+        val playerAddr = resolveActivePlayerCoordByteAddress(state)
+        _uiState.update { current ->
+            current.copy(
+                structProber = current.structProber.copy(
+                    activeField = WasmStructFieldKind.NAME,
+                    isProbing = true,
+                    statusMessage = "Auto-probing inline UTF-8, char*, and std::string fields on player & nearby mobs…"
+                )
+            )
+        }
+        runNameStructProbeInternal(playerAddr = playerAddr, query = "")
+    }
+
+    private fun runNameStructProbeInternal(playerAddr: Long, query: String) {
+        if (playerAddr <= 0L && _uiState.value.discoveredEntities.isEmpty()) {
+            val msg = "Activate a live player pointer or scan nearby entities first."
+            _uiState.update { it.copy(structProber = it.structProber.copy(isProbing = false, statusMessage = msg)) }
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        _uiState.update { current ->
+            current.copy(
+                structProber = current.structProber.copy(
+                    activeField = WasmStructFieldKind.NAME,
+                    isProbing = true,
+                    statusMessage = if (query.isNotBlank()) {
+                        "Searching player & mob structs for \"$query\"…"
+                    } else {
+                        "Auto-probing inline UTF-8, char*, and std::string fields on player & nearby mobs…"
+                    }
+                )
+            )
+        }
+        _effects.tryEmit(
+            DiagnosticsEffect.EvaluateJs(
+                WasmStructProberScripts.buildProbeNameOffsetsScript(
+                    playerByteAddress = playerAddr,
+                    nameQuery = query
+                )
+            )
+        )
+    }
+
+    fun onBindStructFieldCandidate(
+        candidate: WasmStructProbeCandidate,
+        includeAdjacentMax: Boolean = true
+    ) {
+        val state = _uiState.value
+        val field = state.structProber.activeField
+        val activeUrl = state.activeUrl
+        val hostKey = SitePointerStore.normalizeHostKey(activeUrl).orEmpty()
+
+        var nextSchema = state.structProber.schema
+            .withField(field, candidate.toFieldOffset())
+            .copy(hostKey = hostKey)
+
+        // Auto-bind adjacent Max stat when binding HP / MP / FP if none bound yet
+        val autoMaxKind = when (field) {
+            WasmStructFieldKind.HP -> WasmStructFieldKind.MAX_HP
+            WasmStructFieldKind.MP -> WasmStructFieldKind.MAX_MP
+            WasmStructFieldKind.FP -> WasmStructFieldKind.MAX_FP
+            else -> null
+        }
+        var autoBoundMaxMsg = ""
+        if (includeAdjacentMax &&
+            autoMaxKind != null &&
+            nextSchema.fieldFor(autoMaxKind) == null &&
+            candidate.adjacentMaxOffsetBytes != null &&
+            candidate.subOffsetBytes == null
+        ) {
+            val maxField = WasmStructFieldOffset(
+                relOffsetBytes = candidate.adjacentMaxOffsetBytes,
+                subOffsetBytes = null,
+                valueType = candidate.valueType
+            )
+            nextSchema = nextSchema.withField(autoMaxKind, maxField)
+            autoBoundMaxMsg = " (+ auto ${autoMaxKind.shortLabel} ${maxField.displayExpression})"
+        }
+
+        val persistedSchema = siteStructSchemaStore?.saveSchemaForUrl(activeUrl, nextSchema)
+            ?: nextSchema.copy(isSavedLocally = nextSchema.hasAnyBound)
+
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        val stagingPath = "WASM_STRUCT.${field.shortLabel}: ${candidate.expression}"
+        val detail = "Player=${candidate.playerDisplayValue}" +
+            if (candidate.mobPreviews.isNotEmpty()) " • Mobs: ${candidate.mobPreviews.joinToString(", ")}" else ""
+
+        _uiState.update { current ->
+            val mergedStaging = mergeIntoStagingBuffer(
+                existing = current.stagingBuffer,
+                incoming = listOf(stagingPath to detail),
+                sourceStep = "Struct Schema",
+                scanNumber = current.scanCounter.coerceAtLeast(1),
+                timestamp = nowTs,
+                forcePin = true
+            )
+            current.copy(
+                stagingBuffer = mergedStaging,
+                structProber = current.structProber.copy(
+                    schema = persistedSchema,
+                    statusMessage = "Bound ${field.shortLabel} -> ${candidate.expression}$autoBoundMaxMsg (saved for ${hostKey.ifBlank { "session" }})."
+                )
+            )
+        }
+
+        val schemaJson = SiteStructSchemaStore.serializeSchema(persistedSchema)
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmStructProberScripts.buildSyncStructSchemaScript(schemaJson)))
+        appendLog(
+            LogCategory.WASM,
+            "Bound ${field.shortLabel} offset -> ${candidate.expression}$autoBoundMaxMsg",
+            "$detail | Saved locally for host=$hostKey"
+        )
+        _effects.tryEmit(
+            DiagnosticsEffect.ShowToast("Bound ${field.shortLabel} (${candidate.expression}) — streaming live!")
+        )
+    }
+
+    fun onClearBoundStructField(field: WasmStructFieldKind) {
+        val state = _uiState.value
+        val activeUrl = state.activeUrl
+        val updated = state.structProber.schema.withField(field, null)
+        val persisted = siteStructSchemaStore?.saveSchemaForUrl(activeUrl, updated)
+            ?: updated.copy(isSavedLocally = updated.hasAnyBound)
+
+        _uiState.update { current ->
+            val nextVitals = current.playerVitals?.let { pv ->
+                val cleared = when (field) {
+                    WasmStructFieldKind.HP -> pv.copy(hp = null, observedPeakHp = null)
+                    WasmStructFieldKind.MAX_HP -> pv.copy(maxHp = null)
+                    WasmStructFieldKind.MP -> pv.copy(mp = null, observedPeakMp = null)
+                    WasmStructFieldKind.MAX_MP -> pv.copy(maxMp = null)
+                    WasmStructFieldKind.FP -> pv.copy(fp = null, observedPeakFp = null)
+                    WasmStructFieldKind.MAX_FP -> pv.copy(maxFp = null)
+                    WasmStructFieldKind.NAME -> pv.copy(playerName = null)
+                }
+                if (cleared.hasAnyContent) cleared else null
+            }
+            current.copy(
+                playerVitals = nextVitals,
+                structProber = current.structProber.copy(
+                    schema = persisted,
+                    statusMessage = "Cleared ${field.shortLabel} offset."
+                )
+            )
+        }
+
+        val schemaJson = SiteStructSchemaStore.serializeSchema(persisted)
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmStructProberScripts.buildSyncStructSchemaScript(schemaJson)))
+        appendLog(LogCategory.WASM, "Cleared bound ${field.shortLabel} struct offset", "Schema updated for ${state.activeUrl}")
+    }
+
+    fun onClearAllBoundStructFields() {
+        val activeUrl = _uiState.value.activeUrl
+        siteStructSchemaStore?.clearSchemaForUrl(activeUrl)
+        val hostKey = SitePointerStore.normalizeHostKey(activeUrl).orEmpty()
+        _uiState.update { current ->
+            current.copy(
+                playerVitals = null,
+                structProber = current.structProber.copy(
+                    schema = WasmEntityStructSchema(hostKey = hostKey, isSavedLocally = false),
+                    candidates = emptyList(),
+                    probeRound = 0,
+                    statusMessage = "Cleared all saved struct offsets for ${hostKey.ifBlank { "site" }}."
+                )
+            )
+        }
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmStructProberScripts.buildSyncStructSchemaScript("{}")))
     }
 
     // Targeted WebAssembly Heap Value-Tracker (Read-Only HP / Stat Scanner & ±16B Neighbor Inspector)
@@ -1542,6 +1879,35 @@ class DiagnosticsViewModel : ViewModel() {
                 if (staleCount > 0) append(" • $staleCount stale")
             }
 
+            val vitalsObj = json.optJSONObject("playerVitals")
+            val nextPlayerVitals = if (vitalsObj != null) {
+                val prevV = state.playerVitals
+                val hp = if (vitalsObj.has("hp") && !vitalsObj.isNull("hp")) vitalsObj.optInt("hp") else null
+                val maxHp = if (vitalsObj.has("maxHp") && !vitalsObj.isNull("maxHp")) vitalsObj.optInt("maxHp") else null
+                val mp = if (vitalsObj.has("mp") && !vitalsObj.isNull("mp")) vitalsObj.optInt("mp") else null
+                val maxMp = if (vitalsObj.has("maxMp") && !vitalsObj.isNull("maxMp")) vitalsObj.optInt("maxMp") else null
+                val fp = if (vitalsObj.has("fp") && !vitalsObj.isNull("fp")) vitalsObj.optInt("fp") else null
+                val maxFp = if (vitalsObj.has("maxFp") && !vitalsObj.isNull("maxFp")) vitalsObj.optInt("maxFp") else null
+                val pName = vitalsObj.optString("name", "").takeIf { it.isNotBlank() }
+                val peakHp = listOfNotNull(prevV?.observedPeakHp, hp, maxHp).maxOrNull()
+                val peakMp = listOfNotNull(prevV?.observedPeakMp, mp, maxMp).maxOrNull()
+                val peakFp = listOfNotNull(prevV?.observedPeakFp, fp, maxFp).maxOrNull()
+                PlayerVitalsSnapshot(
+                    playerName = pName ?: prevV?.playerName,
+                    hp = hp,
+                    maxHp = maxHp,
+                    mp = mp,
+                    maxMp = maxMp,
+                    fp = fp,
+                    maxFp = maxFp,
+                    observedPeakHp = peakHp,
+                    observedPeakMp = peakMp,
+                    observedPeakFp = peakFp
+                ).takeIf { it.hasAnyContent }
+            } else {
+                state.playerVitals
+            }
+
             state.copy(
                 discoveredPlayerPath = activeHud?.let { "WASM_PTR: ${it.expression}" } ?: state.discoveredPlayerPath,
                 livePlayerCoords = activeHud?.let {
@@ -1553,6 +1919,7 @@ class DiagnosticsViewModel : ViewModel() {
                     )
                 } ?: state.livePlayerCoords,
                 livePollActive = activeHud != null || state.livePollActive,
+                playerVitals = nextPlayerVitals,
                 wasmFloatDelta = prevFd.copy(
                     heapSourceLabel = sourceLabel.ifBlank { prevFd.heapSourceLabel },
                     heapByteLength = if (byteLen > 0L) byteLen else prevFd.heapByteLength,
@@ -2517,6 +2884,52 @@ class DiagnosticsViewModel : ViewModel() {
                 }
             }
 
+            "WASM_STRUCT_PROBE_RESULTS" -> {
+                val fieldKind = WasmStructFieldKind.fromRaw(json.optString("fieldKind", "HP"))
+                val isRefine = json.optBoolean("isRefine", false)
+                val errorMsg = json.optString("error", "")
+                if (errorMsg.isNotBlank()) {
+                    _uiState.update { state ->
+                        state.copy(
+                            structProber = state.structProber.copy(
+                                isProbing = false,
+                                statusMessage = errorMsg
+                            )
+                        )
+                    }
+                    _effects.tryEmit(DiagnosticsEffect.ShowToast(errorMsg))
+                    "Struct Probe (${fieldKind.shortLabel}): $errorMsg"
+                } else {
+                    val durationMs = json.optDouble("durationMs", 0.0)
+                    val totalFound = json.optInt("totalFound", 0)
+                    val parsed = parseStructProbeCandidates(json.optJSONArray("candidates"))
+                    val msg = when {
+                        parsed.isEmpty() && fieldKind.isNameField ->
+                            "0 name fields matched (${durationMs}ms). Try Auto-Probe without a filter or scan nearby entities first."
+                        parsed.isEmpty() ->
+                            "0 ${fieldKind.shortLabel} matches in struct window (${durationMs}ms). Verify exact stat value."
+                        parsed.size == 1 ->
+                            "Exact ${fieldKind.shortLabel} candidate isolated: ${parsed.first().expression} (${durationMs}ms) — tap Bind!"
+                        fieldKind.isNameField ->
+                            "Found $totalFound name offset(s) in ${durationMs}ms — check mob previews & tap Bind."
+                        else ->
+                            "Found $totalFound ${fieldKind.shortLabel} offset(s) in ${durationMs}ms — change stat & tap Refine, or Bind best mob match."
+                    }
+                    _uiState.update { state ->
+                        state.copy(
+                            structProber = state.structProber.copy(
+                                activeField = fieldKind,
+                                isProbing = false,
+                                probeRound = if (isRefine) state.structProber.probeRound + 1 else 1,
+                                candidates = parsed,
+                                statusMessage = msg
+                            )
+                        )
+                    }
+                    "Struct Probe (${fieldKind.shortLabel}, ${durationMs}ms): $totalFound candidate(s)"
+                }
+            }
+
             "MANUAL_EVAL" -> {
                 val type = json.optString("resultType", "unknown")
                 val ms = json.optDouble("durationMs", 0.0)
@@ -3006,6 +3419,11 @@ class DiagnosticsViewModel : ViewModel() {
         return buildList {
             for (i in 0 until array.length()) {
                 val obj = array.optJSONObject(i) ?: continue
+                fun optNullableInt(key: String): Int? =
+                    if (obj.has(key) && !obj.isNull(key)) obj.optInt(key) else null
+                val resolvedName = if (obj.has("resolvedName") && !obj.isNull("resolvedName")) {
+                    obj.optString("resolvedName", "").takeIf { it.isNotBlank() }
+                } else null
                 add(
                     DiscoveredEntitySample(
                         name = obj.optString("name", "WASM Entity #${i + 1}"),
@@ -3018,7 +3436,54 @@ class DiagnosticsViewModel : ViewModel() {
                         screenX = obj.optDouble("screenX", 0.0),
                         screenY = obj.optDouble("screenY", 0.0),
                         inViewport = obj.optBoolean("inViewport", false),
-                        sampleKeys = extractStringArray(obj.optJSONArray("sampleKeys"))
+                        sampleKeys = extractStringArray(obj.optJSONArray("sampleKeys")),
+                        coordByteAddress = obj.optLong("coordByteAddress", 0L),
+                        heapIndex = obj.optInt("heapIndex", -1),
+                        resolvedName = resolvedName,
+                        hp = optNullableInt("hp"),
+                        maxHp = optNullableInt("maxHp"),
+                        mp = optNullableInt("mp"),
+                        maxMp = optNullableInt("maxMp"),
+                        fp = optNullableInt("fp"),
+                        maxFp = optNullableInt("maxFp")
+                    )
+                )
+            }
+        }
+    }
+
+    private fun parseStructProbeCandidates(array: JSONArray?): List<WasmStructProbeCandidate> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val id = obj.optString("id", "").trim()
+                if (id.isEmpty()) continue
+                val sub = if (obj.has("subOffsetBytes") && !obj.isNull("subOffsetBytes")) {
+                    obj.optInt("subOffsetBytes")
+                } else null
+                val numVal = if (obj.has("playerNumericValue") && !obj.isNull("playerNumericValue")) {
+                    obj.optDouble("playerNumericValue")
+                } else null
+                val adjMaxOff = if (obj.has("adjacentMaxOffsetBytes") && !obj.isNull("adjacentMaxOffsetBytes")) {
+                    obj.optInt("adjacentMaxOffsetBytes")
+                } else null
+                val adjMaxVal = if (obj.has("adjacentMaxValue") && !obj.isNull("adjacentMaxValue")) {
+                    obj.optInt("adjacentMaxValue")
+                } else null
+                add(
+                    WasmStructProbeCandidate(
+                        id = id,
+                        relOffsetBytes = obj.optInt("relOffsetBytes", 0),
+                        subOffsetBytes = sub,
+                        valueType = WasmStructValueType.fromRaw(obj.optString("valueType", "INT32")),
+                        expression = obj.optString("expression", ""),
+                        playerDisplayValue = obj.optString("playerDisplayValue", ""),
+                        playerNumericValue = numVal,
+                        adjacentMaxOffsetBytes = adjMaxOff,
+                        adjacentMaxValue = adjMaxVal,
+                        mobPreviews = extractStringArray(obj.optJSONArray("mobPreviews")),
+                        nonZeroMobCount = obj.optInt("nonZeroMobCount", 0)
                     )
                 )
             }
@@ -3487,13 +3952,36 @@ class DiagnosticsViewModel : ViewModel() {
                 } else {
                     state.discoveredEntities.forEachIndexed { idx, e ->
                         val vis = if (e.inViewport) "IN VIEW" else "OFFSCREEN"
+                        val vitalsSummary = buildList {
+                            e.hp?.let { add("HP=$it${e.maxHp?.let { m -> "/$m" } ?: ""}") }
+                            e.mp?.let { add("MP=$it${e.maxMp?.let { m -> "/$m" } ?: ""}") }
+                            e.fp?.let { add("FP=$it${e.maxFp?.let { m -> "/$m" } ?: ""}") }
+                        }.joinToString(" ")
+                        val vitalsPart = if (vitalsSummary.isNotBlank()) " | $vitalsSummary" else ""
                         appendLine(
-                            "  [${idx + 1}] ${e.name}${if (e.id.isNotBlank()) " #${e.id}" else ""} ($vis) | " +
+                            "  [${idx + 1}] ${e.displayName}${if (e.id.isNotBlank()) " #${e.id}" else ""} ($vis)$vitalsPart | " +
                                 "world=(${String.format(Locale.US, "%.2f", e.worldX)}, ${String.format(Locale.US, "%.2f", e.worldY)}, ${String.format(Locale.US, "%.2f", e.worldZ)}) | " +
                                 "dist=${String.format(Locale.US, "%.1f", e.distanceToPlayer)} | " +
                                 "screen=(${String.format(Locale.US, "%.1f", e.screenX)}px, ${String.format(Locale.US, "%.1f", e.screenY)}px) | " +
                                 "path=${e.path}"
                         )
+                    }
+                }
+                if (state.structProber.schema.hasAnyBound || state.playerVitals != null) {
+                    appendLine()
+                    appendLine("--- [3B] BOUND ENTITY STRUCT SCHEMA & LIVE PLAYER VITALS ---")
+                    state.playerVitals?.let { pv ->
+                        appendLine(
+                            "Player Vitals  : name=${pv.playerName ?: "(unbound)"} | " +
+                                "HP=${pv.hp ?: "-"}/${pv.effectiveMaxHp ?: "-"} | " +
+                                "MP=${pv.mp ?: "-"}/${pv.effectiveMaxMp ?: "-"} | " +
+                                "FP=${pv.fp ?: "-"}/${pv.effectiveMaxFp ?: "-"}"
+                        )
+                    }
+                    WasmStructFieldKind.entries.forEach { kind ->
+                        state.structProber.schema.fieldFor(kind)?.let { f ->
+                            appendLine("  ${kind.shortLabel.padEnd(6)} : ${f.displayExpression}")
+                        }
                     }
                 }
                 appendLine()
@@ -3740,6 +4228,26 @@ class DiagnosticsViewModel : ViewModel() {
                     .put("persistentPointerChains", pointerChainsArr)
                     .put("candidates", floatDeltaArr)
             )
+
+            val schemaJsonObj = try {
+                JSONObject(SiteStructSchemaStore.serializeSchema(state.structProber.schema))
+            } catch (_: Exception) {
+                JSONObject()
+            }
+            root.put("entityStructSchema", schemaJsonObj)
+            state.playerVitals?.let { pv ->
+                root.put(
+                    "livePlayerVitals",
+                    JSONObject()
+                        .put("playerName", pv.playerName ?: JSONObject.NULL)
+                        .put("hp", pv.hp ?: JSONObject.NULL)
+                        .put("maxHp", pv.effectiveMaxHp ?: JSONObject.NULL)
+                        .put("mp", pv.mp ?: JSONObject.NULL)
+                        .put("maxMp", pv.effectiveMaxMp ?: JSONObject.NULL)
+                        .put("fp", pv.fp ?: JSONObject.NULL)
+                        .put("maxFp", pv.effectiveMaxFp ?: JSONObject.NULL)
+                )
+            } ?: root.put("livePlayerVitals", JSONObject.NULL)
 
             return root.toString(2)
         }

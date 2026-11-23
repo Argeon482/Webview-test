@@ -220,5 +220,44 @@ class ExampleUnitTest {
     assertNull(SitePointerStore.normalizeHostKey("about:blank"))
     assertNull(SitePointerStore.normalizeHostKey("   "))
   }
+
+  @Test
+  fun wasmStructProberScriptsCoverStatsNamesAndRemainStrictlyReadOnly() {
+    val syncScript = WasmStructProberScripts.buildSyncStructSchemaScript("""{"hp":{"relOffsetBytes":456,"valueType":"INT32"}}""")
+    val statProbeScript = WasmStructProberScripts.buildProbeStatOffsetsScript(
+      fieldKind = WasmStructFieldKind.HP,
+      playerByteAddress = 65011712L,
+      targetValue = 4338.0
+    )
+    val statRefineScript = WasmStructProberScripts.buildProbeStatOffsetsScript(
+      fieldKind = WasmStructFieldKind.HP,
+      playerByteAddress = 65011712L,
+      targetValue = 4120.0,
+      existingCandidatesJson = """[{"relOffsetBytes":456,"valueType":"INT32"}]"""
+    )
+    val nameProbeScript = WasmStructProberScripts.buildProbeNameOffsetsScript(
+      playerByteAddress = 65011712L,
+      nameQuery = "Aibatt"
+    )
+
+    assertTrue(syncScript.contains("window.__wvStructSchema"))
+    assertTrue(statProbeScript.contains("WASM_STRUCT_PROBE_RESULTS"))
+    assertTrue(statProbeScript.contains("mobPreviews"))
+    assertTrue(statProbeScript.contains("adjacentMaxOffsetBytes"))
+    assertTrue(statRefineScript.contains("isRefine: true"))
+    assertTrue(nameProbeScript.contains("INLINE_UTF8"))
+    assertTrue(nameProbeScript.contains("CHAR_PTR"))
+    assertTrue(nameProbeScript.contains("STD_STRING"))
+    assertTrue(nameProbeScript.contains("Aibatt"))
+
+    // Strictly read-only: zero writes to WASM linear memory and zero synthetic input events
+    val heapWriteRegex = Regex("""(hf32|hu32|h32|h16|u8|heapF32|heapU32|heap32|heap16|heapU8|HEAPF32|HEAPU32|HEAP32|HEAPU8)\[[^\]]+]\s*=(?!=)""")
+    val syntheticInputRegex = Regex("""(dispatchEvent|MouseEvent|PointerEvent|TouchEvent|KeyboardEvent)""")
+    listOf(syncScript, statProbeScript, statRefineScript, nameProbeScript).forEach { script ->
+      assertFalse("Must not write to WASM heap", heapWriteRegex.containsMatchIn(script))
+      assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
+    }
+  }
 }
+
 

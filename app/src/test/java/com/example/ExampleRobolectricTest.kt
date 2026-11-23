@@ -628,5 +628,100 @@ class ExampleRobolectricTest {
         assertEquals(4.03, movedEntity.distanceToPlayer, 0.01)
         assertEquals(4, vm.uiState.value.wasmEntityLiveTickCount)
     }
+
+    @Test
+    fun `entity struct prober binds hp and mob names persists per site streams live hud vitals and exports`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val ptrStore = SitePointerStore(InMemoryPointerStorage())
+        val schemaStore = SiteStructSchemaStore(InMemoryPointerStorage())
+        val vm = DiagnosticsViewModel()
+        vm.setSitePointerStoreForTesting(ptrStore)
+        vm.setSiteStructSchemaStoreForTesting(schemaStore)
+
+        val url = "https://universe.flyff.com/play"
+        vm.onUrlInputChanged(url)
+        vm.onLoadUrlRequested()
+
+        // Seed an active live player pointer
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":9.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
+        )
+
+        // 1. Probe HP value -> receive candidate with adjacent MaxHP and 3-mob cross-preview -> bind
+        vm.onSelectStructProbeField(WasmStructFieldKind.HP)
+        vm.onStructProbeInputChanged("4338")
+        vm.runStructFieldProbe(refineExisting = false)
+        assertTrue(vm.uiState.value.structProber.isProbing)
+
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"HP","isRefine":false,"durationMs":1.4,"totalFound":1,"candidates":[{"id":"D_456_INT32","relOffsetBytes":456,"subOffsetBytes":null,"valueType":"INT32","expression":"+0x1C8 [i32]","playerDisplayValue":"4338","playerNumericValue":4338,"adjacentMaxOffsetBytes":460,"adjacentMaxValue":4500,"mobPreviews":["#1=280","#2=310"],"nonZeroMobCount":2}]}"""
+        )
+        assertFalse(vm.uiState.value.structProber.isProbing)
+        assertEquals(1, vm.uiState.value.structProber.candidates.size)
+
+        vm.onBindStructFieldCandidate(vm.uiState.value.structProber.candidates.first())
+        val schemaAfterHp = vm.uiState.value.structProber.schema
+        assertEquals(456, schemaAfterHp.hp?.relOffsetBytes)
+        assertEquals(460, schemaAfterHp.maxHp?.relOffsetBytes)
+        assertTrue(schemaAfterHp.isSavedLocally)
+
+        // 2. Auto-probe Name -> receive CHAR_PTR candidate -> bind
+        vm.runAutoProbeEntityNames()
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"NAME","isRefine":false,"durationMs":2.1,"totalFound":1,"candidates":[{"id":"N_528_CHAR_PTR","relOffsetBytes":528,"subOffsetBytes":null,"valueType":"CHAR_PTR","expression":"+0x210 [char*]","playerDisplayValue":"HeroBlade","mobPreviews":["#1=\"Small Aibatt\"","#2=\"Mushpang\""],"nonZeroMobCount":2}]}"""
+        )
+        vm.onBindStructFieldCandidate(vm.uiState.value.structProber.candidates.first())
+        assertEquals(528, vm.uiState.value.structProber.schema.name?.relOffsetBytes)
+        assertEquals(WasmStructValueType.CHAR_PTR, vm.uiState.value.structProber.schema.name?.valueType)
+
+        // 3. Receive 200ms pointer watch tick containing live playerVitals -> populates HUD vitals
+        vm.onWasmPointersUpdatedFromBridge(
+            """{"stage":"WASM_POINTER_WATCH_TICK","tick":6,"activeHudPointerId":"L1_0x00135C64_+0x98","playerVitals":{"name":"HeroBlade","hp":4120,"maxHp":4500,"mp":820,"maxMp":900,"fp":510,"maxFp":600},"results":[{"id":"L1_0x00135C64_+0x98","resolvedTargetAddress":65011712,"resolvedX":6965.0,"resolvedY":100.0,"resolvedZ":3311.0,"status":"MOVING","isVerifiedLive":true,"changedFromPrev":true,"changeCount":2,"lastDeltaMagnitude":3.2}]}"""
+        )
+        val vitals = vm.uiState.value.playerVitals
+        assertTrue(vitals != null)
+        assertEquals("HeroBlade", vitals!!.playerName)
+        assertEquals(4120, vitals.hp)
+        assertEquals(4500, vitals.effectiveMaxHp)
+        assertEquals(820, vitals.mp)
+        assertEquals(510, vitals.fp)
+
+        // 4. Receive 500ms live entity tick containing decoded Mob Name + HP
+        vm.onWasmEntitiesUpdatedFromBridge(
+            """{"stage":"WASM_ENTITIES_TICK","tick":2,"entities":[{"name":"WASM Entity #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"resolvedName":"Small Aibatt","hp":240,"maxHp":280,"mp":40,"maxMp":40,"worldX":6970.0,"worldY":100.0,"worldZ":3314.0,"distanceToPlayer":5.8,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","struct=0x03E01000"]}]}"""
+        )
+        val mob = vm.uiState.value.discoveredEntities.first()
+        assertEquals("Small Aibatt", mob.displayName)
+        assertEquals(240, mob.hp)
+        assertEquals(280, mob.maxHp)
+
+        // 5. Verify fresh ViewModel reloads saved per-site struct schema on page finish
+        val reloadedVm = DiagnosticsViewModel()
+        reloadedVm.setSitePointerStoreForTesting(ptrStore)
+        reloadedVm.setSiteStructSchemaStoreForTesting(schemaStore)
+        reloadedVm.onPageFinished(url, "Flyff Universe")
+        assertEquals(456, reloadedVm.uiState.value.structProber.schema.hp?.relOffsetBytes)
+        assertEquals(528, reloadedVm.uiState.value.structProber.schema.name?.relOffsetBytes)
+
+        // 6. Verify SharedPreferences constructor and export JSON / Log Dump
+        val prefsSchemaStore = SiteStructSchemaStore(context)
+        prefsSchemaStore.clearSchemaForUrl(url)
+        prefsSchemaStore.saveSchemaForUrl(url, vm.uiState.value.structProber.schema)
+        assertEquals(456, prefsSchemaStore.loadSchemaForUrl(url).hp?.relOffsetBytes)
+
+        val mapJson = DiagnosticsViewModel.buildWasmMemoryMapJson(vm.uiState.value)
+        assertTrue(mapJson.contains("entityStructSchema"))
+        assertTrue(mapJson.contains("livePlayerVitals"))
+        assertTrue(mapJson.contains("HeroBlade"))
+
+        val dumpText = DiagnosticsViewModel.buildFullLogDumpText(vm.uiState.value)
+        assertTrue(dumpText.contains("Small Aibatt"))
+        assertTrue(dumpText.contains("HP=240/280"))
+        assertTrue(dumpText.contains("BOUND ENTITY STRUCT SCHEMA"))
+    }
 }
+
 

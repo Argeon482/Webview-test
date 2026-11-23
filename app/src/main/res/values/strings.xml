@@ -124,4 +124,20 @@
     <string name="cd_pin_pointer_chain">Bookmark pointer chain locally for this site</string>
     <string name="cd_stream_pointer_hud">Stream this pointer chain live to the top coordinates HUD</string>
     <string name="cd_toggle_wasm_entities_live">Toggle 500ms live position refresh for WASM nearby entities</string>
+
+    <!-- WASM Entity Struct Field Prober (Player & Mob HP / MP / FP + Mob Names) -->
+    <string name="struct_prober_title">Entity Struct Prober (HP / MP / FP / Names)</string>
+    <string name="struct_prober_hint_stat">Type your current in-game stat value and tap Probe Struct. If multiple offsets match, change the stat in-game and tap Refine — then Bind to apply to HUD &amp; all mobs.</string>
+    <string name="struct_prober_hint_name">Tap Auto-Probe to list inline UTF-8, char*, and std::string fields on your player &amp; nearby mobs, or type a player/mob name to pinpoint the exact Name offset.</string>
+    <string name="struct_prober_stat_placeholder">Current value (e.g. 4338)</string>
+    <string name="struct_prober_name_placeholder">Player or mob name (optional)</string>
+    <string name="action_probe_struct">Probe Struct</string>
+    <string name="action_refine_struct">Refine</string>
+    <string name="action_auto_probe_names">Auto-Probe</string>
+    <string name="action_search_names">Search</string>
+    <string name="action_bind_offset">Bind</string>
+    <string name="action_clear_schema">Clear All</string>
+    <string name="cd_toggle_struct_prober">Expand or collapse entity struct field prober</string>
+    <string name="cd_clear_bound_field">Clear this bound struct offset</string>
 </resources>
+

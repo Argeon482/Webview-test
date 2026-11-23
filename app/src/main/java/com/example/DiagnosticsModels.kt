@@ -169,8 +169,23 @@ data class DiscoveredEntitySample(
     val screenX: Double,
     val screenY: Double,
     val inViewport: Boolean,
-    val sampleKeys: List<String>
-)
+    val sampleKeys: List<String>,
+    val coordByteAddress: Long = 0L,
+    val heapIndex: Int = -1,
+    val resolvedName: String? = null,
+    val hp: Int? = null,
+    val maxHp: Int? = null,
+    val mp: Int? = null,
+    val maxMp: Int? = null,
+    val fp: Int? = null,
+    val maxFp: Int? = null
+) {
+    val displayName: String
+        get() = resolvedName?.takeIf { it.isNotBlank() } ?: name
+
+    val hasAnyVitals: Boolean
+        get() = hp != null || mp != null || fp != null
+}
 
 @Immutable
 data class ExportReportOutcome(
@@ -333,6 +348,172 @@ data class WasmFloatDeltaState(
     val savedPointerCountForHost: Int = 0
 )
 
+enum class WasmStructFieldKind(
+    val shortLabel: String,
+    val jsonKey: String,
+    val isNameField: Boolean = false
+) {
+    HP("HP", "hp"),
+    MAX_HP("MaxHP", "maxHp"),
+    MP("MP", "mp"),
+    MAX_MP("MaxMP", "maxMp"),
+    FP("FP", "fp"),
+    MAX_FP("MaxFP", "maxFp"),
+    NAME("Name", "name", isNameField = true);
+
+    companion object {
+        fun fromRaw(raw: String): WasmStructFieldKind =
+            entries.firstOrNull {
+                it.name.equals(raw.trim(), ignoreCase = true) ||
+                    it.jsonKey.equals(raw.trim(), ignoreCase = true)
+            } ?: HP
+    }
+}
+
+enum class WasmStructValueType(val shortTag: String) {
+    INT32("i32"),
+    FLOAT32("f32"),
+    INT16("i16"),
+    INLINE_UTF8("utf8"),
+    CHAR_PTR("char*"),
+    STD_STRING("std::str");
+
+    companion object {
+        fun fromRaw(raw: String): WasmStructValueType =
+            entries.firstOrNull {
+                it.name.equals(raw.trim(), ignoreCase = true) ||
+                    it.shortTag.equals(raw.trim(), ignoreCase = true)
+            } ?: INT32
+    }
+}
+
+@Immutable
+data class WasmStructFieldOffset(
+    val relOffsetBytes: Int,
+    val subOffsetBytes: Int? = null,
+    val valueType: WasmStructValueType = WasmStructValueType.INT32,
+    val expression: String = ""
+) {
+    val displayExpression: String
+        get() {
+            if (expression.isNotBlank()) return expression
+            val relHex = formatSignedHex(relOffsetBytes)
+            return if (subOffsetBytes != null) {
+                "*($relHex)${formatSignedHex(subOffsetBytes)} [${valueType.shortTag}]"
+            } else {
+                "$relHex [${valueType.shortTag}]"
+            }
+        }
+
+    companion object {
+        fun formatSignedHex(bytes: Int): String {
+            val sign = if (bytes < 0) "-" else "+"
+            val absHex = kotlin.math.abs(bytes).toString(16).uppercase()
+            return "${sign}0x$absHex"
+        }
+    }
+}
+
+@Immutable
+data class WasmEntityStructSchema(
+    val hp: WasmStructFieldOffset? = null,
+    val maxHp: WasmStructFieldOffset? = null,
+    val mp: WasmStructFieldOffset? = null,
+    val maxMp: WasmStructFieldOffset? = null,
+    val fp: WasmStructFieldOffset? = null,
+    val maxFp: WasmStructFieldOffset? = null,
+    val name: WasmStructFieldOffset? = null,
+    val isSavedLocally: Boolean = false,
+    val hostKey: String = ""
+) {
+    val hasAnyBound: Boolean
+        get() = hp != null || maxHp != null || mp != null || maxMp != null || fp != null || maxFp != null || name != null
+
+    val boundCount: Int
+        get() = listOfNotNull(hp, maxHp, mp, maxMp, fp, maxFp, name).size
+
+    fun fieldFor(kind: WasmStructFieldKind): WasmStructFieldOffset? = when (kind) {
+        WasmStructFieldKind.HP -> hp
+        WasmStructFieldKind.MAX_HP -> maxHp
+        WasmStructFieldKind.MP -> mp
+        WasmStructFieldKind.MAX_MP -> maxMp
+        WasmStructFieldKind.FP -> fp
+        WasmStructFieldKind.MAX_FP -> maxFp
+        WasmStructFieldKind.NAME -> name
+    }
+
+    fun withField(kind: WasmStructFieldKind, offset: WasmStructFieldOffset?): WasmEntityStructSchema = when (kind) {
+        WasmStructFieldKind.HP -> copy(hp = offset)
+        WasmStructFieldKind.MAX_HP -> copy(maxHp = offset)
+        WasmStructFieldKind.MP -> copy(mp = offset)
+        WasmStructFieldKind.MAX_MP -> copy(maxMp = offset)
+        WasmStructFieldKind.FP -> copy(fp = offset)
+        WasmStructFieldKind.MAX_FP -> copy(maxFp = offset)
+        WasmStructFieldKind.NAME -> copy(name = offset)
+    }
+}
+
+@Immutable
+data class WasmStructProbeCandidate(
+    val id: String,
+    val relOffsetBytes: Int,
+    val subOffsetBytes: Int? = null,
+    val valueType: WasmStructValueType,
+    val expression: String,
+    val playerDisplayValue: String,
+    val playerNumericValue: Double? = null,
+    val adjacentMaxOffsetBytes: Int? = null,
+    val adjacentMaxValue: Int? = null,
+    val mobPreviews: List<String> = emptyList(),
+    val nonZeroMobCount: Int = 0
+) {
+    fun toFieldOffset(): WasmStructFieldOffset = WasmStructFieldOffset(
+        relOffsetBytes = relOffsetBytes,
+        subOffsetBytes = subOffsetBytes,
+        valueType = valueType,
+        expression = expression
+    )
+}
+
+@Immutable
+data class PlayerVitalsSnapshot(
+    val playerName: String? = null,
+    val hp: Int? = null,
+    val maxHp: Int? = null,
+    val mp: Int? = null,
+    val maxMp: Int? = null,
+    val fp: Int? = null,
+    val maxFp: Int? = null,
+    val observedPeakHp: Int? = null,
+    val observedPeakMp: Int? = null,
+    val observedPeakFp: Int? = null,
+    val updatedAtMs: Long = System.currentTimeMillis()
+) {
+    val hasAnyContent: Boolean
+        get() = !playerName.isNullOrBlank() || hp != null || mp != null || fp != null
+
+    val effectiveMaxHp: Int?
+        get() = maxHp?.takeIf { it > 0 } ?: observedPeakHp?.takeIf { it > 0 }
+
+    val effectiveMaxMp: Int?
+        get() = maxMp?.takeIf { it > 0 } ?: observedPeakMp?.takeIf { it > 0 }
+
+    val effectiveMaxFp: Int?
+        get() = maxFp?.takeIf { it > 0 } ?: observedPeakFp?.takeIf { it > 0 }
+}
+
+@Immutable
+data class WasmStructProberState(
+    val isExpanded: Boolean = true,
+    val activeField: WasmStructFieldKind = WasmStructFieldKind.HP,
+    val queryInput: String = "",
+    val isProbing: Boolean = false,
+    val probeRound: Int = 0,
+    val candidates: List<WasmStructProbeCandidate> = emptyList(),
+    val schema: WasmEntityStructSchema = WasmEntityStructSchema(),
+    val statusMessage: String = ""
+)
+
 @Immutable
 data class DiagnosticsUiState(
     val urlInput: String = "",
@@ -377,6 +558,8 @@ data class DiagnosticsUiState(
     val lastEntityCount: Int = 0,
     val isWasmEntitiesLivePolling: Boolean = false,
     val wasmEntityLiveTickCount: Int = 0,
+    val playerVitals: PlayerVitalsSnapshot? = null,
+    val structProber: WasmStructProberState = WasmStructProberState(),
     // Step 4/5 Passive asset & console state
     val wasmHeap: WasmHeapTrackerState = WasmHeapTrackerState(),
     val interceptedAssets: List<InterceptedAsset> = emptyList(),

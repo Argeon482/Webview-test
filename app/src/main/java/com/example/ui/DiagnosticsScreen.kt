@@ -322,6 +322,24 @@ fun DiagnosticsScreen(
                         onPruneWasmPointers = viewModel::onPruneZeroAndStalePointers,
                         onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
                         onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
+                        onToggleStructProberExpanded = viewModel::onToggleStructProberExpanded,
+                        onSelectStructProbeField = viewModel::onSelectStructProbeField,
+                        onStructProbeInputChanged = viewModel::onStructProbeInputChanged,
+                        onRunStructProbe = {
+                            focusManager.clearFocus()
+                            viewModel.runStructFieldProbe(refineExisting = false)
+                        },
+                        onRunStructRefine = {
+                            focusManager.clearFocus()
+                            viewModel.runStructFieldProbe(refineExisting = true)
+                        },
+                        onRunAutoProbeNames = {
+                            focusManager.clearFocus()
+                            viewModel.runAutoProbeEntityNames()
+                        },
+                        onBindStructCandidate = { cand -> viewModel.onBindStructFieldCandidate(cand) },
+                        onClearBoundStructField = viewModel::onClearBoundStructField,
+                        onClearAllBoundStructFields = viewModel::onClearAllBoundStructFields,
                         modifier = Modifier
                             .weight(if (state.isConsoleExpanded) 0.58f else 0.40f)
                             .fillMaxHeight()
@@ -421,6 +439,24 @@ fun DiagnosticsScreen(
                         onPruneWasmPointers = viewModel::onPruneZeroAndStalePointers,
                         onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
                         onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
+                        onToggleStructProberExpanded = viewModel::onToggleStructProberExpanded,
+                        onSelectStructProbeField = viewModel::onSelectStructProbeField,
+                        onStructProbeInputChanged = viewModel::onStructProbeInputChanged,
+                        onRunStructProbe = {
+                            focusManager.clearFocus()
+                            viewModel.runStructFieldProbe(refineExisting = false)
+                        },
+                        onRunStructRefine = {
+                            focusManager.clearFocus()
+                            viewModel.runStructFieldProbe(refineExisting = true)
+                        },
+                        onRunAutoProbeNames = {
+                            focusManager.clearFocus()
+                            viewModel.runAutoProbeEntityNames()
+                        },
+                        onBindStructCandidate = { cand -> viewModel.onBindStructFieldCandidate(cand) },
+                        onClearBoundStructField = viewModel::onClearBoundStructField,
+                        onClearAllBoundStructFields = viewModel::onClearAllBoundStructFields,
                         modifier = Modifier
                             .weight(if (state.isConsoleExpanded) 0.66f else 0.42f)
                             .fillMaxWidth()

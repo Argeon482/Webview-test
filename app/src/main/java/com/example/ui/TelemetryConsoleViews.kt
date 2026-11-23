@@ -69,6 +69,8 @@ import com.example.LogCategory
 import com.example.R
 import com.example.ScopeBatchProgress
 import com.example.TelemetryLogEntry
+import com.example.WasmStructFieldKind
+import com.example.WasmStructProbeCandidate
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
 import com.example.ui.theme.ElectricCyan
@@ -503,12 +505,23 @@ fun EntityInspectionConsoleView(
     state: DiagnosticsUiState,
     onRescanEntities: () -> Unit,
     onToggleLiveEntities: () -> Unit,
+    onToggleStructProberExpanded: () -> Unit = {},
+    onSelectStructProbeField: (WasmStructFieldKind) -> Unit = {},
+    onStructProbeInputChanged: (String) -> Unit = {},
+    onRunStructProbe: () -> Unit = {},
+    onRunStructRefine: () -> Unit = {},
+    onRunAutoProbeNames: () -> Unit = {},
+    onBindStructCandidate: (WasmStructProbeCandidate) -> Unit = {},
+    onClearBoundStructField: (WasmStructFieldKind) -> Unit = {},
+    onClearAllBoundStructFields: () -> Unit = {},
     onPinPath: (path: String, detail: String) -> Unit,
     onCopyPayload: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isWasmEntityMode = state.entityProjectionMode.startsWith("WASM", ignoreCase = true) ||
-        state.discoveredEntities.any { it.sampleKeys.contains("WASM_STRUCT") }
+        state.discoveredEntities.any { it.sampleKeys.contains("WASM_STRUCT") } ||
+        state.hasLiveWasmPlayerAnchor ||
+        state.structProber.schema.hasAnyBound
 
     Column(modifier = modifier.background(ObsidianBg)) {
         Row(
@@ -617,6 +630,25 @@ fun EntityInspectionConsoleView(
 
         HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
+        if (isWasmEntityMode) {
+            StructProberPanel(
+                prober = state.structProber,
+                hasPlayerAnchor = state.hasLiveWasmPlayerAnchor,
+                trackedMobCount = state.discoveredEntities.size,
+                onToggleExpanded = onToggleStructProberExpanded,
+                onSelectField = onSelectStructProbeField,
+                onInputChanged = onStructProbeInputChanged,
+                onRunProbe = onRunStructProbe,
+                onRunRefine = onRunStructRefine,
+                onRunAutoProbeNames = onRunAutoProbeNames,
+                onBindCandidate = onBindStructCandidate,
+                onClearField = onClearBoundStructField,
+                onClearAllFields = onClearAllBoundStructFields,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+            )
+            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+        }
+
         if (state.discoveredEntities.isEmpty()) {
             Box(
                 modifier = Modifier
@@ -662,13 +694,20 @@ fun EntityInspectionConsoleView(
                         onPin = {
                             onPinPath(
                                 entity.path,
-                                "${entity.name} world(${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)})"
+                                "${entity.displayName} world(${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)})"
                             )
                         },
                         onCopy = {
+                            val vitalsPart = buildList {
+                                entity.hp?.let { add("HP=$it${entity.maxHp?.let { m -> "/$m" } ?: ""}") }
+                                entity.mp?.let { add("MP=$it${entity.maxMp?.let { m -> "/$m" } ?: ""}") }
+                                entity.fp?.let { add("FP=$it${entity.maxFp?.let { m -> "/$m" } ?: ""}") }
+                            }.joinToString(" ")
                             onCopyPayload(
-                                "${entity.name} (${entity.path}) world=(${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)}) " +
-                                    "dist=${fmt2(entity.distanceToPlayer)} screen=(${fmt2(entity.screenX)}, ${fmt2(entity.screenY)})"
+                                "${entity.displayName} (${entity.path})" +
+                                    (if (vitalsPart.isNotBlank()) " [$vitalsPart]" else "") +
+                                    " world=(${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)}) " +
+                                    "dist=${fmt2(entity.distanceToPlayer)}"
                             )
                         }
                     )
@@ -706,10 +745,10 @@ private fun EntitySampleCard(
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Text(
-                    text = entity.name + if (entity.id.isNotBlank()) " #${entity.id}" else "",
+                    text = entity.displayName + if (entity.resolvedName == null && entity.id.isNotBlank()) " #${entity.id}" else "",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurface,
+                    color = if (entity.resolvedName != null) TelemetryViolet else MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
@@ -740,6 +779,42 @@ private fun EntitySampleCard(
                         fontSize = 9.sp,
                         modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
                     )
+                }
+            }
+
+            if (entity.hasAnyVitals) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    entity.hp?.let { hpVal ->
+                        VitalGaugePill(
+                            label = "HP",
+                            current = hpVal,
+                            max = entity.maxHp,
+                            accent = AlertCoral,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    entity.mp?.let { mpVal ->
+                        VitalGaugePill(
+                            label = "MP",
+                            current = mpVal,
+                            max = entity.maxMp,
+                            accent = ElectricCyan,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    entity.fp?.let { fpVal ->
+                        VitalGaugePill(
+                            label = "FP",
+                            current = fpVal,
+                            max = entity.maxFp,
+                            accent = AssetAmber,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
                 }
             }
 

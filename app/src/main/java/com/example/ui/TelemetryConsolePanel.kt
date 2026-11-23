@@ -79,6 +79,8 @@ import com.example.LogCategory
 import com.example.PlayerCoordinates
 import com.example.R
 import com.example.Step2ScanMode
+import com.example.WasmStructFieldKind
+import com.example.WasmStructProbeCandidate
 import com.example.WizardStepBadge
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
@@ -150,6 +152,15 @@ fun TelemetryConsolePanel(
     onPruneWasmPointers: () -> Unit,
     onTogglePinPointerChain: (String) -> Unit,
     onToggleWasmEntitiesLive: () -> Unit,
+    onToggleStructProberExpanded: () -> Unit = {},
+    onSelectStructProbeField: (WasmStructFieldKind) -> Unit = {},
+    onStructProbeInputChanged: (String) -> Unit = {},
+    onRunStructProbe: () -> Unit = {},
+    onRunStructRefine: () -> Unit = {},
+    onRunAutoProbeNames: () -> Unit = {},
+    onBindStructCandidate: (WasmStructProbeCandidate) -> Unit = {},
+    onClearBoundStructField: (WasmStructFieldKind) -> Unit = {},
+    onClearAllBoundStructFields: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     if (state.isJsDrawerOpen) {
@@ -169,48 +180,111 @@ fun TelemetryConsolePanel(
                 onToggleExpanded = onToggleExpanded
             )
 
-            // Persistent compact Live Coords HUD strip when streaming via pointer or locked coords
-            state.livePlayerCoords?.let { hudCoords ->
+            // Persistent compact Live Coords + Player HP/MP/FP HUD strip (visible across all tabs)
+            val hudCoords = state.livePlayerCoords
+            val hudVitals = state.playerVitals?.takeIf { it.hasAnyContent }
+            if (hudCoords != null || hudVitals != null) {
                 HorizontalDivider(color = SignalEmerald.copy(alpha = 0.45f), thickness = 1.dp)
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(SignalEmerald.copy(alpha = 0.09f))
+                        .background(SignalEmerald.copy(alpha = 0.08f))
                         .clickable {
-                            onCopyPayload(
-                                "${hudCoords.path} -> X=${fmtCoord(hudCoords.x)}, Y=${fmtCoord(hudCoords.y)}, Z=${fmtCoord(hudCoords.z)}"
-                            )
+                            val summary = buildString {
+                                hudVitals?.playerName?.let { append("$it | ") }
+                                hudCoords?.let {
+                                    append("X=${fmtCoord(it.x)}, Y=${fmtCoord(it.y)}, Z=${fmtCoord(it.z)}")
+                                }
+                                hudVitals?.let { v ->
+                                    v.hp?.let { append(" | HP=$it${v.effectiveMaxHp?.let { m -> "/$m" } ?: ""}") }
+                                    v.mp?.let { append(" MP=$it${v.effectiveMaxMp?.let { m -> "/$m" } ?: ""}") }
+                                    v.fp?.let { append(" FP=$it${v.effectiveMaxFp?.let { m -> "/$m" } ?: ""}") }
+                                }
+                            }
+                            onCopyPayload(summary)
                         }
                         .padding(horizontal = 8.dp, vertical = 4.dp)
                         .testTag("live_coords_hud_strip"),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.MyLocation,
-                        contentDescription = null,
-                        tint = SignalEmerald,
-                        modifier = Modifier.size(13.dp)
-                    )
-                    Text(
-                        text = "X:${fmtCoord(hudCoords.x)}  Y:${fmtCoord(hudCoords.y)}  Z:${fmtCoord(hudCoords.z)}",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        fontWeight = FontWeight.Bold,
-                        color = SignalEmerald,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = hudCoords.path,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 9.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
+                    if (hudCoords != null) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.MyLocation,
+                                contentDescription = null,
+                                tint = SignalEmerald,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Text(
+                                text = "X:${fmtCoord(hudCoords.x)}  Y:${fmtCoord(hudCoords.y)}  Z:${fmtCoord(hudCoords.z)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = JetBrainsMonoFontFamily,
+                                fontWeight = FontWeight.Bold,
+                                color = SignalEmerald,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = hudVitals?.playerName?.takeIf { it.isNotBlank() } ?: hudCoords.path,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = JetBrainsMonoFontFamily,
+                                fontWeight = if (!hudVitals?.playerName.isNullOrBlank()) FontWeight.Bold else FontWeight.Normal,
+                                color = if (!hudVitals?.playerName.isNullOrBlank()) TelemetryViolet else MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontSize = 9.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+
+                    AnimatedVisibility(
+                        visible = hudVitals != null && (hudVitals.hp != null || hudVitals.mp != null || hudVitals.fp != null),
+                        enter = expandVertically() + fadeIn(),
+                        exit = shrinkVertically() + fadeOut()
+                    ) {
+                        hudVitals?.let { v ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .testTag("live_player_vitals_hud_row"),
+                                horizontalArrangement = Arrangement.spacedBy(5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                v.hp?.let { hpVal ->
+                                    VitalGaugePill(
+                                        label = "HP",
+                                        current = hpVal,
+                                        max = v.effectiveMaxHp,
+                                        accent = AlertCoral,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                                v.mp?.let { mpVal ->
+                                    VitalGaugePill(
+                                        label = "MP",
+                                        current = mpVal,
+                                        max = v.effectiveMaxMp,
+                                        accent = ElectricCyan,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                                v.fp?.let { fpVal ->
+                                    VitalGaugePill(
+                                        label = "FP",
+                                        current = fpVal,
+                                        max = v.effectiveMaxFp,
+                                        accent = AssetAmber,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -306,6 +380,15 @@ fun TelemetryConsolePanel(
                         state = state,
                         onRescanEntities = onRunStep3,
                         onToggleLiveEntities = onToggleWasmEntitiesLive,
+                        onToggleStructProberExpanded = onToggleStructProberExpanded,
+                        onSelectStructProbeField = onSelectStructProbeField,
+                        onStructProbeInputChanged = onStructProbeInputChanged,
+                        onRunStructProbe = onRunStructProbe,
+                        onRunStructRefine = onRunStructRefine,
+                        onRunAutoProbeNames = onRunAutoProbeNames,
+                        onBindStructCandidate = onBindStructCandidate,
+                        onClearBoundStructField = onClearBoundStructField,
+                        onClearAllBoundStructFields = onClearAllBoundStructFields,
                         onPinPath = { path, detail -> onPinExternalPath(path, "Step 3", detail) },
                         onCopyPayload = onCopyPayload,
                         modifier = Modifier

@@ -19,32 +19,41 @@ object WasmPointerAndEntityScripts {
             if (!obj || typeof obj !== 'object') return null;
             try {
               if (obj.HEAPF32 instanceof Float32Array && obj.HEAPF32.buffer && obj.HEAPF32.buffer.byteLength >= 4) {
+                const buf = obj.HEAPF32.buffer;
                 return {
                   heapF32: obj.HEAPF32,
-                  heapU32: new Uint32Array(obj.HEAPF32.buffer),
-                  heap32: new Int32Array(obj.HEAPF32.buffer),
+                  heapU32: new Uint32Array(buf),
+                  heap32: new Int32Array(buf),
+                  heap16: new Int16Array(buf),
+                  heapU8: new Uint8Array(buf),
                   label: prefix + 'HEAPF32',
-                  byteLength: obj.HEAPF32.buffer.byteLength
+                  byteLength: buf.byteLength
                 };
               }
               const h32 = obj.HEAP32 || obj.HEAPU8 || obj.HEAP8;
               if (h32 && ArrayBuffer.isView(h32) && h32.buffer && h32.buffer.byteLength >= 4) {
+                const buf = h32.buffer;
                 return {
-                  heapF32: new Float32Array(h32.buffer),
-                  heapU32: new Uint32Array(h32.buffer),
-                  heap32: new Int32Array(h32.buffer),
+                  heapF32: new Float32Array(buf),
+                  heapU32: new Uint32Array(buf),
+                  heap32: new Int32Array(buf),
+                  heap16: new Int16Array(buf),
+                  heapU8: new Uint8Array(buf),
                   label: prefix + 'HEAPF32 (buffer view)',
-                  byteLength: h32.buffer.byteLength
+                  byteLength: buf.byteLength
                 };
               }
               const mem = obj.wasmMemory || (obj.asm && obj.asm.memory) || (obj.wasmExports && obj.wasmExports.memory);
               if (typeof WebAssembly !== 'undefined' && mem instanceof WebAssembly.Memory && mem.buffer && mem.buffer.byteLength >= 4) {
+                const buf = mem.buffer;
                 return {
-                  heapF32: new Float32Array(mem.buffer),
-                  heapU32: new Uint32Array(mem.buffer),
-                  heap32: new Int32Array(mem.buffer),
+                  heapF32: new Float32Array(buf),
+                  heapU32: new Uint32Array(buf),
+                  heap32: new Int32Array(buf),
+                  heap16: new Int16Array(buf),
+                  heapU8: new Uint8Array(buf),
                   label: prefix + 'wasmMemory Float32Array',
-                  byteLength: mem.buffer.byteLength
+                  byteLength: buf.byteLength
                 };
               }
             } catch (_) {}
@@ -89,6 +98,118 @@ object WasmPointerAndEntityScripts {
 
         const __peFormatHex = function(n) {
           return '0x' + (n >>> 0).toString(16).toUpperCase().padStart(8, '0');
+        };
+
+        const __peReadUtf8 = function(u8, startAddr, maxLen) {
+          if (!u8 || startAddr <= 0 || startAddr >= u8.length) return null;
+          const limit = Math.min(u8.length, startAddr + (maxLen || 48));
+          const bytes = [];
+          let letters = 0;
+          for (let p = startAddr; p < limit; p++) {
+            const b = u8[p];
+            if (b === 0) break;
+            if (b >= 32 && b <= 126) {
+              bytes.push(b);
+              if ((b >= 65 && b <= 90) || (b >= 97 && b <= 122)) letters++;
+            } else if (b >= 0xC2 && b <= 0xF4 && p + 1 < limit) {
+              bytes.push(b);
+              letters++;
+            } else if (b >= 0x80 && b <= 0xBF && bytes.length > 0) {
+              bytes.push(b);
+            } else {
+              return null;
+            }
+          }
+          if (bytes.length < 2 || bytes.length > 44 || letters < 1) return null;
+          try {
+            const txt = (typeof TextDecoder !== 'undefined')
+              ? new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(bytes))
+              : String.fromCharCode.apply(null, bytes);
+            const cleaned = txt.trim();
+            return (cleaned.length >= 2 && cleaned.length <= 44) ? cleaned : null;
+          } catch (_) {
+            return null;
+          }
+        };
+
+        const __peReadSchemaField = function(coordAddr, desc, heaps) {
+          if (!desc || coordAddr <= 0) return null;
+          const byteLen = heaps.byteLength;
+          let addr = coordAddr + (desc.relOffsetBytes | 0);
+          if (addr <= 0 || addr >= byteLen) return null;
+          if (desc.subOffsetBytes !== null && desc.subOffsetBytes !== undefined) {
+            if ((addr & 3) !== 0 || (addr >>> 2) >= heaps.heapU32.length) return null;
+            const ptr = heaps.heapU32[addr >>> 2] >>> 0;
+            if (ptr < 1024 || ptr >= byteLen) return null;
+            addr = ptr + (desc.subOffsetBytes | 0);
+            if (addr <= 0 || addr >= byteLen) return null;
+          }
+          const vt = desc.valueType || 'INT32';
+          if (vt === 'INT32') {
+            if ((addr & 3) !== 0 || (addr >>> 2) >= heaps.heap32.length) return null;
+            const v = heaps.heap32[addr >>> 2];
+            return (v >= 0 && v <= 100000000) ? v : null;
+          }
+          if (vt === 'INT16') {
+            if ((addr & 1) !== 0 || (addr >>> 1) >= heaps.heap16.length) return null;
+            const v = heaps.heap16[addr >>> 1];
+            return (v >= 0 && v <= 32767) ? v : null;
+          }
+          if (vt === 'FLOAT32') {
+            if ((addr & 3) !== 0 || (addr >>> 2) >= heaps.heapF32.length) return null;
+            const fv = heaps.heapF32[addr >>> 2];
+            return (Number.isFinite(fv) && fv >= 0 && fv <= 100000000) ? Math.round(fv) : null;
+          }
+          if (vt === 'INLINE_UTF8') {
+            return __peReadUtf8(heaps.heapU8, addr, 48);
+          }
+          if (vt === 'CHAR_PTR') {
+            if ((addr & 3) !== 0 || (addr >>> 2) >= heaps.heapU32.length) return null;
+            const strPtr = heaps.heapU32[addr >>> 2] >>> 0;
+            if (strPtr < 1024 || strPtr >= byteLen) return null;
+            return __peReadUtf8(heaps.heapU8, strPtr, 48);
+          }
+          if (vt === 'STD_STRING') {
+            const b0 = heaps.heapU8[addr];
+            if ((b0 & 1) === 0) {
+              const ssoLen = b0 >>> 1;
+              if (ssoLen >= 2 && ssoLen <= 22 && addr + 1 + ssoLen < byteLen) {
+                const s1 = __peReadUtf8(heaps.heapU8, addr + 1, ssoLen + 1);
+                if (s1) return s1;
+              }
+            }
+            const slots = [8, 0, 4];
+            for (let s = 0; s < slots.length; s++) {
+              const sa = addr + slots[s];
+              if ((sa & 3) !== 0 || (sa >>> 2) >= heaps.heapU32.length) continue;
+              const p = heaps.heapU32[sa >>> 2] >>> 0;
+              if (p >= 1024 && p < byteLen) {
+                const t = __peReadUtf8(heaps.heapU8, p, 48);
+                if (t) return t;
+              }
+            }
+            return __peReadUtf8(heaps.heapU8, addr, 48);
+          }
+          return null;
+        };
+
+        const __peReadEntitySchema = function(coordAddr, heaps) {
+          const schema = window.__wvStructSchema;
+          if (!schema || typeof schema !== 'object' || coordAddr <= 0) return null;
+          const out = {};
+          let any = false;
+          const fields = ['hp', 'maxHp', 'mp', 'maxMp', 'fp', 'maxFp', 'name'];
+          for (let i = 0; i < fields.length; i++) {
+            const k = fields[i];
+            if (schema[k]) {
+              const val = __peReadSchemaField(coordAddr, schema[k], heaps);
+              if (val !== null && val !== undefined) {
+                out[k] = val;
+                any = true;
+              }
+            }
+          }
+          return any ? out : null;
         };
 
         const __peDerefChain = function(chain, heaps) {
@@ -279,6 +400,19 @@ object WasmPointerAndEntityScripts {
                 );
               }
 
+              let vitalsAnchorAddr = hudResolved ? hudResolved.addr : 0;
+              if (vitalsAnchorAddr <= 0) {
+                for (let ri = 0; ri < results.length; ri++) {
+                  if (results[ri].isVerifiedLive && results[ri].resolvedTargetAddress > 0) {
+                    vitalsAnchorAddr = results[ri].resolvedTargetAddress;
+                    break;
+                  }
+                }
+              }
+              const playerVitals = vitalsAnchorAddr > 0
+                ? __peReadEntitySchema(vitalsAnchorAddr, heaps)
+                : null;
+
               const payload = {
                 stage: 'WASM_POINTER_WATCH_TICK',
                 tick: __ptrWatch.tick,
@@ -290,6 +424,7 @@ object WasmPointerAndEntityScripts {
                 staleCount: staleCount,
                 activeHudPointerId: __ptrWatch.hudPointerId,
                 hudTargetAddress: hudResolved ? hudResolved.addr : 0,
+                playerVitals: playerVitals,
                 results: results
               };
 
@@ -675,11 +810,21 @@ object WasmPointerAndEntityScripts {
               const relTag = 'Δ(' + e.dx.toFixed(1) + ', ' + e.dy.toFixed(1) + ', ' + e.dz.toFixed(1) + ')';
               const entityName = 'WASM Entity #' + (i + 1);
               const entityPath = 'HEAPF32[' + e.heapIndex + '] @ ' + hexCoord;
+              const decoded = __peReadEntitySchema(e.byteAddr, heaps) || {};
 
               entities.push({
                 name: entityName,
                 id: candidateId || hexStruct,
                 path: entityPath,
+                coordByteAddress: e.byteAddr,
+                heapIndex: e.heapIndex,
+                resolvedName: decoded.name || null,
+                hp: (typeof decoded.hp === 'number') ? decoded.hp : null,
+                maxHp: (typeof decoded.maxHp === 'number') ? decoded.maxHp : null,
+                mp: (typeof decoded.mp === 'number') ? decoded.mp : null,
+                maxMp: (typeof decoded.maxMp === 'number') ? decoded.maxMp : null,
+                fp: (typeof decoded.fp === 'number') ? decoded.fp : null,
+                maxFp: (typeof decoded.maxFp === 'number') ? decoded.maxFp : null,
                 worldX: Number(e.x.toFixed(3)),
                 worldY: Number(e.y.toFixed(3)),
                 worldZ: Number(e.z.toFixed(3)),
@@ -803,10 +948,20 @@ object WasmPointerAndEntityScripts {
                   const dy = hasPlayer ? (y - py) : 0;
                   const dz = hasPlayer ? (z - pz) : 0;
                   const dist = hasPlayer ? Math.sqrt(dx * dx + dy * dy + dz * dz) : 0;
+                  const decoded = __peReadEntitySchema(t.byteAddr, heaps) || {};
                   out.push({
                     name: t.name,
                     id: t.id,
                     path: t.path,
+                    coordByteAddress: t.byteAddr,
+                    heapIndex: t.heapIndex,
+                    resolvedName: decoded.name || null,
+                    hp: (typeof decoded.hp === 'number') ? decoded.hp : null,
+                    maxHp: (typeof decoded.maxHp === 'number') ? decoded.maxHp : null,
+                    mp: (typeof decoded.mp === 'number') ? decoded.mp : null,
+                    maxMp: (typeof decoded.maxMp === 'number') ? decoded.maxMp : null,
+                    fp: (typeof decoded.fp === 'number') ? decoded.fp : null,
+                    maxFp: (typeof decoded.maxFp === 'number') ? decoded.maxFp : null,
                     worldX: Number(x.toFixed(3)),
                     worldY: Number(y.toFixed(3)),
                     worldZ: Number(z.toFixed(3)),

@@ -29,28 +29,29 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun step1MovementFloatDeltaScriptsAreNonBlockingStillnessFilteredAndReadOnly() {
+    fun step1MovementFloatDeltaScriptsUseIsolatedBufferClonePermissiveDeltasAndReadOnly() {
         val baselineScript = WasmHeapScripts.buildCaptureStandingBaselineScript()
-        val deltaScript = WasmHeapScripts.buildScanMovementDeltasScript(minDelta = 0.05, maxDelta = 500.0)
+        val deltaScript = WasmHeapScripts.buildScanMovementDeltasScript()
         val resetScript = WasmHeapScripts.buildResetFloatScanScript()
 
-        // Step 1A: Standing baseline snapshot + jitter prune
+        // Step 1A / 2A: True isolated Float32Array clone via buffer.slice() (never aliases live HEAPF32)
         assertTrue(baselineScript.contains("(async function()"))
         assertTrue(baselineScript.contains("window.HEAPF32"))
-        assertTrue(baselineScript.contains("new Int32Array("))
-        assertTrue(baselineScript.contains("new Float32Array("))
-        assertTrue(baselineScript.contains("setTimeout(resolve, 12)"))
-        assertTrue(baselineScript.contains("setTimeout(resolve, 120)"))
+        assertTrue(baselineScript.contains("hf32.buffer.slice(hf32.byteOffset, hf32.byteOffset + hf32.byteLength)"))
+        assertTrue(baselineScript.contains("new Float32Array(slicedBuffer)"))
+        assertTrue(baselineScript.contains("clonedHeap.buffer === hf32.buffer"))
         assertTrue(baselineScript.contains("FLOAT_BASELINE_CAPTURED"))
 
-        // Step 1B: Movement deltas + stillness verification + 200ms live preview
+        // Step 1B / 2B: Permissive 0.02..500.0 movement deltas + X/Y/Z Vec3 clustering + 200ms live preview
         assertTrue(deltaScript.contains("(async function()"))
+        assertTrue(deltaScript.contains("var MIN_DELTA = 0.02;"))
+        assertTrue(deltaScript.contains("var MAX_DELTA = 500.0;"))
+        assertTrue(deltaScript.contains("st.baselineHeap"))
+        assertTrue(deltaScript.contains("movedNext2 && validMidY"))
         assertTrue(deltaScript.contains("FLOAT_DELTAS_SCANNED"))
-        assertTrue(deltaScript.contains("isStillNow"))
         assertTrue(deltaScript.contains("updateFloatDeltaPreview"))
-        assertTrue(deltaScript.contains("200"))
 
-        assertTrue(resetScript.contains("st.snapIndices = null"))
+        assertTrue(resetScript.contains("st.baselineHeap = null"))
 
         listOf(baselineScript, deltaScript, resetScript).forEach { script ->
             assertFalse("Step 1 must never write to WASM heap", heapWriteRegex.containsMatchIn(script))

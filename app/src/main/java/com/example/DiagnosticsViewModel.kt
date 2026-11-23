@@ -699,12 +699,13 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
 
             "FLOAT_BASELINE_CAPTURED" -> {
                 val sampled = obj.optInt("sampledCount", 0)
+                val clonedLength = obj.optInt("clonedLength", sampled)
                 val pruned = obj.optInt("prunedJitterCount", 0)
                 val durationMs = obj.optDouble("durationMs", 0.0)
                 _uiState.update { state ->
                     state.copy(
                         scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "Baseline captured ($sampled static floats)",
+                        scanStatusDetail = "Isolated clone ready ($clonedLength floats)",
                         floatScanner = state.floatScanner.copy(
                             isBusy = false,
                             baselineCaptured = true,
@@ -713,13 +714,13 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                             scanDurationMs = durationMs,
                             candidates = emptyList(),
                             isLivePreviewing = false,
-                            statusMessage = "Baseline ready ($sampled static floats, $pruned timers pruned). Walk a few steps, stop, then tap '2. Scan Movement Deltas'."
+                            statusMessage = "Isolated Float32Array cloned ($sampled world-range floats, $pruned noisy timers flagged). Move in-game, then tap '2. Scan Movement Deltas' (0.02–500.0)."
                         )
                     )
                 }
                 appendLog(
                     category = LogCategory.SCAN,
-                    summary = "Baseline captured: $sampled static floats ($pruned jitter pruned) in ${durationMs}ms",
+                    summary = "Isolated baseline cloned: $clonedLength floats ($sampled world-range, $pruned timers flagged) in ${durationMs}ms",
                     payload = jsonStr
                 )
                 true

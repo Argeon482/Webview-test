@@ -242,14 +242,20 @@ fun DiagnosticsScreen(
             // 2. Compact, Fixed Live Telemetry Bar (zero layout shift @ 200ms)
             FixedLiveTelemetryBar(
                 state = state,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
             )
 
-            // 3. Adaptive Main Body
+            HorizontalDivider(
+                color = ObsidianBorder.copy(alpha = 0.85f),
+                thickness = 1.dp
+            )
+
+            // 3. Adaptive Main Body (NestedScrollView-compatible scrollable deck)
             BoxWithConstraints(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
+                    .padding(top = 6.dp)
             ) {
                 val isWideLayout = maxWidth >= 840.dp
                 val nestedScrollInterop = rememberNestedScrollInteropConnection()

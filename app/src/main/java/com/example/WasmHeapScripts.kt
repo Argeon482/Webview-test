@@ -156,9 +156,10 @@ function __wvEnsureState(defaultBase) {
     floatScanToken: 0,
     analyzeToken: 0,
     notifiedMissing: false,
-    snapIndices: null,
-    snapValues: null,
-    snapCount: 0,
+    baselineHeap: null,
+    baselineLength: 0,
+    jitterMask: null,
+    prevMovedMap: null,
     deltaCandidates: [],
     scanRound: 0
   });
@@ -372,8 +373,10 @@ function __wvExtractStructSignature(res, baseIndex, radius) {
     // =========================================================================
 
     /**
-     * Button A: Captures a non-blocking chunked standing baseline of static finite floats in
-     * `window.HEAPF32` (ignoring out-of-bounds/zero/subnormal noise and pruning ticking timers).
+     * Step 1A / 2A ("Capture Standing Baseline"):
+     * Creates a TRUE isolated clone of the active `window.HEAPF32` memory buffer via
+     * `new Float32Array(hf32.buffer.slice(...))` (with manual indexed-loop fallback) so baseline
+     * values NEVER alias or update live alongside character movement.
      */
     fun buildCaptureStandingBaselineScript(): String = """
 (async function() {
@@ -400,75 +403,82 @@ function __wvExtractStructSignature(res, baseIndex, radius) {
 
     var hf32 = res.hf32;
     var len = res.length;
-    var startIndex = len > 4096 ? 256 : 0;
-    var maxSnapshot = 1500000;
-    var chunkSize = 262144;
-    var totalChunks = Math.max(1, Math.ceil((len - startIndex) / chunkSize));
     var startTime = performance.now();
 
-    var idxBuf = new Int32Array(Math.min(maxSnapshot, len));
-    var valBuf = new Float32Array(Math.min(maxSnapshot, len));
-    var count = 0;
-
     if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('RUNNING', 'Snapshotting standing baseline...');
+      window.TelemetryBridge.updateScanStatus('RUNNING', 'Cloning isolated Float32Array baseline...');
     }
 
-    var chunkNo = 0;
-    for (var s = startIndex; s < len && count < maxSnapshot; s += chunkSize) {
-      if (st.floatScanToken !== token) return;
-      chunkNo++;
-      var e = Math.min(len, s + chunkSize);
-      for (var i = s; i < e; i++) {
-        var v = hf32[i];
-        if (!Number.isFinite(v)) continue;
-        var av = Math.abs(v);
-        if (av < 0.0001 || av > 100000) continue;
-        idxBuf[count] = i;
-        valBuf[count] = v;
-        count++;
-        if (count >= maxSnapshot) break;
+    // Create a true, isolated Float32Array clone (never aliases live window.HEAPF32.buffer)
+    var clonedHeap = null;
+    try {
+      var slicedBuffer = hf32.buffer.slice(hf32.byteOffset, hf32.byteOffset + hf32.byteLength);
+      clonedHeap = new Float32Array(slicedBuffer);
+    } catch (_sliceErr) {
+      clonedHeap = new Float32Array(len);
+      for (var c = 0; c < len; c++) {
+        clonedHeap[c] = hf32[c];
       }
-      if (window.TelemetryBridge && (chunkNo % 4 === 0 || chunkNo === totalChunks)) {
-        window.TelemetryBridge.updateScanStatus('RUNNING', 'Baseline slice ' + chunkNo + '/' + totalChunks + '...');
-      }
-      await new Promise(function(resolve) { setTimeout(resolve, 12); });
     }
 
-    if (st.floatScanToken !== token) return;
+    // Safety invariant: guarantee the clone does not share the live ArrayBuffer
+    if (clonedHeap.buffer === hf32.buffer) {
+      var manualClone = new Float32Array(len);
+      for (var mc = 0; mc < len; mc++) {
+        manualClone[mc] = hf32[mc];
+      }
+      clonedHeap = manualClone;
+    }
 
-    // Wait 120ms while standing still and prune continuously changing timers/particles
-    await new Promise(function(resolve) { setTimeout(resolve, 120); });
+    // Brief 100ms idle observation to flag high-frequency animated timers (> 0.05 jump while idle)
+    // without mutating the isolated clone or dropping 0.0 / subtle server sync ticks.
+    await new Promise(function(resolve) { setTimeout(resolve, 100); });
     if (st.floatScanToken !== token) return;
 
     var liveRes = __wvResolveWasmHeap();
     var liveF32 = liveRes ? liveRes.hf32 : hf32;
-    var writePos = 0;
-    var pruned = 0;
-    for (var k = 0; k < count; k++) {
-      var hIdx = idxBuf[k];
-      if (hIdx < liveF32.length && Math.abs(liveF32[hIdx] - valBuf[k]) <= 0.0005) {
-        idxBuf[writePos] = hIdx;
-        valBuf[writePos] = valBuf[k];
-        writePos++;
-      } else {
-        pruned++;
+    var jitterMask = new Uint8Array(len);
+    var startIndex = len > 4096 ? 64 : 0;
+    var chunkSize = 524288;
+    var validFloatCount = 0;
+    var prunedJitter = 0;
+
+    for (var s = startIndex; s < len; s += chunkSize) {
+      if (st.floatScanToken !== token) return;
+      var e = Math.min(len, s + chunkSize);
+      for (var i = s; i < e; i++) {
+        var bv = clonedHeap[i];
+        if (!Number.isFinite(bv) || Math.abs(bv) > 100000) continue;
+        validFloatCount++;
+        if (i < liveF32.length) {
+          var lv = liveF32[i];
+          if (Number.isFinite(lv) && Math.abs(lv - bv) > 0.05) {
+            jitterMask[i] = 1;
+            prunedJitter++;
+          }
+        }
       }
+      await new Promise(function(resolve) { setTimeout(resolve, 8); });
     }
 
-    st.snapIndices = idxBuf.subarray(0, writePos);
-    st.snapValues = valBuf.subarray(0, writePos);
-    st.snapCount = writePos;
+    if (st.floatScanToken !== token) return;
+
+    st.baselineHeap = clonedHeap;
+    st.baselineLength = len;
+    st.jitterMask = jitterMask;
+    st.prevMovedMap = null;
     st.deltaCandidates = [];
     st.scanRound = 0;
 
     var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
     if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Baseline: ' + writePos + ' static floats');
+      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Cloned ' + len + ' floats (' + durationMs + 'ms)');
       window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
         type: 'FLOAT_BASELINE_CAPTURED',
-        sampledCount: writePos,
-        prunedJitterCount: pruned,
+        sampledCount: validFloatCount,
+        clonedLength: len,
+        prunedJitterCount: prunedJitter,
+        isolatedClone: clonedHeap.buffer !== hf32.buffer,
         durationMs: durationMs,
         heapByteLength: res.byteLength,
         heapSource: res.label
@@ -484,11 +494,13 @@ function __wvExtractStructSignature(res, baseIndex, radius) {
 """.trimIndent()
 
     /**
-     * Button B: Filters `window.HEAPF32` against the standing baseline for floats that shifted
-     * during movement and stopped when standing still, then starts a 200ms live preview ticker.
+     * Step 1B / 2B ("Scan Movement Deltas"):
+     * Compares live `window.HEAPF32` against the isolated `baselineHeap` clone using permissive
+     * movement thresholds (`0.02` to `500.0`), clusters adjacent `X, Y, Z` floats (including
+     * flat-ground `X + Z` movement with constant `Y`), and streams live 200ms previews immediately.
      */
     fun buildScanMovementDeltasScript(
-        minDelta: Double = 0.05,
+        minDelta: Double = 0.02,
         maxDelta: Double = 500.0
     ): String = """
 (async function() {
@@ -497,7 +509,7 @@ function __wvExtractStructSignature(res, baseIndex, radius) {
     var st = __wvEnsureState($VERIFIED_PLAYER_BASE_INDEX);
     var token = ++st.floatScanToken;
 
-    if (!st.snapIndices || !st.snapValues || st.snapCount === 0) {
+    if (!st.baselineHeap || st.baselineLength === 0) {
       if (window.TelemetryBridge) {
         window.TelemetryBridge.updateScanStatus('ERROR', 'Capture baseline first');
         window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
@@ -521,125 +533,156 @@ function __wvExtractStructSignature(res, baseIndex, radius) {
     }
 
     var hf32 = res.hf32;
-    var len = res.length;
+    var baseHeap = st.baselineHeap;
+    var jitterMask = st.jitterMask;
+    var scanLen = Math.min(res.length, st.baselineLength);
+    var startIndex = scanLen > 4096 ? 64 : 0;
     var startTime = performance.now();
-    var minD = $minDelta;
-    var maxD = $maxDelta;
+    var MIN_DELTA = $minDelta;
+    var MAX_DELTA = $maxDelta;
     var chunkSize = 262144;
+    var totalChunks = Math.max(1, Math.ceil((scanLen - startIndex) / chunkSize));
 
     if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('RUNNING', 'Scanning movement float deltas...');
+      window.TelemetryBridge.updateScanStatus('RUNNING', 'Scanning float deltas (' + MIN_DELTA + '..' + MAX_DELTA + ')...');
     }
 
     var hits = [];
-    var snapIdx = st.snapIndices;
-    var snapVal = st.snapValues;
-    var total = st.snapCount;
+    var movedSet = Object.create(null);
+    var chunkNo = 0;
 
-    for (var s = 0; s < total; s += chunkSize) {
+    for (var s = startIndex; s < scanLen; s += chunkSize) {
       if (st.floatScanToken !== token) return;
-      var e = Math.min(total, s + chunkSize);
-      for (var k = s; k < e; k++) {
-        var idx = snapIdx[k];
-        if (idx >= len) continue;
-        var cur = hf32[idx];
-        if (!Number.isFinite(cur) || Math.abs(cur) > 100000) continue;
-        var base = snapVal[k];
+      chunkNo++;
+      var e = Math.min(scanLen, s + chunkSize);
+      for (var i = s; i < e; i++) {
+        if (jitterMask && jitterMask[i] === 1) continue;
+        var base = baseHeap[i];
+        var cur = hf32[i];
+        if (!Number.isFinite(base) || !Number.isFinite(cur)) continue;
+        if (Math.abs(base) > 100000 || Math.abs(cur) > 100000) continue;
+
         var diff = cur - base;
         var absDiff = Math.abs(diff);
-        if (absDiff >= minD && absDiff <= maxD) {
+        if (absDiff >= MIN_DELTA && absDiff <= MAX_DELTA) {
           hits.push({
-            idx: idx,
+            idx: i,
             base: base,
             cur: cur,
             delta: diff
           });
-          if (hits.length >= 20000) break;
+          movedSet[i] = true;
+          if (hits.length >= 30000) break;
         }
       }
-      if (hits.length >= 20000) break;
+      if (hits.length >= 30000) break;
+      if (window.TelemetryBridge && (chunkNo % 4 === 0 || chunkNo === totalChunks)) {
+        window.TelemetryBridge.updateScanStatus(
+          'RUNNING',
+          'Delta slice ' + chunkNo + '/' + totalChunks + ' (' + hits.length + ' hits)'
+        );
+      }
       await new Promise(function(resolve) { setTimeout(resolve, 10); });
     }
 
     if (st.floatScanToken !== token) return;
 
-    // 120ms stillness verification pass: floats that moved AND then stopped when standing still
-    await new Promise(function(resolve) { setTimeout(resolve, 120); });
+    // Soft 80ms stability check: NEVER discards moving/server-ticking coords; used strictly as ranking bonus
+    await new Promise(function(resolve) { setTimeout(resolve, 80); });
     if (st.floatScanToken !== token) return;
 
     var liveRes = __wvResolveWasmHeap();
     var liveF32 = liveRes ? liveRes.hf32 : hf32;
-    var stillHits = [];
-    var allMovedSet = Object.create(null);
+    var stillCount = 0;
+    var prevMap = st.prevMovedMap;
+    var nextMovedMap = Object.create(null);
 
-    for (var m = 0; m < hits.length; m++) {
-      var h = hits[m];
-      var nowVal = h.idx < liveF32.length ? liveF32[h.idx] : h.cur;
-      var isStill = Number.isFinite(nowVal) && Math.abs(nowVal - h.cur) <= 0.002;
-      h.isStillNow = isStill;
-      h.cur = nowVal;
-      h.delta = nowVal - h.base;
-      allMovedSet[h.idx] = true;
-      if (isStill) stillHits.push(h);
-    }
-
-    // Prefer stopped floats; fall back to all moved hits if character was still walking
-    var working = stillHits.length > 0 ? stillHits : hits;
-
-    // Detect contiguous Vec2/Vec3 coordinate clusters (adjacent indices also changed)
+    // Group adjacent X, Y, Z floats (supports both full 3D movement & flat-ground X+Z movement)
     var enriched = [];
-    for (var j = 0; j < working.length; j++) {
-      var item = working[j];
-      var i = item.idx;
-      var hasPrev = !!allMovedSet[i - 1];
-      var hasNext = !!allMovedSet[i + 1];
-      var hasNext2 = !!allMovedSet[i + 2];
-      var cluster = 1 + (hasPrev ? 1 : 0) + (hasNext ? 1 : 0) + (hasNext2 ? 1 : 0);
-      var axis = !hasPrev ? 'X' : (hasNext ? 'Y' : 'Z');
-      var py = (i + 1 < liveF32.length && Number.isFinite(liveF32[i + 1])) ? liveF32[i + 1] : 0;
-      var pz = (i + 2 < liveF32.length && Number.isFinite(liveF32[i + 2])) ? liveF32[i + 2] : 0;
+    for (var j = 0; j < hits.length; j++) {
+      var item = hits[j];
+      var idx = item.idx;
+      var nowVal = idx < liveF32.length ? liveF32[idx] : item.cur;
+      if (!Number.isFinite(nowVal)) nowVal = item.cur;
+      var isStillNow = Math.abs(nowVal - item.cur) <= 0.02;
+      if (isStillNow) stillCount++;
+
+      var movedPrev2 = !!movedSet[idx - 2];
+      var movedPrev1 = !!movedSet[idx - 1];
+      var movedNext1 = !!movedSet[idx + 1];
+      var movedNext2 = !!movedSet[idx + 2];
+
+      var py = (idx + 1 < liveF32.length && Number.isFinite(liveF32[idx + 1])) ? liveF32[idx + 1] : 0;
+      var pz = (idx + 2 < liveF32.length && Number.isFinite(liveF32[idx + 2])) ? liveF32[idx + 2] : 0;
+      var validMidY = Math.abs(py) <= 100000;
+
+      // Determine cluster size & axis role:
+      // - Contiguous [X, Y, Z] all moved -> clusterSize = 3
+      // - Flat-ground [X, static Y, Z] where idx & idx+2 moved -> clusterSize = 3, axisHint = 'X'
+      // - Adjacent 2-axis pair [X, Y] -> clusterSize = 2
+      var cluster = 1;
+      var axis = 'X';
+      if (!movedPrev1 && movedNext1 && movedNext2) {
+        cluster = 3;
+        axis = 'X';
+      } else if (!movedPrev1 && !movedPrev2 && movedNext2 && validMidY) {
+        cluster = 3;
+        axis = 'X';
+      } else if (movedPrev1 && movedNext1) {
+        cluster = 3;
+        axis = 'Y';
+      } else if (movedPrev1 && movedPrev2) {
+        cluster = 3;
+        axis = 'Z';
+      } else if (!movedPrev1 && movedPrev2 && !movedNext1) {
+        cluster = 3;
+        axis = 'Z';
+      } else if (!movedPrev1 && movedNext1) {
+        cluster = 2;
+        axis = 'X';
+      } else if (movedPrev1 && !movedNext1) {
+        cluster = 2;
+        axis = 'Y';
+      }
+
+      var repeatedHit = !!(prevMap && prevMap[idx] !== undefined && Math.abs(nowVal - prevMap[idx]) >= MIN_DELTA);
+      nextMovedMap[idx] = nowVal;
+
       enriched.push({
-        heapIndex: i,
-        byteAddress: i * 4,
+        heapIndex: idx,
+        byteAddress: idx * 4,
         baselineValue: Math.round(item.base * 1000) / 1000,
-        currentValue: Math.round(item.cur * 1000) / 1000,
-        delta: Math.round(item.delta * 1000) / 1000,
+        currentValue: Math.round(nowVal * 1000) / 1000,
+        delta: Math.round((nowVal - item.base) * 1000) / 1000,
         previewY: Math.round(py * 1000) / 1000,
         previewZ: Math.round(pz * 1000) / 1000,
-        isStillNow: item.isStillNow,
+        isStillNow: isStillNow,
         clusterSize: cluster,
-        axisHint: axis
+        axisHint: axis,
+        repeatedHit: repeatedHit
       });
     }
 
-    // Sort: stopped Vec3 X-heads first, then cluster size, then realistic walking delta magnitude
+    // Rank Vec3 X-heads, multi-round confirmed movement, stopped coords, and realistic walking deltas first
     enriched.sort(function(a, b) {
-      if (a.isStillNow !== b.isStillNow) return a.isStillNow ? -1 : 1;
-      var aHead = (a.clusterSize >= 2 && a.axisHint === 'X') ? 1 : 0;
-      var bHead = (b.clusterSize >= 2 && b.axisHint === 'X') ? 1 : 0;
-      if (bHead !== aHead) return bHead - aHead;
+      if (a.repeatedHit !== b.repeatedHit) return a.repeatedHit ? -1 : 1;
+      var aVec3Head = (a.clusterSize >= 3 && a.axisHint === 'X') ? 1 : 0;
+      var bVec3Head = (b.clusterSize >= 3 && b.axisHint === 'X') ? 1 : 0;
+      if (bVec3Head !== aVec3Head) return bVec3Head - aVec3Head;
+      var aPairHead = (a.clusterSize >= 2 && a.axisHint === 'X') ? 1 : 0;
+      var bPairHead = (b.clusterSize >= 2 && b.axisHint === 'X') ? 1 : 0;
+      if (bPairHead !== aPairHead) return bPairHead - aPairHead;
       if (b.clusterSize !== a.clusterSize) return b.clusterSize - a.clusterSize;
+      if (a.isStillNow !== b.isStillNow) return a.isStillNow ? -1 : 1;
       return Math.abs(a.delta) - Math.abs(b.delta);
     });
 
-    var topCandidates = enriched.slice(0, 60);
+    var topCandidates = enriched.slice(0, 80);
+    st.prevMovedMap = nextMovedMap;
     st.deltaCandidates = topCandidates;
     st.scanRound = (st.scanRound || 0) + 1;
 
-    // Narrow baseline to surviving hits for fast subsequent refinements if user scans again
-    if (working.length > 0 && working.length < st.snapCount) {
-      var nextIdx = new Int32Array(working.length);
-      var nextVal = new Float32Array(working.length);
-      for (var w = 0; w < working.length; w++) {
-        nextIdx[w] = working[w].idx;
-        nextVal[w] = working[w].cur;
-      }
-      st.snapIndices = nextIdx;
-      st.snapValues = nextVal;
-      st.snapCount = working.length;
-    }
-
-    // Start 200ms live preview loop for displayed candidates
+    // Immediately start 200ms live preview loop for displayed candidates
     if (st.deltaPreviewTimerId !== null) {
       clearInterval(st.deltaPreviewTimerId);
       st.deltaPreviewTimerId = null;
@@ -672,12 +715,12 @@ function __wvExtractStructSignature(res, baseIndex, radius) {
 
     var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
     if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Isolated ' + working.length + ' movement deltas');
+      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Isolated ' + hits.length + ' movement deltas');
       window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
         type: 'FLOAT_DELTAS_SCANNED',
         scanRound: st.scanRound,
-        totalMatches: working.length,
-        stillCount: stillHits.length,
+        totalMatches: hits.length,
+        stillCount: stillCount,
         durationMs: durationMs,
         candidates: topCandidates
       }));
@@ -701,9 +744,10 @@ function __wvExtractStructSignature(res, baseIndex, radius) {
         clearInterval(st.deltaPreviewTimerId);
         st.deltaPreviewTimerId = null;
       }
-      st.snapIndices = null;
-      st.snapValues = null;
-      st.snapCount = 0;
+      st.baselineHeap = null;
+      st.baselineLength = 0;
+      st.jitterMask = null;
+      st.prevMovedMap = null;
       st.deltaCandidates = [];
       st.scanRound = 0;
     }

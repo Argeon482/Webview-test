@@ -244,6 +244,7 @@ object WasmHeapScripts {
                     const t0 = performance.now();
                     const hf32 = heaps.hf32;
                     const len = hf32.length;
+                    const START_INDEX = len > 4096 ? 256 : 0;
 
                     let isolatedClone = null;
                     let cloneMethod = 'buffer.slice';
@@ -274,8 +275,13 @@ object WasmHeapScripts {
                         isolatedClone = forced;
                     }
 
-                    // Brief 120ms stillness check to count naturally jittering floats (timers/clocks)
-                    await new Promise(function(resolve) { setTimeout(resolve, 120); });
+                    // Mark low WASM stack/static region as pruned (NaN sentinel in isolated clone)
+                    for (let i = 0; i < START_INDEX && i < len; i++) {
+                        isolatedClone[i] = NaN;
+                    }
+
+                    // 220ms stillness window while player stands still: actively PRUNE jittering/ticking floats
+                    await new Promise(function(resolve) { setTimeout(resolve, 220); });
                     if (myGen !== root.scanGeneration) return;
 
                     let plausibleCount = 0;
@@ -284,18 +290,24 @@ object WasmHeapScripts {
                     const liveF32 = currentHeaps ? currentHeaps.hf32 : hf32;
                     const checkLen = Math.min(len, liveF32.length);
                     const SAMPLE_CHUNK = 524288;
-                    for (let start = 0; start < checkLen; start += SAMPLE_CHUNK) {
+                    for (let start = START_INDEX; start < checkLen; start += SAMPLE_CHUNK) {
                         if (myGen !== root.scanGeneration) return;
                         const end = Math.min(start + SAMPLE_CHUNK, checkLen);
                         for (let i = start; i < end; i++) {
                             const bVal = isolatedClone[i];
-                            if (bVal !== 0 && isPlausibleWorldFloat(bVal)) {
-                                plausibleCount++;
-                                const nVal = liveF32[i];
-                                if (Math.abs(nVal - bVal) > 0.0005) {
-                                    jitterCount++;
-                                }
+                            const absB = Math.abs(bVal);
+                            const validFloat = Number.isFinite(bVal) && absB <= 100000.0 && (bVal === 0 || absB >= 0.0001);
+                            if (!validFloat) {
+                                isolatedClone[i] = NaN;
+                                continue;
                             }
+                            const nVal = liveF32[i];
+                            if (!Number.isFinite(nVal) || Math.abs(nVal - bVal) > 0.0005) {
+                                isolatedClone[i] = NaN;
+                                jitterCount++;
+                                continue;
+                            }
+                            plausibleCount++;
                         }
                         if (end < checkLen) await yieldFrame();
                     }
@@ -305,7 +317,7 @@ object WasmHeapScripts {
                     root.baselineSource = heaps.source;
                     const elapsedMs = Number((performance.now() - t0).toFixed(1));
 
-                    emitStatus('COMPLETED', 'Isolated baseline ready (' + plausibleCount + ' floats)');
+                    emitStatus('COMPLETED', 'Baseline ready (' + plausibleCount + ' still, ' + jitterCount + ' jitter pruned)');
                     emitLog('SCAN', {
                         type: 'FLOAT_BASELINE_CAPTURED',
                         success: true,
@@ -332,8 +344,10 @@ object WasmHeapScripts {
 
     /**
      * Step 1B: Compares the current live `window.HEAPF32` against the isolated `baselineClone`
-     * using permissive movement delta thresholds (`0.02..500.0`), detects contiguous `X/Y/Z`
-     * coordinate clusters, ranks top candidates, and starts a 200ms live preview timer.
+     * using permissive movement delta thresholds (`0.02..500.0`), prunes continuously moving
+     * timers via a stillness check, advances the per-round isolated snapshot so every subsequent
+     * scan strictly narrows the candidate pool, detects contiguous `X/Y/Z` (and flat `X/_/Z`)
+     * coordinate clusters, and streams 200ms live previews.
      */
     fun buildScanMovementDeltasScript(
         minDelta: Double = DEFAULT_MIN_MOVEMENT_DELTA,
@@ -360,7 +374,7 @@ object WasmHeapScripts {
                         emitLog('SCAN', {
                             type: 'FLOAT_DELTA_SCANNED',
                             success: false,
-                            error: 'No isolated baseline captured yet. Stand still and tap Capture Standing Baseline first.'
+                            error: 'No isolated baseline captured yet. Stand still and tap Baseline first.'
                         });
                         return;
                     }
@@ -370,97 +384,137 @@ object WasmHeapScripts {
                     const hf32 = heaps.hf32;
                     const base = root.baselineClone;
                     const len = Math.min(hf32.length, base.length);
+                    const START_INDEX = len > 4096 ? 256 : 0;
                     const MIN_DELTA = $safeMin;
                     const MAX_DELTA = $safeMax;
                     const CHUNK = 262144;
 
-                    emitStatus('RUNNING', 'Scanning movement deltas (' + MIN_DELTA + '..' + MAX_DELTA + ')…');
-
-                    async function scanIndexList(indices) {
-                        const matched = [];
-                        for (let p = 0; p < indices.length; p++) {
-                            if (p > 0 && (p % CHUNK) === 0) {
-                                if (myGen !== root.scanGeneration) return null;
-                                await yieldFrame();
-                            }
-                            const idx = indices[p];
-                            if (idx < 0 || idx + 2 >= len) continue;
-                            const bv = base[idx];
-                            const cv = hf32[idx];
-                            if (!isPlausibleWorldFloat(bv) || !isPlausibleWorldFloat(cv)) continue;
-                            const diff = cv - bv;
-                            const absDiff = Math.abs(diff);
-                            if (absDiff >= MIN_DELTA && absDiff <= MAX_DELTA) {
-                                matched.push(idx);
-                            }
-                        }
-                        return matched;
+                    function isPlausibleScanFloat(v) {
+                        if (!Number.isFinite(v)) return false;
+                        const a = Math.abs(v);
+                        return a <= 100000.0 && (v === 0 || a >= 0.0001);
                     }
 
-                    async function scanFullHeap() {
-                        const matched = [];
-                        for (let start = 0; start < len - 2; start += CHUNK) {
-                            if (myGen !== root.scanGeneration) return null;
+                    emitStatus('RUNNING', 'Scanning movement deltas (Round #' + ((root.scanRound || 0) + 1) + ')…');
+
+                    let rawMatches = [];
+                    const isRefinement = (root.scanRound > 0 && root.candidateIndices.length > 0);
+
+                    if (isRefinement) {
+                        const prevPool = root.candidateIndices;
+                        for (let p = 0; p < prevPool.length; p++) {
+                            if (p > 0 && (p % CHUNK) === 0) {
+                                if (myGen !== root.scanGeneration) return;
+                                await yieldFrame();
+                            }
+                            const idx = prevPool[p];
+                            if (idx < START_INDEX || idx + 2 >= len) continue;
+                            const bv = base[idx];
+                            if (Number.isNaN(bv)) continue;
+                            const cv = hf32[idx];
+                            if (!isPlausibleScanFloat(cv)) continue;
+                            const absDiff = Math.abs(cv - bv);
+                            if (absDiff >= MIN_DELTA && absDiff <= MAX_DELTA) {
+                                rawMatches.push(idx);
+                            }
+                        }
+
+                        // Preserve narrowed candidate pool if user tapped Scan Next without moving enough
+                        if (rawMatches.length === 0) {
+                            const durationMs = Number((performance.now() - t0).toFixed(1));
+                            emitStatus('COMPLETED', 'Kept ' + prevPool.length + ' hits (move further, then Scan Next)');
+                            emitLog('SCAN', {
+                                type: 'FLOAT_DELTA_SCANNED',
+                                success: true,
+                                scanRound: root.scanRound,
+                                totalMatchesFound: prevPool.length,
+                                prunedMovingCount: 0,
+                                preservedDueToZeroDelta: true,
+                                durationMs: durationMs,
+                                isLivePreviewing: root.previewTimerId !== null,
+                                minDelta: MIN_DELTA,
+                                maxDelta: MAX_DELTA,
+                                candidates: []
+                            });
+                            return;
+                        }
+                    } else {
+                        for (let start = START_INDEX; start < len - 2; start += CHUNK) {
+                            if (myGen !== root.scanGeneration) return;
                             const end = Math.min(start + CHUNK, len - 2);
                             for (let i = start; i < end; i++) {
                                 const bv = base[i];
+                                if (Number.isNaN(bv)) continue;
                                 const cv = hf32[i];
-                                if (!isPlausibleWorldFloat(bv) || !isPlausibleWorldFloat(cv)) continue;
+                                if (!isPlausibleScanFloat(cv)) continue;
                                 const absDiff = Math.abs(cv - bv);
                                 if (absDiff >= MIN_DELTA && absDiff <= MAX_DELTA) {
-                                    matched.push(i);
+                                    rawMatches.push(i);
                                 }
                             }
                             if (end < len - 2) await yieldFrame();
                         }
-                        return matched;
                     }
 
-                    let usedFallbackFullScan = false;
-                    let rawMatches = null;
-                    if (root.candidateIndices.length > 0 && root.scanRound > 0) {
-                        rawMatches = await scanIndexList(root.candidateIndices);
-                        if (rawMatches === null) return;
-                        if (rawMatches.length === 0) {
-                            usedFallbackFullScan = true;
-                            rawMatches = await scanFullHeap();
-                            if (rawMatches === null) return;
-                        }
-                    } else {
-                        rawMatches = await scanFullHeap();
-                        if (rawMatches === null) return;
+                    // Stillness prune: wait 180ms while stopped and drop continuously ticking timers/animations
+                    const snap1 = new Float32Array(rawMatches.length);
+                    for (let i = 0; i < rawMatches.length; i++) {
+                        snap1[i] = hf32[rawMatches[i]];
                     }
-
-                    root.candidateIndices = rawMatches;
-                    root.scanRound = (root.scanRound || 0) + 1;
-
-                    // Index lookup set for contiguous X/Y/Z cluster detection
-                    const matchSet = new Set();
-                    const maxSetItems = Math.min(rawMatches.length, 60000);
-                    for (let i = 0; i < maxSetItems; i++) {
-                        matchSet.add(rawMatches[i]);
-                    }
-
-                    // Brief 90ms stability verification so stationary coords rank above ticking timers
-                    const firstSnap = new Map();
-                    const maxScored = Math.min(rawMatches.length, 2000);
-                    for (let i = 0; i < maxScored; i++) {
-                        const idx = rawMatches[i];
-                        firstSnap.set(idx, hf32[idx]);
-                    }
-                    await new Promise(function(resolve) { setTimeout(resolve, 90); });
+                    await new Promise(function(resolve) { setTimeout(resolve, 180); });
                     if (myGen !== root.scanGeneration) return;
 
                     const liveHeaps2 = resolveWasmHeaps();
                     const liveF32 = liveHeaps2 ? liveHeaps2.hf32 : hf32;
+                    const stillMatches = [];
+                    const movingSet = new Set();
+                    for (let i = 0; i < rawMatches.length; i++) {
+                        const idx = rawMatches[i];
+                        if (idx + 2 >= liveF32.length) continue;
+                        const nowV = liveF32[idx];
+                        if (Number.isFinite(nowV) && Math.abs(nowV - snap1[i]) <= 0.002) {
+                            stillMatches.push(idx);
+                        } else {
+                            movingSet.add(idx);
+                        }
+                    }
+
+                    const filteredMatches = stillMatches.length > 0 ? stillMatches : rawMatches;
+                    const prunedMovingCount = rawMatches.length - filteredMatches.length;
+
+                    // Snapshot previous-round values for display before advancing isolated baseline for next round
+                    const prevValuesForDisplay = new Map();
+                    const maxScored = Math.min(filteredMatches.length, 3000);
+                    for (let i = 0; i < maxScored; i++) {
+                        const idx = filteredMatches[i];
+                        prevValuesForDisplay.set(idx, Number(base[idx]));
+                    }
+
+                    // Advance isolated baseline values so next Scan Next compares against THIS stopped position
+                    for (let i = 0; i < filteredMatches.length; i++) {
+                        const idx = filteredMatches[i];
+                        if (idx < base.length && idx < liveF32.length) {
+                            base[idx] = liveF32[idx];
+                        }
+                    }
+
+                    root.candidateIndices = filteredMatches;
+                    root.scanRound = (root.scanRound || 0) + 1;
+
+                    // Index lookup set for contiguous X/Y/Z (and flat-ground X/_/Z) cluster detection
+                    const matchSet = new Set();
+                    const maxSetItems = Math.min(filteredMatches.length, 60000);
+                    for (let i = 0; i < maxSetItems; i++) {
+                        matchSet.add(filteredMatches[i]);
+                    }
+
                     const scored = [];
                     const emittedClusterBases = new Set();
 
                     for (let i = 0; i < maxScored; i++) {
-                        const idx = rawMatches[i];
+                        const idx = filteredMatches[i];
                         if (idx + 2 >= liveF32.length) continue;
 
-                        // Normalize contiguous changed triplet/pair to its leading X base index
                         const hasPrev = matchSet.has(idx - 1);
                         const hasPrev2 = matchSet.has(idx - 2);
                         const hasNext = matchSet.has(idx + 1);
@@ -472,6 +526,9 @@ object WasmHeapScripts {
                         if (hasNext && hasNext2) {
                             clusterSize = 3;
                             axisHint = 'X/Y/Z';
+                        } else if (hasNext2 && !hasPrev && !hasPrev2) {
+                            clusterSize = 3;
+                            axisHint = 'X/_/Z';
                         } else if (hasNext) {
                             clusterSize = 2;
                             axisHint = 'X/Y';
@@ -483,21 +540,23 @@ object WasmHeapScripts {
                             baseIdx = idx - 2;
                             clusterSize = 3;
                             axisHint = 'X/Y/Z';
+                        } else if (hasPrev2 && !hasPrev) {
+                            baseIdx = idx - 2;
+                            clusterSize = 3;
+                            axisHint = 'X/_/Z';
                         }
 
                         if (emittedClusterBases.has(baseIdx)) continue;
                         emittedClusterBases.add(baseIdx);
 
-                        const bv = Number(base[baseIdx]);
                         const cv = Number(liveF32[baseIdx]);
-                        const prevV = firstSnap.has(baseIdx) ? firstSnap.get(baseIdx) : cv;
-                        const isStillNow = Math.abs(cv - prevV) < 0.005;
+                        const bv = prevValuesForDisplay.has(baseIdx) ? prevValuesForDisplay.get(baseIdx) : cv;
+                        const isStillNow = !movingSet.has(baseIdx);
                         const yVal = Number(liveF32[baseIdx + 1]);
                         const zVal = Number(liveF32[baseIdx + 2]);
-                        const neighborPlausible = isPlausibleWorldFloat(yVal) && isPlausibleWorldFloat(zVal);
+                        const neighborPlausible = isPlausibleScanFloat(yVal) && isPlausibleScanFloat(zVal);
                         const delta = cv - bv;
 
-                        // Priority score: contiguous Vec3/Vec2 clusters + stationary now + plausible Y/Z
                         let score = 0;
                         if (clusterSize >= 3) score += 100;
                         else if (clusterSize === 2) score += 60;
@@ -590,14 +649,15 @@ object WasmHeapScripts {
                     }
 
                     const durationMs = Number((performance.now() - t0).toFixed(1));
-                    emitStatus('COMPLETED', 'Found ' + rawMatches.length + ' movement deltas');
+                    emitStatus('COMPLETED', 'Round #' + root.scanRound + ': ' + filteredMatches.length + ' hits');
                     emitLog('SCAN', {
                         type: 'FLOAT_DELTA_SCANNED',
                         success: true,
                         scanRound: root.scanRound,
-                        totalMatchesFound: rawMatches.length,
+                        totalMatchesFound: filteredMatches.length,
+                        prunedMovingCount: prunedMovingCount,
+                        preservedDueToZeroDelta: false,
                         durationMs: durationMs,
-                        usedFallbackFullScan: usedFallbackFullScan,
                         isLivePreviewing: root.previewCandidates.length > 0,
                         minDelta: MIN_DELTA,
                         maxDelta: MAX_DELTA,

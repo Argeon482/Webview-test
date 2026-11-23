@@ -16,7 +16,10 @@
     <string name="step1_card_subtitle">Stand still, capture baseline, move your character and stop, then scan deltas to isolate live coordinates.</string>
     <string name="action_capture_baseline">1. Capture Standing Baseline</string>
     <string name="action_scan_movement_deltas">2. Scan Movement Deltas</string>
+    <string name="action_quick_baseline">1. Baseline</string>
+    <string name="action_quick_scan_next">2. Scan Next</string>
     <string name="action_reset_scan">Reset Scan</string>
+    <string name="cd_quick_reset_scan">Reset float delta scan</string>
     <string name="action_inspect_and_lock">Tap to Inspect &amp; Lock</string>
 
     <!-- Step 2: Pointer & Memory Signature Analyzer -->

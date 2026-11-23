@@ -815,7 +815,8 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                     val round = obj.optInt("scanRound", 1)
                     val durationMs = obj.optDouble("durationMs", 0.0)
                     val livePreview = obj.optBoolean("isLivePreviewing", false)
-                    val fallback = obj.optBoolean("usedFallbackFullScan", false)
+                    val preserved = obj.optBoolean("preservedDueToZeroDelta", false)
+                    val prunedMoving = obj.optInt("prunedMovingCount", 0)
                     val arr = obj.optJSONArray("candidates") ?: JSONArray()
                     val parsed = buildList {
                         for (i in 0 until arr.length()) {
@@ -839,31 +840,45 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                             )
                         }
                     }
-                    val statusMsg = if (parsed.isEmpty()) {
-                        "0 deltas in range 0.02..500.0. Walk further in-game or capture a fresh Standing Baseline."
-                    } else {
-                        "Round #$round: ${parsed.size} ranked from $totalFound hits (${String.format(Locale.US, "%.0f", durationMs)}ms" +
-                            (if (fallback) ", full-clone fallback" else "") +
-                            "). Tap any candidate to inspect ±16 struct & lock."
-                    }
-                    _uiState.update { current ->
-                        current.copy(
-                            floatScanner = current.floatScanner.copy(
-                                isBusy = false,
-                                scanRound = round,
-                                totalMatchesFound = totalFound,
-                                scanDurationMs = durationMs,
-                                isLivePreviewing = livePreview,
-                                candidates = parsed,
-                                statusMessage = statusMsg
+                    if (preserved) {
+                        val keptMsg = "0 of $totalFound candidates moved since last scan. Walk further in-game, stop, then tap Scan Next (kept $totalFound candidates)."
+                        _uiState.update { current ->
+                            current.copy(
+                                floatScanner = current.floatScanner.copy(
+                                    isBusy = false,
+                                    scanDurationMs = durationMs,
+                                    statusMessage = keptMsg
+                                )
                             )
+                        }
+                        appendLog(LogCategory.SCAN, "Kept $totalFound candidates (no delta)", keptMsg)
+                    } else {
+                        val statusMsg = if (parsed.isEmpty()) {
+                            "0 deltas in range 0.02..500.0. Walk further in-game or capture a fresh Standing Baseline."
+                        } else {
+                            "Round #$round: $totalFound matches (${parsed.size} shown" +
+                                (if (prunedMoving > 0) ", pruned $prunedMoving moving" else "") +
+                                ", ${String.format(Locale.US, "%.0f", durationMs)}ms). Move again & tap Scan Next to narrow further."
+                        }
+                        _uiState.update { current ->
+                            current.copy(
+                                floatScanner = current.floatScanner.copy(
+                                    isBusy = false,
+                                    scanRound = round,
+                                    totalMatchesFound = totalFound,
+                                    scanDurationMs = durationMs,
+                                    isLivePreviewing = livePreview,
+                                    candidates = parsed,
+                                    statusMessage = statusMsg
+                                )
+                            )
+                        }
+                        appendLog(
+                            LogCategory.SCAN,
+                            "Delta scan #$round: $totalFound matches (${parsed.size} ranked, pruned $prunedMoving moving)",
+                            statusMsg
                         )
                     }
-                    appendLog(
-                        LogCategory.SCAN,
-                        "Delta scan #$round: $totalFound matches (${parsed.size} ranked)",
-                        statusMsg
-                    )
                 }
                 true
             }

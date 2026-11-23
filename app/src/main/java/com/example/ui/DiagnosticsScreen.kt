@@ -35,6 +35,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -42,12 +43,15 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.DirectionsRun
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.UnfoldLess
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -57,6 +61,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -103,6 +108,7 @@ import com.example.ui.theme.ObsidianBorder
 import com.example.ui.theme.ObsidianSurface
 import com.example.ui.theme.ObsidianSurfaceElevated
 import com.example.ui.theme.OnElectricCyan
+import com.example.ui.theme.OnSignalEmerald
 import com.example.ui.theme.SignalEmerald
 import com.example.ui.theme.TelemetryViolet
 import kotlinx.coroutines.flow.collectLatest
@@ -278,6 +284,9 @@ fun DiagnosticsScreen(
                             onResourceObserved = viewModel::onResourceRequestObserved,
                             onConsoleLog = { msg -> viewModel.onTelemetryFromBridge(LogCategory.JS.tag, msg) },
                             onToggleExpand = viewModel::onToggleWebViewExpanded,
+                            onCaptureBaseline = viewModel::captureStandingBaseline,
+                            onScanMovementDeltas = viewModel::scanMovementDeltas,
+                            onResetFloatScan = viewModel::resetFloatScan,
                             showHeightToggle = false,
                             modifier = Modifier
                                 .weight(1.1f)
@@ -349,7 +358,7 @@ fun DiagnosticsScreen(
                             .testTag("main_scrollable_container"),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        val webViewHeight = if (state.isWebViewExpanded) 430.dp else 270.dp
+                        val webViewHeight = if (state.isWebViewExpanded) 460.dp else 326.dp
                         DiagnosticWebViewCard(
                             state = state,
                             telemetryBridge = telemetryBridge,
@@ -361,6 +370,9 @@ fun DiagnosticsScreen(
                             onResourceObserved = viewModel::onResourceRequestObserved,
                             onConsoleLog = { msg -> viewModel.onTelemetryFromBridge(LogCategory.JS.tag, msg) },
                             onToggleExpand = viewModel::onToggleWebViewExpanded,
+                            onCaptureBaseline = viewModel::captureStandingBaseline,
+                            onScanMovementDeltas = viewModel::scanMovementDeltas,
+                            onResetFloatScan = viewModel::resetFloatScan,
                             showHeightToggle = true,
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -736,6 +748,9 @@ private fun DiagnosticWebViewCard(
     onResourceObserved: (WebResourceRequest) -> Unit,
     onConsoleLog: (String) -> Unit,
     onToggleExpand: () -> Unit,
+    onCaptureBaseline: () -> Unit,
+    onScanMovementDeltas: () -> Unit,
+    onResetFloatScan: () -> Unit,
     showHeightToggle: Boolean,
     modifier: Modifier = Modifier
 ) {
@@ -907,6 +922,119 @@ private fun DiagnosticWebViewCard(
                         .fillMaxSize()
                         .testTag("diagnostic_webview")
                 )
+            }
+
+            // Docked Quick Scanner Bar right inside the WebView window (no scrolling needed to tap Scan Next)
+            HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+            val scanner = state.floatScanner
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(ObsidianSurfaceElevated)
+                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                    .testTag("webview_quick_scan_bar"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onCaptureBaseline,
+                    enabled = !scanner.isBusy,
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(
+                        1.dp,
+                        if (scanner.baselineCaptured) SignalEmerald.copy(alpha = 0.7f) else ElectricCyan.copy(alpha = 0.85f)
+                    ),
+                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("webview_capture_baseline_button")
+                ) {
+                    if (scanner.isBusy && !scanner.baselineCaptured) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(15.dp),
+                            strokeWidth = 2.dp,
+                            color = ElectricCyan
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.CameraAlt,
+                            contentDescription = null,
+                            tint = if (scanner.baselineCaptured) SignalEmerald else ElectricCyan,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(5.dp))
+                    Text(
+                        text = stringResource(R.string.action_quick_baseline),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = if (scanner.baselineCaptured) SignalEmerald else ElectricCyan,
+                        maxLines = 1
+                    )
+                }
+
+                Button(
+                    onClick = onScanMovementDeltas,
+                    enabled = !scanner.isBusy && scanner.baselineCaptured,
+                    shape = RoundedCornerShape(8.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = SignalEmerald,
+                        contentColor = OnSignalEmerald,
+                        disabledContainerColor = SignalEmerald.copy(alpha = 0.22f),
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp)
+                        .testTag("webview_scan_next_button")
+                ) {
+                    if (scanner.isBusy && scanner.baselineCaptured) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(15.dp),
+                            strokeWidth = 2.dp,
+                            color = OnSignalEmerald
+                        )
+                    } else {
+                        Icon(
+                            imageVector = Icons.Default.DirectionsRun,
+                            contentDescription = null,
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
+                    Spacer(Modifier.width(6.dp))
+                    val scanNextLabel = if (scanner.scanRound > 0) {
+                        "${stringResource(R.string.action_quick_scan_next)} (${scanner.totalMatchesFound})"
+                    } else {
+                        stringResource(R.string.action_quick_scan_next)
+                    }
+                    Text(
+                        text = scanNextLabel,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                IconButton(
+                    onClick = onResetFloatScan,
+                    enabled = !scanner.isBusy && (scanner.baselineCaptured || scanner.scanRound > 0),
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("webview_reset_scan_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.RestartAlt,
+                        contentDescription = stringResource(R.string.cd_quick_reset_scan),
+                        tint = if (scanner.baselineCaptured || scanner.scanRound > 0) {
+                            MaterialTheme.colorScheme.onSurface
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f)
+                        },
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
             }
         }
     }

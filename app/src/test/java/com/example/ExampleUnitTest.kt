@@ -27,21 +27,27 @@ class ExampleUnitTest {
         assertTrue(startFeed.contains("updateDirectHeapCoords"))
         assertTrue(pauseFeed.contains("clearInterval(root.feedTimerId)"))
 
-        // Step 1A: true isolated Float32Array baseline clone (decoupled ArrayBuffer + indexed fallback)
+        // Step 1A: true isolated Float32Array baseline clone + active jitter pruning via NaN sentinel
         assertTrue(baselineScript.contains("(async function()"))
         assertTrue(baselineScript.contains("hf32.buffer.slice(0)"))
         assertTrue(baselineScript.contains("isolatedClone.buffer !== hf32.buffer"))
         assertTrue(baselineScript.contains("new Float32Array(len)"))
+        assertTrue(baselineScript.contains("const START_INDEX = len > 4096 ? 256 : 0;"))
+        assertTrue(baselineScript.contains("isolatedClone[i] = NaN;"))
         assertTrue(baselineScript.contains("FLOAT_BASELINE_CAPTURED"))
 
-        // Step 1B: permissive movement thresholds (0.02..500.0), contiguous X/Y/Z clustering, 200ms preview
+        // Step 1B: iterative narrowing, post-move stillness pruning, per-round baseline update, no full-heap reset
         assertTrue(deltaScript.contains("(async function()"))
         assertTrue(deltaScript.contains("const MIN_DELTA = 0.02;"))
         assertTrue(deltaScript.contains("const MAX_DELTA = 500.0;"))
         assertTrue(deltaScript.contains("absDiff >= MIN_DELTA && absDiff <= MAX_DELTA"))
+        assertTrue(deltaScript.contains("const filteredMatches = stillMatches.length > 0 ? stillMatches : rawMatches;"))
+        assertTrue(deltaScript.contains("base[idx] = liveF32[idx];"))
+        assertTrue(deltaScript.contains("preservedDueToZeroDelta: true"))
         assertTrue(deltaScript.contains("FLOAT_DELTA_SCANNED"))
         assertTrue(deltaScript.contains("updateFloatDeltaPreview"))
         assertTrue(deltaScript.contains("X/Y/Z"))
+        assertTrue(deltaScript.contains("X/_/Z"))
 
         // Reset cleans baseline clone and preview timer
         assertTrue(resetScript.contains("root.baselineClone = null"))

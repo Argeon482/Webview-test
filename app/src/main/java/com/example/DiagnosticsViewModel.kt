@@ -45,6 +45,21 @@ class DiagnosticsViewModel : ViewModel() {
     private val seenAssetUrls = LinkedHashSet<String>()
     private var pendingExportJob: Job? = null
     private var pendingExportContext: Context? = null
+    private var sitePointerStore: SitePointerStore? = null
+
+    fun attachContext(context: Context) {
+        if (sitePointerStore == null) {
+            sitePointerStore = SitePointerStore(context.applicationContext)
+            val currentUrl = _uiState.value.activeUrl
+            if (currentUrl != "about:blank") {
+                restoreSavedPointersForUrl(currentUrl, autoVerify = false)
+            }
+        }
+    }
+
+    internal fun setSitePointerStoreForTesting(store: SitePointerStore) {
+        sitePointerStore = store
+    }
 
     fun onUrlInputChanged(input: String) {
         _uiState.update { it.copy(urlInput = input) }
@@ -55,6 +70,7 @@ class DiagnosticsViewModel : ViewModel() {
         when (val validation = normalizeAndValidateUrl(raw)) {
             is UrlValidationResult.Valid -> {
                 val targetUrl = validation.normalizedUrl
+                val savedForTarget = sitePointerStore?.loadPointersForUrl(targetUrl).orEmpty()
                 seenAssetUrls.clear()
                 _uiState.update {
                     it.copy(
@@ -82,8 +98,16 @@ class DiagnosticsViewModel : ViewModel() {
                         entityViewportHeight = 0,
                         discoveredEntities = emptyList(),
                         lastEntityCount = 0,
+                        isWasmEntitiesLivePolling = false,
+                        wasmEntityLiveTickCount = 0,
                         wasmHeap = WasmHeapTrackerState(),
-                        wasmFloatDelta = WasmFloatDeltaState(),
+                        wasmFloatDelta = WasmFloatDeltaState(
+                            pointerChains = savedForTarget,
+                            savedPointerCountForHost = savedForTarget.size,
+                            pointerStatusMessage = if (savedForTarget.isNotEmpty()) {
+                                "Loaded ${savedForTarget.size} saved pointer(s) for this site. Will auto-verify once WASM loads."
+                            } else ""
+                        ),
                         interceptedAssets = emptyList(),
                         estimatedFps = null,
                         canvasCount = 0
@@ -104,12 +128,15 @@ class DiagnosticsViewModel : ViewModel() {
         _uiState.update {
             it.copy(
                 livePollActive = false,
+                isWasmEntitiesLivePolling = false,
                 wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false),
                 wasmFloatDelta = it.wasmFloatDelta.copy(
                     isLiveWatching = false,
                     isSamplingBaseline = false,
                     isScanningDeltas = false,
                     isScanningPointers = false,
+                    isWatchingPointers = false,
+                    isAutoVerifyingOnReload = false,
                     lockedCoords = it.wasmFloatDelta.lockedCoords?.copy(isLivePolling = false)
                 )
             )
@@ -143,12 +170,15 @@ class DiagnosticsViewModel : ViewModel() {
                 isLoading = true,
                 loadProgress = 10,
                 livePollActive = false,
+                isWasmEntitiesLivePolling = false,
                 wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false),
                 wasmFloatDelta = it.wasmFloatDelta.copy(
                     isLiveWatching = false,
                     isSamplingBaseline = false,
                     isScanningDeltas = false,
                     isScanningPointers = false,
+                    isWatchingPointers = false,
+                    isAutoVerifyingOnReload = false,
                     lockedCoords = it.wasmFloatDelta.lockedCoords?.copy(isLivePolling = false)
                 )
             )
@@ -169,6 +199,100 @@ class DiagnosticsViewModel : ViewModel() {
                 LogCategory.SYSTEM,
                 "Page ready: ${title?.takeIf { it.isNotBlank() } ?: url}",
                 url
+            )
+            restoreSavedPointersForUrl(url, autoVerify = true)
+        }
+    }
+
+    private fun restoreSavedPointersForUrl(url: String, autoVerify: Boolean) {
+        val store = sitePointerStore
+        val savedFromDisk = store?.loadPointersForUrl(url).orEmpty()
+        val currentState = _uiState.value
+        val existingChains = currentState.wasmFloatDelta.pointerChains
+        val sameHost = SitePointerStore.normalizeHostKey(currentState.activeUrl) ==
+            SitePointerStore.normalizeHostKey(url)
+
+        val merged = buildList {
+            val seen = LinkedHashSet<String>()
+            savedFromDisk.forEach { saved ->
+                if (seen.add(saved.id)) {
+                    add(
+                        saved.copy(
+                            isPinned = true,
+                            isSavedLocally = true,
+                            status = WasmPointerStatus.PENDING,
+                            isVerifiedLive = false,
+                            changedFromPrev = false,
+                            changeCount = 0,
+                            lastDeltaMagnitude = 0.0,
+                            isStreamingToHud = (currentState.wasmFloatDelta.activeHudPointerId == saved.id)
+                        )
+                    )
+                }
+            }
+            if (sameHost) {
+                existingChains.forEach { ex ->
+                    if (seen.add(ex.id)) {
+                        add(
+                            ex.copy(
+                                status = WasmPointerStatus.PENDING,
+                                isVerifiedLive = false,
+                                changedFromPrev = false,
+                                changeCount = 0,
+                                lastDeltaMagnitude = 0.0
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
+        val hostName = SitePointerStore.normalizeHostKey(url).orEmpty()
+        if (merged.isEmpty()) {
+            _uiState.update { state ->
+                state.copy(
+                    wasmFloatDelta = state.wasmFloatDelta.copy(
+                        savedPointerCountForHost = 0,
+                        isAutoVerifyingOnReload = false
+                    )
+                )
+            }
+            return
+        }
+
+        val hudId = currentState.wasmFloatDelta.activeHudPointerId
+            ?.takeIf { id -> merged.any { it.id == id } }
+        val statusMsg = if (autoVerify) {
+            "Auto-verifying ${merged.size} saved pointer(s) for $hostName (waiting for WASM heap)…"
+        } else {
+            "Loaded ${savedFromDisk.size} saved pointer(s) for $hostName."
+        }
+
+        _uiState.update { state ->
+            state.copy(
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    pointerChains = merged,
+                    savedPointerCountForHost = savedFromDisk.size,
+                    isAutoVerifyingOnReload = autoVerify,
+                    pointerStatusMessage = statusMsg
+                )
+            )
+        }
+
+        if (autoVerify) {
+            appendLog(
+                LogCategory.WASM,
+                "Auto-verifying ${merged.size} saved pointer chain(s) for $hostName…",
+                "Waiting for WASM HEAPF32 initialization, then starting 200ms Live Watch"
+            )
+            val payloadJson = buildPointerChainsPayloadJson(merged)
+            _effects.tryEmit(
+                DiagnosticsEffect.EvaluateJs(
+                    WasmPointerAndEntityScripts.buildAutoVerifySavedPointersScript(
+                        chainsJsonArray = payloadJson,
+                        hudPointerId = hudId
+                    )
+                )
             )
         }
     }
@@ -380,11 +504,71 @@ class DiagnosticsViewModel : ViewModel() {
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildComputeDeltaScript()))
     }
 
-    // Step 3: Player-Anchored Visual Entity Discovery
+    // Step 3: Player-Anchored Visual Entity Discovery (WASM HEAPF32 Nearby Entity Scan + JS Fallback)
     fun runStep3ScanEntities() {
-        val anchor = _uiState.value.discoveredPlayerPath
+        val state = _uiState.value
+        val fd = state.wasmFloatDelta
+        val activeHudChain = fd.activeHudPointerId?.let { id ->
+            fd.pointerChains.firstOrNull { it.id == id && it.resolvedTargetAddress > 0L && it.status != WasmPointerStatus.STALE && it.status != WasmPointerStatus.ZERO }
+        }
+        val bestLiveChain = activeHudChain
+            ?: fd.pointerChains.firstOrNull { it.status == WasmPointerStatus.MOVING && it.resolvedTargetAddress > 0L }
+            ?: fd.pointerChains.firstOrNull { it.status == WasmPointerStatus.LIVE && it.resolvedTargetAddress > 0L }
+        val locked = fd.lockedCoords
+        val anchor = state.discoveredPlayerPath
+
+        val isWasmAnchor = bestLiveChain != null ||
+            locked != null ||
+            (anchor != null && (anchor.startsWith("window.HEAPF32") || anchor.startsWith("WASM_PTR:")))
+
+        if (isWasmAnchor) {
+            val playerAddr = bestLiveChain?.resolvedTargetAddress
+                ?: locked?.xByteAddress
+                ?: 0L
+            val px = bestLiveChain?.resolvedX
+                ?: locked?.xValue
+                ?: state.livePlayerCoords?.x
+                ?: 0.0
+            val py = bestLiveChain?.resolvedY
+                ?: locked?.yValue
+                ?: state.livePlayerCoords?.y
+                ?: 0.0
+            val pz = bestLiveChain?.resolvedZ
+                ?: locked?.zValue
+                ?: state.livePlayerCoords?.z
+                ?: 0.0
+            val structOffset = bestLiveChain?.offsets?.lastOrNull() ?: 0
+
+            if (playerAddr <= 0L && px == 0.0 && py == 0.0 && pz == 0.0) {
+                val msg = "Stream a live WASM pointer chain to HUD or lock coordinates first before scanning WASM entities."
+                appendLog(LogCategory.ENTITY, msg, msg)
+                _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+                return
+            }
+
+            val hexPlayer = formatHexAddress(playerAddr)
+            onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 3 (WASM): Scanning HEAPF32 near $hexPlayer…")
+            appendLog(
+                LogCategory.ENTITY,
+                "Step 3 (WASM): Scanning HEAPF32 for nearby entities around $hexPlayer…",
+                "Player=(${String.format(Locale.US, "%.2f", px)}, ${String.format(Locale.US, "%.2f", py)}, ${String.format(Locale.US, "%.2f", pz)}), structOffset=+0x${structOffset.toString(16).uppercase(Locale.US)}, radius=1.5..250u"
+            )
+            _effects.tryEmit(
+                DiagnosticsEffect.EvaluateJs(
+                    WasmPointerAndEntityScripts.buildScanWasmNearbyEntitiesScript(
+                        playerByteAddress = playerAddr,
+                        playerX = px,
+                        playerY = py,
+                        playerZ = pz,
+                        structCoordOffset = structOffset
+                    )
+                )
+            )
+            return
+        }
+
         if (anchor.isNullOrBlank()) {
-            val msg = "Complete Step 2B first (or lock a Staging candidate) so Step 3 can anchor to your player coordinates."
+            val msg = "Complete Step 2B (or stream a live WASM pointer / lock coords) so Step 3 can anchor to your player coordinates."
             appendLog(LogCategory.ENTITY, msg, msg)
             _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
             return
@@ -396,6 +580,42 @@ class DiagnosticsViewModel : ViewModel() {
             "Climbing 1–3 parent levels up from $anchor to inspect sibling Arrays/Maps/Sets & project to 2D canvas"
         )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildScanEntitiesScript(anchor)))
+    }
+
+    fun onToggleWasmEntitiesLiveRefresh() {
+        val state = _uiState.value
+        if (state.isWasmEntitiesLivePolling) {
+            _uiState.update { it.copy(isWasmEntitiesLivePolling = false) }
+            _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmPointerAndEntityScripts.buildStopWasmEntitiesLiveRefreshScript()))
+            appendLog(LogCategory.ENTITY, "Stopped 500ms live WASM entity refresh", "Paused entity coordinate polling")
+        } else {
+            if (state.discoveredEntities.isEmpty()) {
+                _effects.tryEmit(DiagnosticsEffect.ShowToast("Run Step 3 (Scan Nearby Entities) first."))
+                return
+            }
+            _uiState.update { it.copy(isWasmEntitiesLivePolling = true, wasmEntityLiveTickCount = 0) }
+            _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmPointerAndEntityScripts.buildStartWasmEntitiesLiveRefreshScript()))
+            appendLog(LogCategory.ENTITY, "Started 500ms live WASM entity position refresh", "Tracking ${state.discoveredEntities.size} nearby WASM entity structs")
+        }
+    }
+
+    fun onWasmEntitiesUpdatedFromBridge(jsonPayload: String) {
+        val json = try {
+            JSONObject(jsonPayload)
+        } catch (_: Exception) {
+            return
+        }
+        if (json.optString("stage", "") != "WASM_ENTITIES_TICK") return
+        val tick = json.optInt("tick", 1)
+        val parsed = parseWasmEntitiesArray(json.optJSONArray("entities"))
+        _uiState.update { state ->
+            state.copy(
+                discoveredEntities = parsed,
+                lastEntityCount = parsed.size,
+                isWasmEntitiesLivePolling = true,
+                wasmEntityLiveTickCount = tick
+            )
+        }
     }
 
     // Targeted WebAssembly Heap Value-Tracker (Read-Only HP / Stat Scanner & ±16B Neighbor Inspector)
@@ -839,10 +1059,35 @@ class DiagnosticsViewModel : ViewModel() {
     }
 
     fun onResetWasmFloatDelta() {
+        val current = _uiState.value
+        val preservedSaved = current.wasmFloatDelta.pointerChains.filter { it.isPinned || it.isSavedLocally }
+        val activeHudPreserved = current.wasmFloatDelta.activeHudPointerId
+            ?.takeIf { id -> preservedSaved.any { it.id == id } }
+        val savedCount = sitePointerStore?.countSavedForUrl(current.activeUrl) ?: preservedSaved.count { it.isSavedLocally }
+
         _uiState.update { state ->
-            state.copy(wasmFloatDelta = WasmFloatDeltaState())
+            state.copy(
+                wasmFloatDelta = WasmFloatDeltaState(
+                    pointerChains = preservedSaved,
+                    isWatchingPointers = current.wasmFloatDelta.isWatchingPointers && preservedSaved.isNotEmpty(),
+                    pointerWatchTickCount = if (preservedSaved.isNotEmpty()) current.wasmFloatDelta.pointerWatchTickCount else 0,
+                    activeHudPointerId = activeHudPreserved,
+                    savedPointerCountForHost = savedCount,
+                    pointerStatusMessage = if (preservedSaved.isNotEmpty()) {
+                        "Preserved ${preservedSaved.size} bookmarked pointer chain(s) across Reset."
+                    } else ""
+                )
+            )
         }
-        appendLog(LogCategory.WASM, "Reset WASM Float Heap Delta Scanner", "Released HEAPF32 baseline snapshot and stopped Live Float Watcher")
+        appendLog(
+            LogCategory.WASM,
+            "Reset WASM Float Heap Delta Scanner",
+            if (preservedSaved.isNotEmpty()) {
+                "Released HEAPF32 baseline snapshot while preserving ${preservedSaved.size} bookmarked pointer chain(s)"
+            } else {
+                "Released HEAPF32 baseline snapshot and stopped Live Float Watcher"
+            }
+        )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildResetFloatDeltaScript()))
     }
 
@@ -1007,22 +1252,13 @@ class DiagnosticsViewModel : ViewModel() {
             _effects.tryEmit(DiagnosticsEffect.ShowToast("Run 'Find Pointers' first to discover pointer chains to verify."))
             return
         }
-        val payloadArr = JSONArray()
-        chains.forEach { c ->
-            val offArr = JSONArray()
-            c.offsets.forEach { offArr.put(it) }
-            payloadArr.put(
-                JSONObject()
-                    .put("id", c.id)
-                    .put("basePointerAddress", c.basePointerAddress)
-                    .put("offsets", offArr)
-            )
-        }
+        val payloadJson = buildPointerChainsPayloadJson(chains)
         _uiState.update { current ->
             current.copy(
                 scanStatus = AsyncScanStatus.RUNNING,
                 scanStatusDetail = "Verifying ${chains.size} pointer chains live…",
                 wasmFloatDelta = current.wasmFloatDelta.copy(
+                    isAutoVerifyingOnReload = false,
                     pointerStatusMessage = "Re-dereferencing ${chains.size} pointer chains against live HEAPU32 / HEAPF32…"
                 )
             )
@@ -1030,13 +1266,310 @@ class DiagnosticsViewModel : ViewModel() {
         appendLog(
             LogCategory.WASM,
             "Verifying ${chains.size} persistent pointer chains live…",
-            "Dereferencing base pointer + offsets against current WASM linear memory"
+            "Dereferencing base pointer + offsets against current WASM linear memory (filtering out 0,0,0 false positives)"
         )
-        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildVerifyPointerChainsScript(payloadArr.toString())))
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildVerifyPointerChainsScript(payloadJson)))
+    }
+
+    fun onToggleWatchWasmPointers() {
+        val fd = _uiState.value.wasmFloatDelta
+        if (fd.isWatchingPointers) {
+            _uiState.update { state ->
+                state.copy(
+                    wasmFloatDelta = state.wasmFloatDelta.copy(
+                        isWatchingPointers = false,
+                        pointerStatusMessage = "Paused 200ms Live Pointer Watch. Tap 'Watch Live' to resume."
+                    )
+                )
+            }
+            _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmPointerAndEntityScripts.buildStopPointerWatchScript()))
+            appendLog(LogCategory.WASM, "Paused 200ms Live Pointer Watch", "Stopped continuous pointer dereferencing")
+        } else {
+            startLivePointerWatchInternal(fd.pointerChains, fd.activeHudPointerId)
+        }
+    }
+
+    private fun startLivePointerWatchInternal(
+        chains: List<WasmPointerChain>,
+        hudPointerId: String?
+    ) {
+        if (chains.isEmpty()) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("No pointer chains available to watch."))
+            return
+        }
+        val payloadJson = buildPointerChainsPayloadJson(chains)
+        _uiState.update { state ->
+            state.copy(
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    isWatchingPointers = true,
+                    activeHudPointerId = hudPointerId,
+                    pointerStatusMessage = "Live 200ms Watch active on ${chains.size} pointer(s) — walk in-game to confirm MOVING ✓."
+                )
+            )
+        }
+        _effects.tryEmit(
+            DiagnosticsEffect.EvaluateJs(
+                WasmPointerAndEntityScripts.buildStartPointerWatchScript(payloadJson, hudPointerId)
+            )
+        )
+    }
+
+    fun onStreamPointerChainToHud(chainId: String) {
+        val state = _uiState.value
+        val fd = state.wasmFloatDelta
+        val target = fd.pointerChains.firstOrNull { it.id == chainId } ?: return
+        val turningOff = fd.activeHudPointerId == chainId
+        val nextHudId = if (turningOff) null else chainId
+
+        if (!turningOff && (target.status == WasmPointerStatus.STALE || target.status == WasmPointerStatus.ZERO)) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Cannot stream ${target.status.label} pointer to HUD — pick a LIVE or MOVING ✓ chain."))
+            return
+        }
+
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        _uiState.update { current ->
+            val updatedChains = current.wasmFloatDelta.pointerChains.map { c ->
+                c.copy(isStreamingToHud = (c.id == nextHudId))
+            }
+            val nextLocked = if (!turningOff && target.resolvedTargetAddress > 0L) {
+                val xIdx = (target.resolvedTargetAddress / 4L).toInt()
+                LockedWasmCoords(
+                    xIndex = xIdx,
+                    yIndex = xIdx + 1,
+                    zIndex = xIdx + 2,
+                    xByteAddress = target.resolvedTargetAddress,
+                    yByteAddress = target.resolvedTargetAddress + 4L,
+                    zByteAddress = target.resolvedTargetAddress + 8L,
+                    xValue = target.resolvedX,
+                    yValue = target.resolvedY,
+                    zValue = target.resolvedZ,
+                    lockedAtTimestamp = nowTs,
+                    liveTickCount = current.wasmFloatDelta.pointerWatchTickCount,
+                    isLivePolling = true
+                )
+            } else if (turningOff) {
+                current.wasmFloatDelta.lockedCoords
+            } else {
+                current.wasmFloatDelta.lockedCoords
+            }
+
+            current.copy(
+                discoveredPlayerPath = if (!turningOff) "WASM_PTR: ${target.expression}" else current.discoveredPlayerPath,
+                playerPropertyKeys = if (!turningOff) target.expression else current.playerPropertyKeys,
+                livePlayerCoords = if (!turningOff) {
+                    PlayerCoordinates(
+                        path = "WASM_PTR: ${target.expression}",
+                        x = target.resolvedX,
+                        y = target.resolvedY,
+                        z = target.resolvedZ
+                    )
+                } else current.livePlayerCoords,
+                livePollActive = if (!turningOff) true else current.livePollActive,
+                wasmFloatDelta = current.wasmFloatDelta.copy(
+                    activeHudPointerId = nextHudId,
+                    pointerChains = updatedChains,
+                    lockedCoords = nextLocked,
+                    isWatchingPointers = if (!turningOff) true else current.wasmFloatDelta.isWatchingPointers,
+                    pointerStatusMessage = if (!turningOff) {
+                        "Streaming ${target.expression} -> ${formatHexAddress(target.resolvedTargetAddress)} live to HUD (200ms). Step 3 WASM Entity Scan ready!"
+                    } else {
+                        "Unbound pointer HUD stream."
+                    }
+                )
+            )
+        }
+
+        if (!turningOff) {
+            if (fd.isWatchingPointers) {
+                _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmPointerAndEntityScripts.buildSetHudPointerScript(nextHudId)))
+            } else {
+                startLivePointerWatchInternal(_uiState.value.wasmFloatDelta.pointerChains, nextHudId)
+            }
+            appendLog(
+                LogCategory.WASM,
+                "Streaming pointer ${target.expression} live to HUD",
+                "Resolved -> ${formatHexAddress(target.resolvedTargetAddress)} (${String.format(Locale.US, "%.2f", target.resolvedX)}, ${String.format(Locale.US, "%.2f", target.resolvedY)}, ${String.format(Locale.US, "%.2f", target.resolvedZ)})"
+            )
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Streaming ${target.expression} live to HUD"))
+        } else {
+            _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmPointerAndEntityScripts.buildSetHudPointerScript(null)))
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Stopped HUD pointer stream"))
+        }
+    }
+
+    fun onPruneZeroAndStalePointers() {
+        val current = _uiState.value
+        val before = current.wasmFloatDelta.pointerChains
+        val kept = before.filter { chain ->
+            chain.isPinned || chain.isSavedLocally ||
+                (chain.status != WasmPointerStatus.ZERO && chain.status != WasmPointerStatus.STALE)
+        }
+        val removed = before.size - kept.size
+        if (removed <= 0) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("No unbookmarked ZERO or STALE pointers to prune."))
+            return
+        }
+        val nextHud = current.wasmFloatDelta.activeHudPointerId?.takeIf { id -> kept.any { it.id == id } }
+        _uiState.update { state ->
+            state.copy(
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    pointerChains = kept,
+                    activeHudPointerId = nextHud,
+                    pointerStatusMessage = "Pruned $removed ZERO/STALE pointer(s). ${kept.size} remaining."
+                )
+            )
+        }
+        if (current.wasmFloatDelta.isWatchingPointers) {
+            if (kept.isNotEmpty()) {
+                startLivePointerWatchInternal(kept, nextHud)
+            } else {
+                _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmPointerAndEntityScripts.buildStopPointerWatchScript()))
+            }
+        }
+        appendLog(LogCategory.WASM, "Pruned $removed ZERO/STALE pointer chains", "${kept.size} chains remaining")
+        _effects.tryEmit(DiagnosticsEffect.ShowToast("Pruned $removed ZERO/STALE pointer(s)"))
+    }
+
+    fun onWasmPointersUpdatedFromBridge(jsonPayload: String) {
+        val json = try {
+            JSONObject(jsonPayload)
+        } catch (_: Exception) {
+            return
+        }
+        if (json.optString("stage", "") != "WASM_POINTER_WATCH_TICK") return
+
+        val tick = json.optInt("tick", 1)
+        val sourceLabel = json.optString("heapSourceLabel", "")
+        val byteLen = json.optLong("heapByteLength", 0L)
+        val movingCount = json.optInt("movingCount", 0)
+        val liveCount = json.optInt("liveCount", 0)
+        val zeroCount = json.optInt("zeroCount", 0)
+        val staleCount = json.optInt("staleCount", 0)
+        val resultsArr = json.optJSONArray("results") ?: JSONArray()
+
+        val byId = HashMap<String, JSONObject>(resultsArr.length())
+        for (i in 0 until resultsArr.length()) {
+            val obj = resultsArr.optJSONObject(i) ?: continue
+            val id = obj.optString("id", "")
+            if (id.isNotBlank()) byId[id] = obj
+        }
+
+        _uiState.update { state ->
+            val prevFd = state.wasmFloatDelta
+            val hudId = prevFd.activeHudPointerId
+            var hudChainUpdated: WasmPointerChain? = null
+
+            val updatedChains = prevFd.pointerChains.map { chain ->
+                val res = byId[chain.id]
+                if (res != null) {
+                    val ok = res.optBoolean("isVerifiedLive", false)
+                    val parsedStatus = WasmPointerStatus.fromRaw(res.optString("status", ""), ok)
+                    val targetAddr = res.optLong("resolvedTargetAddress", if (ok) chain.resolvedTargetAddress else 0L)
+                    val rx = res.optDouble("resolvedX", chain.resolvedX)
+                    val ry = res.optDouble("resolvedY", chain.resolvedY)
+                    val rz = res.optDouble("resolvedZ", chain.resolvedZ)
+                    val changed = res.optBoolean("changedFromPrev", false)
+                    val changeCount = res.optInt("changeCount", chain.changeCount)
+                    val deltaMag = res.optDouble("lastDeltaMagnitude", 0.0)
+                    val next = chain.copy(
+                        resolvedTargetAddress = targetAddr,
+                        resolvedX = rx,
+                        resolvedY = ry,
+                        resolvedZ = rz,
+                        isVerifiedLive = ok,
+                        status = parsedStatus,
+                        watchBaselineX = chain.watchBaselineX ?: if (ok) rx else null,
+                        watchBaselineY = chain.watchBaselineY ?: if (ok) ry else null,
+                        watchBaselineZ = chain.watchBaselineZ ?: if (ok) rz else null,
+                        changedFromPrev = changed,
+                        changeCount = changeCount,
+                        lastDeltaMagnitude = deltaMag,
+                        isStreamingToHud = (chain.id == hudId)
+                    )
+                    if (chain.id == hudId && ok) {
+                        hudChainUpdated = next
+                    }
+                    next
+                } else {
+                    chain
+                }
+            }
+
+            // Sort MOVING first, then LIVE, then ZERO, then STALE/PENDING (keeping pinned/static priority)
+            val sortedChains = updatedChains.sortedWith(
+                compareBy<WasmPointerChain>(
+                    {
+                        when (it.status) {
+                            WasmPointerStatus.MOVING -> 0
+                            WasmPointerStatus.LIVE -> 1
+                            WasmPointerStatus.PENDING -> 2
+                            WasmPointerStatus.ZERO -> 3
+                            WasmPointerStatus.STALE -> 4
+                        }
+                    },
+                    { !it.isStreamingToHud },
+                    { !it.isPinned },
+                    { !it.isLikelyStatic }
+                )
+            )
+
+            val activeHud = hudChainUpdated
+            val nextLocked = if (activeHud != null && activeHud.resolvedTargetAddress > 0L) {
+                val xIdx = (activeHud.resolvedTargetAddress / 4L).toInt()
+                LockedWasmCoords(
+                    xIndex = xIdx,
+                    yIndex = xIdx + 1,
+                    zIndex = xIdx + 2,
+                    xByteAddress = activeHud.resolvedTargetAddress,
+                    yByteAddress = activeHud.resolvedTargetAddress + 4L,
+                    zByteAddress = activeHud.resolvedTargetAddress + 8L,
+                    xValue = activeHud.resolvedX,
+                    yValue = activeHud.resolvedY,
+                    zValue = activeHud.resolvedZ,
+                    lockedAtTimestamp = prevFd.lockedCoords?.lockedAtTimestamp ?: formatTimestamp(System.currentTimeMillis()),
+                    liveTickCount = tick,
+                    isLivePolling = true
+                )
+            } else {
+                prevFd.lockedCoords
+            }
+
+            val summaryMsg = buildString {
+                append("Live Watch #$tick: ")
+                if (movingCount > 0) append("$movingCount MOVING ✓ • ")
+                append("$liveCount live")
+                if (zeroCount > 0) append(" • $zeroCount zero")
+                if (staleCount > 0) append(" • $staleCount stale")
+            }
+
+            state.copy(
+                discoveredPlayerPath = activeHud?.let { "WASM_PTR: ${it.expression}" } ?: state.discoveredPlayerPath,
+                livePlayerCoords = activeHud?.let {
+                    PlayerCoordinates(
+                        path = "WASM_PTR: ${it.expression}",
+                        x = it.resolvedX,
+                        y = it.resolvedY,
+                        z = it.resolvedZ
+                    )
+                } ?: state.livePlayerCoords,
+                livePollActive = activeHud != null || state.livePollActive,
+                wasmFloatDelta = prevFd.copy(
+                    heapSourceLabel = sourceLabel.ifBlank { prevFd.heapSourceLabel },
+                    heapByteLength = if (byteLen > 0L) byteLen else prevFd.heapByteLength,
+                    isWatchingPointers = true,
+                    isAutoVerifyingOnReload = false,
+                    pointerWatchTickCount = tick,
+                    pointerChains = sortedChains,
+                    lockedCoords = nextLocked,
+                    pointerStatusMessage = summaryMsg
+                )
+            )
+        }
     }
 
     fun onTogglePinWasmPointerChain(chainId: String) {
         val nowTs = formatTimestamp(System.currentTimeMillis())
+        val activeUrl = _uiState.value.activeUrl
         var toggledChain: WasmPointerChain? = null
         var nowPinned = false
 
@@ -1044,7 +1577,10 @@ class DiagnosticsViewModel : ViewModel() {
             val updatedChains = state.wasmFloatDelta.pointerChains.map { chain ->
                 if (chain.id == chainId) {
                     nowPinned = !chain.isPinned
-                    val next = chain.copy(isPinned = nowPinned)
+                    val next = chain.copy(
+                        isPinned = nowPinned,
+                        isSavedLocally = nowPinned && SitePointerStore.normalizeHostKey(activeUrl) != null
+                    )
                     toggledChain = next
                     next
                 } else {
@@ -1055,7 +1591,7 @@ class DiagnosticsViewModel : ViewModel() {
             val mergedStaging = if (chain != null) {
                 val stagingKey = "WASM_PTR: ${chain.expression}"
                 val regionTag = if (chain.isLikelyStatic) "STATIC" else "HEAP"
-                val detail = "[L${chain.depth} $regionTag] -> ${formatHexAddress(chain.resolvedTargetAddress)} • (${String.format(Locale.US, "%.2f", chain.resolvedX)}, ${String.format(Locale.US, "%.2f", chain.resolvedY)}, ${String.format(Locale.US, "%.2f", chain.resolvedZ)})"
+                val detail = "[L${chain.depth} $regionTag ${chain.status.label}] -> ${formatHexAddress(chain.resolvedTargetAddress)} • (${String.format(Locale.US, "%.2f", chain.resolvedX)}, ${String.format(Locale.US, "%.2f", chain.resolvedY)}, ${String.format(Locale.US, "%.2f", chain.resolvedZ)})"
                 if (nowPinned) {
                     mergeIntoStagingBuffer(
                         existing = state.stagingBuffer,
@@ -1074,16 +1610,51 @@ class DiagnosticsViewModel : ViewModel() {
                 state.stagingBuffer
             }
 
+            val savedCount = toggledChain?.let { c ->
+                val store = sitePointerStore
+                if (store != null && SitePointerStore.normalizeHostKey(activeUrl) != null) {
+                    if (nowPinned) store.savePointerForUrl(activeUrl, c).size
+                    else store.removePointerForUrl(activeUrl, c.id).size
+                } else {
+                    updatedChains.count { it.isSavedLocally }
+                }
+            } ?: state.wasmFloatDelta.savedPointerCountForHost
+
             state.copy(
                 stagingBuffer = sortStagingBuffer(mergedStaging),
-                wasmFloatDelta = state.wasmFloatDelta.copy(pointerChains = updatedChains)
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    pointerChains = updatedChains,
+                    savedPointerCountForHost = savedCount
+                )
             )
         }
 
         toggledChain?.let { chain ->
-            val toast = if (nowPinned) "Pinned pointer chain ${chain.expression} to Staging" else "Unpinned pointer chain"
+            val host = SitePointerStore.normalizeHostKey(activeUrl)
+            val toast = if (nowPinned) {
+                if (host != null) "Saved ${chain.expression} for $host (auto-verifies on reload)"
+                else "Bookmarked pointer chain ${chain.expression}"
+            } else {
+                "Removed saved pointer chain ${chain.expression}"
+            }
             _effects.tryEmit(DiagnosticsEffect.ShowToast(toast))
         }
+    }
+
+    private fun buildPointerChainsPayloadJson(chains: List<WasmPointerChain>): String {
+        val payloadArr = JSONArray()
+        chains.forEach { c ->
+            val offArr = JSONArray()
+            c.offsets.forEach { offArr.put(it) }
+            payloadArr.put(
+                JSONObject()
+                    .put("id", c.id)
+                    .put("basePointerAddress", c.basePointerAddress)
+                    .put("offsets", offArr)
+                    .put("expression", c.expression)
+            )
+        }
+        return payloadArr.toString()
     }
 
     fun onWasmFloatCandidatesUpdatedFromBridge(jsonPayload: String) {
@@ -1888,6 +2459,64 @@ class DiagnosticsViewModel : ViewModel() {
                 }
             }
 
+            "WASM_ENTITIES_DISCOVERED" -> {
+                val errorMsg = json.optString("error", "")
+                if (errorMsg.isNotBlank()) {
+                    _uiState.update {
+                        it.copy(
+                            scanStatus = AsyncScanStatus.ERROR,
+                            scanStatusDetail = errorMsg.take(60)
+                        )
+                    }
+                    _effects.tryEmit(DiagnosticsEffect.ShowToast(errorMsg))
+                    "Step 3 (WASM): $errorMsg"
+                } else {
+                    val durationMs = json.optDouble("durationMs", 0.0)
+                    val arrayPath = json.optString("arrayPath", "window.HEAPF32")
+                    val mode = json.optString("projectionMode", "WASM Spatial HEAPF32")
+                    val vpW = json.optInt("viewportWidth", 0)
+                    val vpH = json.optInt("viewportHeight", 0)
+                    val rawCount = json.optInt("rawCandidateCount", 0)
+                    val parsedEntities = parseWasmEntitiesArray(json.optJSONArray("entities"))
+
+                    _uiState.update { state ->
+                        val nextScan = state.scanCounter + 1
+                        val mergedStaging = if (parsedEntities.isNotEmpty()) {
+                            mergeIntoStagingBuffer(
+                                existing = state.stagingBuffer,
+                                incoming = listOf(arrayPath to "WASM nearby entities (${parsedEntities.size} detected)"),
+                                sourceStep = "Step 3 WASM",
+                                scanNumber = nextScan,
+                                timestamp = nowTs
+                            )
+                        } else state.stagingBuffer
+
+                        state.copy(
+                            scanCounter = nextScan,
+                            discoveredEntityArrayPath = arrayPath,
+                            entityProjectionMode = mode,
+                            entityViewportWidth = vpW,
+                            entityViewportHeight = vpH,
+                            discoveredEntities = parsedEntities,
+                            lastEntityCount = parsedEntities.size,
+                            isWasmEntitiesLivePolling = false,
+                            wasmEntityLiveTickCount = 0,
+                            stagingBuffer = mergedStaging,
+                            scanStatus = if (parsedEntities.isNotEmpty()) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                            scanStatusDetail = "Step 3 WASM: ${parsedEntities.size} nearby (${durationMs}ms)"
+                        )
+                    }
+                    if (parsedEntities.isNotEmpty()) {
+                        _effects.tryEmit(
+                            DiagnosticsEffect.ShowToast("Found ${parsedEntities.size} nearby WASM entities — open Entities tab")
+                        )
+                        "Step 3 (WASM, ${durationMs}ms): Found ${parsedEntities.size} nearby entities (from $rawCount raw hits) in $arrayPath"
+                    } else {
+                        "Step 3 (WASM, ${durationMs}ms): 0 nearby entity coordinates found within 1.5..250u of player"
+                    }
+                }
+            }
+
             "MANUAL_EVAL" -> {
                 val type = json.optString("resultType", "unknown")
                 val ms = json.optDouble("durationMs", 0.0)
@@ -2145,11 +2774,12 @@ class DiagnosticsViewModel : ViewModel() {
                 val totalL2 = json.optInt("totalL2", 0)
                 val durationMs = json.optDouble("durationMs", 0.0)
                 val targetAddr = json.optLong("targetByteAddress", 0L)
-                val pinnedExisting = _uiState.value.wasmFloatDelta.pointerChains.filter { it.isPinned }
+                val pinnedExisting = _uiState.value.wasmFloatDelta.pointerChains.filter { it.isPinned || it.isSavedLocally }
                 val pinnedIds = pinnedExisting.map { it.id }.toSet()
-                val parsedChains = parseWasmPointerChains(json.optJSONArray("chains"), pinnedIds)
+                val savedIds = pinnedExisting.filter { it.isSavedLocally }.map { it.id }.toSet()
+                val parsedChains = parseWasmPointerChains(json.optJSONArray("chains"), pinnedIds, savedIds)
 
-                // Merge newly discovered chains while preserving any previously pinned chains
+                // Merge newly discovered chains while preserving any previously pinned/saved chains
                 val mergedChains = buildList {
                     val seen = LinkedHashSet<String>()
                     parsedChains.forEach { c ->
@@ -2162,7 +2792,7 @@ class DiagnosticsViewModel : ViewModel() {
 
                 val staticCount = parsedChains.count { it.isLikelyStatic }
                 val pointerMsg = if (parsedChains.isNotEmpty()) {
-                    "Found L1=$totalL1, L2=$totalL2 pointers ($staticCount in static <2MB region) in ${durationMs}ms. Reload & tap 'Verify Live' to confirm persistence."
+                    "Found L1=$totalL1, L2=$totalL2 pointers ($staticCount static) in ${durationMs}ms. Live 200ms Watch started — walk to confirm MOVING ✓!"
                 } else {
                     "0 direct L1/L2 pointers found within 256B of ${formatHexAddress(targetAddr)} (${durationMs}ms). Try locking an adjacent Vec3 slot or checking ±16B neighbors."
                 }
@@ -2194,7 +2824,19 @@ class DiagnosticsViewModel : ViewModel() {
                             pointerScanTotalL1 = totalL1,
                             pointerScanTotalL2 = totalL2,
                             pointerChains = mergedChains,
+                            isWatchingPointers = mergedChains.isNotEmpty(),
                             pointerStatusMessage = pointerMsg
+                        )
+                    )
+                }
+                if (mergedChains.isNotEmpty()) {
+                    val payloadJson = buildPointerChainsPayloadJson(mergedChains)
+                    _effects.tryEmit(
+                        DiagnosticsEffect.EvaluateJs(
+                            WasmPointerAndEntityScripts.buildStartPointerWatchScript(
+                                chainsJsonArray = payloadJson,
+                                hudPointerId = _uiState.value.wasmFloatDelta.activeHudPointerId
+                            )
                         )
                     )
                 }
@@ -2203,6 +2845,7 @@ class DiagnosticsViewModel : ViewModel() {
 
             "WASM_POINTER_CHAINS_VERIFIED" -> {
                 val validCount = json.optInt("validCount", 0)
+                val zeroCount = json.optInt("zeroCount", 0)
                 val totalCount = json.optInt("totalCount", 0)
                 val resultsArr = json.optJSONArray("results") ?: JSONArray()
                 val byId = HashMap<String, JSONObject>(resultsArr.length())
@@ -2212,34 +2855,129 @@ class DiagnosticsViewModel : ViewModel() {
                     if (id.isNotBlank()) byId[id] = obj
                 }
 
-                val verifyMsg = "Live verification: $validCount/$totalCount pointer chains resolved to valid coordinates."
+                val verifyMsg = "Verified $validCount/$totalCount live" +
+                    (if (zeroCount > 0) " ($zeroCount zeroed)" else "") +
+                    " — streaming 200ms Watch (walk to confirm MOVING ✓)."
+                var chainsToWatch: List<WasmPointerChain> = emptyList()
+                var hudId: String? = null
                 _uiState.update { state ->
                     val updatedChains = state.wasmFloatDelta.pointerChains.map { chain ->
                         val res = byId[chain.id]
                         if (res != null) {
                             val ok = res.optBoolean("isVerifiedLive", false)
+                            val st = WasmPointerStatus.fromRaw(res.optString("status", ""), ok)
                             chain.copy(
-                                resolvedTargetAddress = if (ok) res.optLong("resolvedTargetAddress", chain.resolvedTargetAddress) else 0L,
-                                resolvedX = if (ok) res.optDouble("resolvedX", chain.resolvedX) else 0.0,
-                                resolvedY = if (ok) res.optDouble("resolvedY", chain.resolvedY) else 0.0,
-                                resolvedZ = if (ok) res.optDouble("resolvedZ", chain.resolvedZ) else 0.0,
-                                isVerifiedLive = ok
+                                resolvedTargetAddress = res.optLong("resolvedTargetAddress", if (ok) chain.resolvedTargetAddress else 0L),
+                                resolvedX = res.optDouble("resolvedX", 0.0),
+                                resolvedY = res.optDouble("resolvedY", 0.0),
+                                resolvedZ = res.optDouble("resolvedZ", 0.0),
+                                isVerifiedLive = ok,
+                                status = st
                             )
                         } else {
                             chain
                         }
                     }
+                    chainsToWatch = updatedChains
+                    hudId = state.wasmFloatDelta.activeHudPointerId
+                        ?: updatedChains.firstOrNull { it.status == WasmPointerStatus.LIVE || it.status == WasmPointerStatus.MOVING }?.id
+                    val finalChains = updatedChains.map { it.copy(isStreamingToHud = (it.id == hudId)) }
                     state.copy(
                         scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "Verified $validCount/$totalCount pointers",
+                        scanStatusDetail = "Verified $validCount/$totalCount live ($zeroCount zeroed)",
                         wasmFloatDelta = state.wasmFloatDelta.copy(
-                            pointerChains = updatedChains,
+                            pointerChains = finalChains,
+                            activeHudPointerId = hudId,
+                            isWatchingPointers = finalChains.isNotEmpty(),
+                            isAutoVerifyingOnReload = false,
                             pointerStatusMessage = verifyMsg
                         )
                     )
                 }
+                if (chainsToWatch.isNotEmpty()) {
+                    _effects.tryEmit(
+                        DiagnosticsEffect.EvaluateJs(
+                            WasmPointerAndEntityScripts.buildStartPointerWatchScript(
+                                chainsJsonArray = buildPointerChainsPayloadJson(chainsToWatch),
+                                hudPointerId = hudId
+                            )
+                        )
+                    )
+                }
                 _effects.tryEmit(DiagnosticsEffect.ShowToast(verifyMsg))
-                "Pointer Verify: $validCount/$totalCount chains resolved live"
+                "Pointer Verify: $validCount/$totalCount live ($zeroCount zeroed) • Live 200ms Watch started"
+            }
+
+            "WASM_POINTER_AUTO_VERIFY_DONE" -> {
+                val heapFound = json.optBoolean("heapFound", false)
+                val nonZeroCount = json.optInt("nonZeroCount", 0)
+                val zeroCount = json.optInt("zeroCount", 0)
+                val totalCount = json.optInt("totalCount", 0)
+                val autoHudId = json.optString("autoHudPointerId", "").takeIf { it.isNotBlank() && it != "null" }
+                val sourceLabel = json.optString("heapSourceLabel", "")
+                val byteLen = json.optLong("heapByteLength", 0L)
+                val resultsArr = json.optJSONArray("results") ?: JSONArray()
+                val byId = HashMap<String, JSONObject>(resultsArr.length())
+                for (i in 0 until resultsArr.length()) {
+                    val obj = resultsArr.optJSONObject(i) ?: continue
+                    val id = obj.optString("id", "")
+                    if (id.isNotBlank()) byId[id] = obj
+                }
+
+                val msg = if (!heapFound) {
+                    "WASM heap not detected yet after reload. Tap 'Verify' once in-game."
+                } else {
+                    "Auto-verified $nonZeroCount/$totalCount saved pointer(s) live" +
+                        (if (zeroCount > 0) " ($zeroCount zeroed)" else "") +
+                        " • 200ms Watch active!"
+                }
+
+                _uiState.update { state ->
+                    val updatedChains = state.wasmFloatDelta.pointerChains.map { chain ->
+                        val res = byId[chain.id]
+                        if (res != null) {
+                            val ok = res.optBoolean("isVerifiedLive", false)
+                            val st = WasmPointerStatus.fromRaw(res.optString("status", ""), ok)
+                            chain.copy(
+                                resolvedTargetAddress = res.optLong("resolvedTargetAddress", 0L),
+                                resolvedX = res.optDouble("resolvedX", 0.0),
+                                resolvedY = res.optDouble("resolvedY", 0.0),
+                                resolvedZ = res.optDouble("resolvedZ", 0.0),
+                                isVerifiedLive = ok,
+                                status = st,
+                                isStreamingToHud = (chain.id == autoHudId)
+                            )
+                        } else chain
+                    }
+                    val activeHudChain = autoHudId?.let { id -> updatedChains.firstOrNull { it.id == id && it.isVerifiedLive } }
+                    state.copy(
+                        discoveredPlayerPath = activeHudChain?.let { "WASM_PTR: ${it.expression}" } ?: state.discoveredPlayerPath,
+                        livePlayerCoords = activeHudChain?.let {
+                            PlayerCoordinates(
+                                path = "WASM_PTR: ${it.expression}",
+                                x = it.resolvedX,
+                                y = it.resolvedY,
+                                z = it.resolvedZ
+                            )
+                        } ?: state.livePlayerCoords,
+                        livePollActive = activeHudChain != null || state.livePollActive,
+                        scanStatus = if (nonZeroCount > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = if (nonZeroCount > 0) "Auto-verified $nonZeroCount/$totalCount pointers" else "Waiting for game load",
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            heapSourceLabel = sourceLabel.ifBlank { state.wasmFloatDelta.heapSourceLabel },
+                            heapByteLength = if (byteLen > 0L) byteLen else state.wasmFloatDelta.heapByteLength,
+                            pointerChains = updatedChains,
+                            activeHudPointerId = autoHudId,
+                            isWatchingPointers = heapFound && updatedChains.isNotEmpty(),
+                            isAutoVerifyingOnReload = false,
+                            pointerStatusMessage = msg
+                        )
+                    )
+                }
+                if (nonZeroCount > 0) {
+                    _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+                }
+                msg
             }
 
             "WASM_POINTER_ERROR" -> {
@@ -2250,6 +2988,7 @@ class DiagnosticsViewModel : ViewModel() {
                         scanStatusDetail = msg.take(60),
                         wasmFloatDelta = state.wasmFloatDelta.copy(
                             isScanningPointers = false,
+                            isAutoVerifyingOnReload = false,
                             pointerStatusMessage = msg
                         )
                     )
@@ -2262,9 +3001,34 @@ class DiagnosticsViewModel : ViewModel() {
         }
     }
 
+    private fun parseWasmEntitiesArray(array: JSONArray?): List<DiscoveredEntitySample> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                add(
+                    DiscoveredEntitySample(
+                        name = obj.optString("name", "WASM Entity #${i + 1}"),
+                        id = obj.optString("id", ""),
+                        path = obj.optString("path", ""),
+                        worldX = obj.optDouble("worldX", 0.0),
+                        worldY = obj.optDouble("worldY", 0.0),
+                        worldZ = obj.optDouble("worldZ", 0.0),
+                        distanceToPlayer = obj.optDouble("distanceToPlayer", 0.0),
+                        screenX = obj.optDouble("screenX", 0.0),
+                        screenY = obj.optDouble("screenY", 0.0),
+                        inViewport = obj.optBoolean("inViewport", false),
+                        sampleKeys = extractStringArray(obj.optJSONArray("sampleKeys"))
+                    )
+                )
+            }
+        }
+    }
+
     private fun parseWasmPointerChains(
         array: JSONArray?,
-        pinnedIds: Set<String>
+        pinnedIds: Set<String>,
+        savedIds: Set<String> = emptySet()
     ): List<WasmPointerChain> {
         if (array == null) return emptyList()
         return buildList {
@@ -2287,7 +3051,13 @@ class DiagnosticsViewModel : ViewModel() {
                 val ry = obj.optDouble("resolvedY", 0.0)
                 val rz = obj.optDouble("resolvedZ", 0.0)
                 val isStatic = obj.optBoolean("isLikelyStatic", false)
-                val isVerified = obj.optBoolean("isVerifiedLive", true)
+                val isZero = kotlin.math.abs(rx) < 0.00001 && kotlin.math.abs(ry) < 0.00001 && kotlin.math.abs(rz) < 0.00001
+                val isVerified = obj.optBoolean("isVerifiedLive", true) && !isZero
+                val status = when {
+                    isZero -> WasmPointerStatus.ZERO
+                    isVerified -> WasmPointerStatus.LIVE
+                    else -> WasmPointerStatus.STALE
+                }
                 val expr = obj.optString("expression", "")
                 add(
                     WasmPointerChain(
@@ -2302,7 +3072,9 @@ class DiagnosticsViewModel : ViewModel() {
                         isLikelyStatic = isStatic,
                         isVerifiedLive = isVerified,
                         expression = expr,
-                        isPinned = pinnedIds.contains(id)
+                        isPinned = pinnedIds.contains(id),
+                        status = status,
+                        isSavedLocally = savedIds.contains(id)
                     )
                 )
             }
@@ -2788,13 +3560,13 @@ class DiagnosticsViewModel : ViewModel() {
                         )
                     }
                     if (state.wasmFloatDelta.pointerChains.isNotEmpty()) {
-                        appendLine("Persistent Pointer Chains (${state.wasmFloatDelta.pointerChains.size}, L1=${state.wasmFloatDelta.pointerScanTotalL1}, L2=${state.wasmFloatDelta.pointerScanTotalL2}):")
+                        appendLine("Persistent Pointer Chains (${state.wasmFloatDelta.pointerChains.size}, L1=${state.wasmFloatDelta.pointerScanTotalL1}, L2=${state.wasmFloatDelta.pointerScanTotalL2}, watchTicks=${state.wasmFloatDelta.pointerWatchTickCount}):")
                         state.wasmFloatDelta.pointerChains.forEach { p ->
                             val regTag = if (p.isLikelyStatic) "STATIC" else "HEAP"
-                            val liveTag = if (p.isVerifiedLive) "LIVE" else "STALE"
-                            val pinTag = if (p.isPinned) "[PINNED] " else ""
+                            val pinTag = if (p.isSavedLocally) "[SAVED] " else if (p.isPinned) "[PINNED] " else ""
+                            val hudTag = if (p.isStreamingToHud) "[HUD] " else ""
                             appendLine(
-                                "  $pinTag[L${p.depth} $regTag $liveTag] ${p.expression} -> ${formatHexAddress(p.resolvedTargetAddress)} " +
+                                "  $pinTag$hudTag[L${p.depth} $regTag ${p.status.name} Δx${p.changeCount}] ${p.expression} -> ${formatHexAddress(p.resolvedTargetAddress)} " +
                                     "(${String.format(Locale.US, "%.3f", p.resolvedX)}, ${String.format(Locale.US, "%.3f", p.resolvedY)}, ${String.format(Locale.US, "%.3f", p.resolvedZ)})"
                             )
                         }
@@ -2941,7 +3713,12 @@ class DiagnosticsViewModel : ViewModel() {
                         .put("resolvedZ", chain.resolvedZ)
                         .put("isLikelyStatic", chain.isLikelyStatic)
                         .put("isVerifiedLive", chain.isVerifiedLive)
+                        .put("status", chain.status.name)
+                        .put("changeCount", chain.changeCount)
+                        .put("lastDeltaMagnitude", chain.lastDeltaMagnitude)
                         .put("isPinned", chain.isPinned)
+                        .put("isSavedLocally", chain.isSavedLocally)
+                        .put("isStreamingToHud", chain.isStreamingToHud)
                         .put("expression", chain.expression)
                 )
             }
@@ -2956,6 +3733,10 @@ class DiagnosticsViewModel : ViewModel() {
                     .put("lockedCoords", lockedJson)
                     .put("pointerScanTotalL1", floatDelta.pointerScanTotalL1)
                     .put("pointerScanTotalL2", floatDelta.pointerScanTotalL2)
+                    .put("isWatchingPointers", floatDelta.isWatchingPointers)
+                    .put("pointerWatchTickCount", floatDelta.pointerWatchTickCount)
+                    .put("activeHudPointerId", floatDelta.activeHudPointerId ?: JSONObject.NULL)
+                    .put("savedPointerCountForHost", floatDelta.savedPointerCountForHost)
                     .put("persistentPointerChains", pointerChainsArr)
                     .put("candidates", floatDeltaArr)
             )

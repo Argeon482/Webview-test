@@ -257,6 +257,27 @@ data class LockedWasmCoords(
     val isLivePolling: Boolean = true
 )
 
+enum class WasmPointerStatus(val label: String) {
+    MOVING("MOVING ✓"),
+    LIVE("LIVE"),
+    ZERO("ZERO"),
+    STALE("STALE"),
+    PENDING("PENDING");
+
+    companion object {
+        fun fromRaw(raw: String, fallbackLive: Boolean): WasmPointerStatus {
+            return when (raw.trim().uppercase()) {
+                "MOVING" -> MOVING
+                "LIVE" -> LIVE
+                "ZERO" -> ZERO
+                "STALE" -> STALE
+                "PENDING" -> PENDING
+                else -> if (fallbackLive) LIVE else STALE
+            }
+        }
+    }
+}
+
 @Immutable
 data class WasmPointerChain(
     val id: String,
@@ -270,7 +291,16 @@ data class WasmPointerChain(
     val isLikelyStatic: Boolean,
     val isVerifiedLive: Boolean = true,
     val expression: String,
-    val isPinned: Boolean = false
+    val isPinned: Boolean = false,
+    val status: WasmPointerStatus = if (isVerifiedLive) WasmPointerStatus.LIVE else WasmPointerStatus.STALE,
+    val watchBaselineX: Double? = null,
+    val watchBaselineY: Double? = null,
+    val watchBaselineZ: Double? = null,
+    val changedFromPrev: Boolean = false,
+    val changeCount: Int = 0,
+    val lastDeltaMagnitude: Double = 0.0,
+    val isSavedLocally: Boolean = false,
+    val isStreamingToHud: Boolean = false
 )
 
 @Immutable
@@ -295,7 +325,12 @@ data class WasmFloatDeltaState(
     val pointerScanTotalL1: Int = 0,
     val pointerScanTotalL2: Int = 0,
     val pointerChains: List<WasmPointerChain> = emptyList(),
-    val pointerStatusMessage: String = ""
+    val pointerStatusMessage: String = "",
+    val isWatchingPointers: Boolean = false,
+    val pointerWatchTickCount: Int = 0,
+    val activeHudPointerId: String? = null,
+    val isAutoVerifyingOnReload: Boolean = false,
+    val savedPointerCountForHost: Int = 0
 )
 
 @Immutable
@@ -333,13 +368,15 @@ data class DiagnosticsUiState(
     val livePollActive: Boolean = false,
     val livePollTickCount: Int = 0,
     val wasmFloatDelta: WasmFloatDeltaState = WasmFloatDeltaState(),
-    // Step 3 state (Visual Entity Inspection Console)
+    // Step 3 state (Visual Entity Inspection Console + WASM Nearby Entity Scanner)
     val discoveredEntityArrayPath: String? = null,
     val entityProjectionMode: String = "",
     val entityViewportWidth: Int = 0,
     val entityViewportHeight: Int = 0,
     val discoveredEntities: List<DiscoveredEntitySample> = emptyList(),
     val lastEntityCount: Int = 0,
+    val isWasmEntitiesLivePolling: Boolean = false,
+    val wasmEntityLiveTickCount: Int = 0,
     // Step 4/5 Passive asset & console state
     val wasmHeap: WasmHeapTrackerState = WasmHeapTrackerState(),
     val interceptedAssets: List<InterceptedAsset> = emptyList(),
@@ -364,6 +401,14 @@ data class DiagnosticsUiState(
     val totalCachedAssetBytes: Long
         get() = interceptedAssets.filter { it.captureStatus == AssetCaptureStatus.CAPTURED }.sumOf { it.byteSize }
 
+    val hasLiveWasmPlayerAnchor: Boolean
+        get() = wasmFloatDelta.lockedCoords != null ||
+            wasmFloatDelta.activeHudPointerId != null ||
+            wasmFloatDelta.pointerChains.any {
+                (it.status == WasmPointerStatus.MOVING || it.status == WasmPointerStatus.LIVE) &&
+                    it.resolvedTargetAddress > 0L
+            }
+
     val step1Badge: WizardStepBadge
         get() = if (step1Completed && (customGlobals.isNotEmpty() || canvasCount > 0)) {
             WizardStepBadge.CAPTURED
@@ -375,9 +420,11 @@ data class DiagnosticsUiState(
         get() = when {
             (!discoveredPlayerPath.isNullOrBlank() && livePlayerCoords != null) ||
                 wasmFloatDelta.lockedCoords != null ||
+                wasmFloatDelta.activeHudPointerId != null ||
+                wasmFloatDelta.pointerChains.any { it.status == WasmPointerStatus.MOVING } ||
                 (wasmFloatDelta.candidates.isNotEmpty() && (wasmFloatDelta.isLiveWatching || wasmFloatDelta.pinnedIndices.isNotEmpty())) ->
                 WizardStepBadge.CAPTURED
-            step1Completed || baselineCaptured || wasmFloatDelta.baselineCaptured ->
+            step1Completed || baselineCaptured || wasmFloatDelta.baselineCaptured || wasmFloatDelta.pointerChains.isNotEmpty() ->
                 WizardStepBadge.READY
             else -> WizardStepBadge.PENDING
         }
@@ -385,7 +432,7 @@ data class DiagnosticsUiState(
     val step3Badge: WizardStepBadge
         get() = when {
             !discoveredEntityArrayPath.isNullOrBlank() && discoveredEntities.isNotEmpty() -> WizardStepBadge.CAPTURED
-            !discoveredPlayerPath.isNullOrBlank() -> WizardStepBadge.READY
+            !discoveredPlayerPath.isNullOrBlank() || hasLiveWasmPlayerAnchor -> WizardStepBadge.READY
             else -> WizardStepBadge.PENDING
         }
 

@@ -109,10 +109,19 @@
     <string name="action_lock_coords">Lock Coords</string>
     <string name="action_unlock_coords">Unlock</string>
     <string name="action_find_pointers">Find Pointers</string>
-    <string name="action_verify_pointers">Verify Live</string>
+    <string name="action_verify_pointers">Verify</string>
+    <string name="action_watch_pointers_live">Watch Live</string>
+    <string name="action_stop_watch_pointers">Stop Watch</string>
+    <string name="action_prune_pointers">Prune 0/Stale</string>
+    <string name="action_stream_pointer_hud">Stream to HUD</string>
+    <string name="action_live_entities_on">Live 500ms</string>
+    <string name="action_live_entities_off">Stop Live</string>
     <string name="wasm_locked_coords_title">Locked WASM Coordinates (HEAPF32)</string>
     <string name="wasm_pointer_chains_title">Persistent Pointer Chains (HEAPU32)</string>
-    <string name="wasm_pointer_chains_hint">Scans WASM linear memory for Level-1 &amp; Level-2 pointers pointing to your locked coordinates struct so you can re-locate them persistently across reloads.</string>
+    <string name="wasm_pointer_chains_hint">Watch Live polls every 200ms — walk in-game to confirm MOVING ✓ vs ZERO/STALE. Bookmark chains to save per site and auto-verify on reload.</string>
+    <string name="wasm_step3_instruction">Anchored to your live WASM pointer/locked player coords (or JS object path) — scans read-only HEAPF32 memory for nearby entity coordinates.</string>
     <string name="cd_lock_float_candidate">Lock this float offset as player coordinates</string>
-    <string name="cd_pin_pointer_chain">Pin pointer chain to Staging</string>
+    <string name="cd_pin_pointer_chain">Bookmark pointer chain locally for this site</string>
+    <string name="cd_stream_pointer_hud">Stream this pointer chain live to the top coordinates HUD</string>
+    <string name="cd_toggle_wasm_entities_live">Toggle 500ms live position refresh for WASM nearby entities</string>
 </resources>

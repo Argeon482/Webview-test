@@ -514,4 +514,119 @@ class ExampleRobolectricTest {
         assertTrue(dumpText.contains("Persistent Pointer Chains"))
         assertTrue(dumpText.contains("*(*(0x00002400) + 0x8) + 0x10"))
     }
+
+    @Test
+    fun `site pointer store persists bookmarks per host survives reset and auto-verifies on reload`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val store = SitePointerStore(InMemoryPointerStorage())
+        val vm = DiagnosticsViewModel()
+        vm.setSitePointerStoreForTesting(store)
+
+        val url = "https://universe.flyff.com/play"
+        vm.onUrlInputChanged(url)
+        vm.onLoadUrlRequested()
+
+        // Seed 3 discovered pointers matching the real Flyff export pattern: 2 live + 1 zero
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":12.0,"targetByteAddress":65011712,"totalL1":2,"totalL2":1,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"},{"id":"L2_0x0005E678_+0xC_+0x98","depth":2,"basePointerAddress":386680,"offsets":[12,152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(*(0x0005E678) + 0xC) + 0x98"},{"id":"L1_0x001B1868_+0x98","depth":1,"basePointerAddress":1775720,"offsets":[152],"resolvedTargetAddress":70000000,"resolvedX":0.0,"resolvedY":0.0,"resolvedZ":0.0,"isLikelyStatic":true,"isVerifiedLive":false,"expression":"*(0x001B1868) + 0x98"}]}"""
+        )
+
+        // Auto-watch starts immediately after pointer discovery
+        assertTrue(vm.uiState.value.wasmFloatDelta.isWatchingPointers)
+
+        // Bookmark the 2 genuine chains -> saved locally per host
+        vm.onTogglePinWasmPointerChain("L1_0x00135C64_+0x98")
+        vm.onTogglePinWasmPointerChain("L2_0x0005E678_+0xC_+0x98")
+        assertEquals(2, store.countSavedForUrl(url))
+        assertEquals(2, vm.uiState.value.wasmFloatDelta.savedPointerCountForHost)
+
+        // Live 200ms watch tick: L1 moves, L2 stays live, 3rd chain is ZERO (0,0,0)
+        vm.onWasmPointersUpdatedFromBridge(
+            """{"stage":"WASM_POINTER_WATCH_TICK","tick":5,"activeHudPointerId":"L1_0x00135C64_+0x98","results":[{"id":"L1_0x00135C64_+0x98","resolvedTargetAddress":65011712,"resolvedX":6970.5,"resolvedY":100.0,"resolvedZ":3315.25,"status":"MOVING","isVerifiedLive":true,"changedFromPrev":true,"changeCount":3,"lastDeltaMagnitude":8.52},{"id":"L2_0x0005E678_+0xC_+0x98","resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"status":"LIVE","isVerifiedLive":true,"changedFromPrev":false,"changeCount":0,"lastDeltaMagnitude":0.0},{"id":"L1_0x001B1868_+0x98","resolvedTargetAddress":70000000,"resolvedX":0.0,"resolvedY":0.0,"resolvedZ":0.0,"status":"ZERO","isVerifiedLive":false,"changedFromPrev":false,"changeCount":0,"lastDeltaMagnitude":0.0}]}"""
+        )
+        val chainsAfterTick = vm.uiState.value.wasmFloatDelta.pointerChains
+        assertEquals("L1_0x00135C64_+0x98", chainsAfterTick.first().id)
+        assertEquals(WasmPointerStatus.MOVING, chainsAfterTick.first().status)
+        assertEquals(3, chainsAfterTick.first().changeCount)
+        assertEquals(WasmPointerStatus.ZERO, chainsAfterTick.first { it.id == "L1_0x001B1868_+0x98" }.status)
+
+        // Stream moving pointer to HUD -> updates livePlayerCoords and lockedCoords
+        vm.onStreamPointerChainToHud("L1_0x00135C64_+0x98")
+        assertEquals("L1_0x00135C64_+0x98", vm.uiState.value.wasmFloatDelta.activeHudPointerId)
+        assertEquals(6970.5, vm.uiState.value.livePlayerCoords!!.x, 0.001)
+        assertTrue(vm.uiState.value.hasLiveWasmPlayerAnchor)
+
+        // Prune 0/Stale removes unbookmarked ZERO chain while keeping saved live chains
+        vm.onPruneZeroAndStalePointers()
+        assertEquals(2, vm.uiState.value.wasmFloatDelta.pointerChains.size)
+        assertFalse(vm.uiState.value.wasmFloatDelta.pointerChains.any { it.id == "L1_0x001B1868_+0x98" })
+
+        // Reset float scanner preserves bookmarked site pointers
+        vm.onResetWasmFloatDelta()
+        assertEquals(2, vm.uiState.value.wasmFloatDelta.pointerChains.size)
+        assertTrue(vm.uiState.value.wasmFloatDelta.pointerChains.all { it.isSavedLocally && it.isPinned })
+
+        // Simulated page reload / fresh ViewModel instance restores saved pointers & triggers auto-verify
+        val reloadedVm = DiagnosticsViewModel()
+        reloadedVm.setSitePointerStoreForTesting(store)
+        reloadedVm.onPageFinished(url, "Flyff Universe")
+        assertEquals(2, reloadedVm.uiState.value.wasmFloatDelta.pointerChains.size)
+        assertTrue(reloadedVm.uiState.value.wasmFloatDelta.isAutoVerifyingOnReload)
+
+        // Also verify SharedPreferences-backed constructor works with Robolectric context
+        val prefsStore = SitePointerStore(context)
+        prefsStore.clearPointersForUrl(url)
+        prefsStore.savePointerForUrl(url, chainsAfterTick.first())
+        assertEquals(1, prefsStore.loadPointersForUrl(url).size)
+    }
+
+    @Test
+    fun `telemetry bridge forwards wasm pointers and entities and step 3 scans nearby wasm entities`() {
+        val ptrPayloads = mutableListOf<String>()
+        val entityPayloads = mutableListOf<String>()
+        val bridge = TelemetryBridge(
+            onTelemetryReceived = { _, _ -> },
+            onReportPayloadReceived = {},
+            onWasmPointersUpdated = { ptrPayloads.add(it) },
+            onWasmEntitiesUpdated = { entityPayloads.add(it) }
+        )
+
+        bridge.updateWasmPointers("""{"stage":"WASM_POINTER_WATCH_TICK","tick":1,"results":[]}""")
+        bridge.updateWasmEntities("""{"stage":"WASM_ENTITIES_TICK","tick":1,"entities":[]}""")
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(1, ptrPayloads.size)
+        assertEquals(1, entityPayloads.size)
+
+        val vm = DiagnosticsViewModel()
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":8.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
+        )
+        assertTrue(vm.uiState.value.hasLiveWasmPlayerAnchor)
+
+        // Trigger Step 3 -> runs WASM nearby-entity scan and receives discovered entities
+        vm.runStep3ScanEntities()
+        assertEquals(AsyncScanStatus.RUNNING, vm.uiState.value.scanStatus)
+
+        vm.onTelemetryFromBridge(
+            "ENTITY",
+            """{"stage":"WASM_ENTITIES_DISCOVERED","arrayPath":"window.HEAPF32 near 0x03E00000","projectionMode":"WASM Spatial HEAPF32 (radius 1.5..250u)","viewportWidth":1080,"viewportHeight":1920,"durationMs":14.5,"entities":[{"name":"WASM Entity #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","worldX":6975.0,"worldY":100.0,"worldZ":3312.5,"distanceToPlayer":13.3,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","struct=0x03E01000","Δ(13.0, 0.0, 2.7)","off=+0x98"]},{"name":"WASM Entity #2","id":"0x03E02400","path":"HEAPF32[16255270] @ 0x03E02498","worldX":6990.0,"worldY":100.0,"worldZ":3325.0,"distanceToPlayer":31.9,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","struct=0x03E02400","Δ(28.0, 0.0, 15.2)","off=+0x98"]}]}"""
+        )
+        assertEquals(2, vm.uiState.value.discoveredEntities.size)
+        assertEquals(WizardStepBadge.CAPTURED, vm.uiState.value.step3Badge)
+
+        // Live 500ms entity update moves Entity #1 closer
+        vm.onToggleWasmEntitiesLiveRefresh()
+        assertTrue(vm.uiState.value.isWasmEntitiesLivePolling)
+
+        vm.onWasmEntitiesUpdatedFromBridge(
+            """{"stage":"WASM_ENTITIES_TICK","tick":4,"entities":[{"name":"WASM Entity #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","worldX":6966.0,"worldY":100.0,"worldZ":3310.0,"distanceToPlayer":4.03,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","struct=0x03E01000","Δ(4.0, 0.0, 0.2)"]}]}"""
+        )
+        val movedEntity = vm.uiState.value.discoveredEntities.first { it.id == "0x03E01000" }
+        assertEquals(6966.0, movedEntity.worldX, 0.001)
+        assertEquals(4.03, movedEntity.distanceToPlayer, 0.01)
+        assertEquals(4, vm.uiState.value.wasmEntityLiveTickCount)
+    }
 }
+

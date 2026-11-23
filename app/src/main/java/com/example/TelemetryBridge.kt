@@ -25,7 +25,9 @@ class TelemetryBridge(
     private val onPlayerCoordsUpdated: (path: String, x: Double, y: Double, z: Double) -> Unit = { _, _, _, _ -> },
     private val onBatchProgressChanged: (progress: ScopeBatchProgress) -> Unit = {},
     private val onWasmNeighborsUpdated: (jsonPayload: String) -> Unit = {},
-    private val onWasmFloatCandidatesUpdated: (jsonPayload: String) -> Unit = {}
+    private val onWasmFloatCandidatesUpdated: (jsonPayload: String) -> Unit = {},
+    private val onWasmPointersUpdated: (jsonPayload: String) -> Unit = {},
+    private val onWasmEntitiesUpdated: (jsonPayload: String) -> Unit = {}
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exportArmed = AtomicBoolean(false)
@@ -34,6 +36,8 @@ class TelemetryBridge(
     private val lastCoordUpdateMs = AtomicLong(0L)
     private val lastWasmNeighborMs = AtomicLong(0L)
     private val lastWasmFloatMs = AtomicLong(0L)
+    private val lastWasmPointerMs = AtomicLong(0L)
+    private val lastWasmEntityMs = AtomicLong(0L)
 
     fun armExport() {
         exportArmed.set(true)
@@ -151,6 +155,38 @@ class TelemetryBridge(
         }
     }
 
+    /**
+     * Receives live 200 ms WASM Pointer Chain Watch ticks (MOVING / LIVE / ZERO / STALE + live XYZ).
+     */
+    @JavascriptInterface
+    fun updateWasmPointers(jsonPayload: String) {
+        val now = System.currentTimeMillis()
+        val prev = lastWasmPointerMs.get()
+        if (now - prev < MIN_WASM_TICK_INTERVAL_MS) return
+        if (!lastWasmPointerMs.compareAndSet(prev, now)) return
+
+        val safeJson = sanitizePayload(jsonPayload, MAX_WASM_TICK_PAYLOAD_CHARS)
+        mainHandler.post {
+            onWasmPointersUpdated(safeJson)
+        }
+    }
+
+    /**
+     * Receives live 500 ms WASM Nearby Entity position refresh ticks.
+     */
+    @JavascriptInterface
+    fun updateWasmEntities(jsonPayload: String) {
+        val now = System.currentTimeMillis()
+        val prev = lastWasmEntityMs.get()
+        if (now - prev < MIN_WASM_ENTITY_INTERVAL_MS) return
+        if (!lastWasmEntityMs.compareAndSet(prev, now)) return
+
+        val safeJson = sanitizePayload(jsonPayload, MAX_LOG_PAYLOAD_CHARS)
+        mainHandler.post {
+            onWasmEntitiesUpdated(safeJson)
+        }
+    }
+
     @JavascriptInterface
     fun exportReport(jsonContent: String) {
         if (!exportArmed.compareAndSet(true, false)) {
@@ -217,5 +253,6 @@ class TelemetryBridge(
         private const val MAX_LOGS_PER_WINDOW = 60L
         private const val MIN_COORD_INTERVAL_MS = 120L
         private const val MIN_WASM_TICK_INTERVAL_MS = 120L
+        private const val MIN_WASM_ENTITY_INTERVAL_MS = 250L
     }
 }

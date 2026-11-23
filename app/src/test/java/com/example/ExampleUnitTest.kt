@@ -157,5 +157,68 @@ class ExampleUnitTest {
     assertFalse(readOnlyRegex.containsMatchIn(unlockScript))
     assertFalse(readOnlyRegex.containsMatchIn(pointerScanScript))
     assertFalse(readOnlyRegex.containsMatchIn(verifyScript))
+    assertTrue(verifyScript.contains("status = 'ZERO'"))
+  }
+
+  @Test
+  fun wasmPointerWatchAutoVerifyAndNearbyEntityScriptsAreNonBlockingAndStrictlyReadOnly() {
+    val sampleChainsJson =
+      """[{"id":"L1_0x00135C64_+0x98","basePointerAddress":1268836,"offsets":[152]}]"""
+    val watchScript = WasmPointerAndEntityScripts.buildStartPointerWatchScript(
+      chainsJsonArray = sampleChainsJson,
+      hudPointerId = "L1_0x00135C64_+0x98"
+    )
+    val setHudScript = WasmPointerAndEntityScripts.buildSetHudPointerScript("L1_0x00135C64_+0x98")
+    val stopWatchScript = WasmPointerAndEntityScripts.buildStopPointerWatchScript()
+    val autoVerifyScript = WasmPointerAndEntityScripts.buildAutoVerifySavedPointersScript(sampleChainsJson)
+    val entityScanScript = WasmPointerAndEntityScripts.buildScanWasmNearbyEntitiesScript(
+      playerByteAddress = 1048576L,
+      playerX = 6961.98,
+      playerY = 100.0,
+      playerZ = 3309.76
+    )
+    val entityLiveScript = WasmPointerAndEntityScripts.buildStartWasmEntitiesLiveRefreshScript()
+    val entityStopScript = WasmPointerAndEntityScripts.buildStopWasmEntitiesLiveRefreshScript()
+
+    // 200ms Live Pointer Watch + 4-state verdict + optional HUD stream
+    assertTrue(watchScript.contains("setInterval(pushPtrTick, 200)"))
+    assertTrue(watchScript.contains("updateWasmPointers"))
+    assertTrue(watchScript.contains("updatePlayerCoords"))
+    assertTrue(watchScript.contains("status = 'MOVING'"))
+    assertTrue(watchScript.contains("status: isZero ? 'ZERO' : 'LIVE'"))
+    assertTrue(watchScript.contains("status: 'STALE'"))
+    assertTrue(setHudScript.contains("hudPointerId"))
+    assertTrue(stopWatchScript.contains("clearInterval"))
+
+    // Async non-blocking auto-verify after reload
+    assertTrue(autoVerifyScript.contains("(async function()"))
+    assertTrue(autoVerifyScript.contains("WASM_POINTER_AUTO_VERIFY_DONE"))
+    assertTrue(autoVerifyScript.contains("__peYield(800)"))
+
+    // Non-blocking 1 MB sliced WASM nearby-entity scan & 500ms live refresh
+    assertTrue(entityScanScript.contains("(async function()"))
+    assertTrue(entityScanScript.contains("WASM_ENTITIES_DISCOVERED"))
+    assertTrue(entityScanScript.contains("const CHUNK_FLOATS = 262144;"))
+    assertTrue(entityLiveScript.contains("setInterval(pushEntityTick, 500)"))
+    assertTrue(entityLiveScript.contains("updateWasmEntities"))
+    assertTrue(entityStopScript.contains("clearInterval"))
+
+    // Strictly read-only: zero writes to HEAPF32 / HEAPU32 / HEAP32 and zero synthetic input events
+    val heapWriteRegex = Regex("""(hf32|hu32|h32|HEAPF32|HEAPU32|HEAP32)\[[^\]]+]\s*=(?!=)""")
+    val syntheticInputRegex = Regex("""(dispatchEvent|MouseEvent|PointerEvent|TouchEvent|KeyboardEvent)""")
+    listOf(
+      watchScript, setHudScript, stopWatchScript, autoVerifyScript,
+      entityScanScript, entityLiveScript, entityStopScript
+    ).forEach { script ->
+      assertFalse("Must not write to WASM heap", heapWriteRegex.containsMatchIn(script))
+      assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
+    }
+
+    // Host normalization for per-site persistence
+    assertEquals("universe.flyff.com", SitePointerStore.normalizeHostKey("https://Universe.Flyff.com/play?world=1"))
+    assertEquals("example.com", SitePointerStore.normalizeHostKey("example.com/game"))
+    assertNull(SitePointerStore.normalizeHostKey("about:blank"))
+    assertNull(SitePointerStore.normalizeHostKey("   "))
   }
 }
+

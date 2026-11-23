@@ -502,10 +502,14 @@ private fun StagingCandidateCard(
 fun EntityInspectionConsoleView(
     state: DiagnosticsUiState,
     onRescanEntities: () -> Unit,
+    onToggleLiveEntities: () -> Unit,
     onPinPath: (path: String, detail: String) -> Unit,
     onCopyPayload: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val isWasmEntityMode = state.entityProjectionMode.startsWith("WASM", ignoreCase = true) ||
+        state.discoveredEntities.any { it.sampleKeys.contains("WASM_STRUCT") }
+
     Column(modifier = modifier.background(ObsidianBg)) {
         Row(
             modifier = Modifier
@@ -513,7 +517,7 @@ fun EntityInspectionConsoleView(
                 .background(ObsidianSurface)
                 .padding(horizontal = 10.dp, vertical = 7.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Column(
                 modifier = Modifier.weight(1f),
@@ -530,18 +534,55 @@ fun EntityInspectionConsoleView(
                 )
                 val meta = buildString {
                     append("${state.discoveredEntities.size} detected")
+                    if (state.isWasmEntitiesLivePolling) append(" • LIVE #${state.wasmEntityLiveTickCount}")
                     if (state.entityProjectionMode.isNotBlank()) append(" • ${state.entityProjectionMode}")
-                    if (state.entityViewportWidth > 0 && state.entityViewportHeight > 0) {
-                        append(" • ${state.entityViewportWidth}×${state.entityViewportHeight}")
-                    }
                 }
                 Text(
                     text = meta,
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = JetBrainsMonoFontFamily,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fontSize = 10.sp
+                    color = if (state.isWasmEntitiesLivePolling) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 10.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
+            }
+
+            if (isWasmEntityMode && state.discoveredEntities.isNotEmpty()) {
+                Surface(
+                    onClick = onToggleLiveEntities,
+                    shape = RoundedCornerShape(7.dp),
+                    color = if (state.isWasmEntitiesLivePolling) AlertCoral.copy(alpha = 0.16f) else SignalEmerald.copy(alpha = 0.18f),
+                    border = BorderStroke(
+                        1.dp,
+                        if (state.isWasmEntitiesLivePolling) AlertCoral.copy(alpha = 0.7f) else SignalEmerald.copy(alpha = 0.65f)
+                    ),
+                    modifier = Modifier
+                        .heightIn(min = 44.dp)
+                        .testTag("toggle_wasm_entities_live_button")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (state.isWasmEntitiesLivePolling) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = stringResource(R.string.cd_toggle_wasm_entities_live),
+                            tint = if (state.isWasmEntitiesLivePolling) AlertCoral else SignalEmerald,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Text(
+                            text = stringResource(
+                                if (state.isWasmEntitiesLivePolling) R.string.action_live_entities_off
+                                else R.string.action_live_entities_on
+                            ),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = if (state.isWasmEntitiesLivePolling) AlertCoral else SignalEmerald
+                        )
+                    }
+                }
             }
 
             Surface(
@@ -550,7 +591,7 @@ fun EntityInspectionConsoleView(
                 color = TelemetryViolet.copy(alpha = 0.18f),
                 border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.65f)),
                 modifier = Modifier
-                    .heightIn(min = 40.dp)
+                    .heightIn(min = 44.dp)
                     .testTag("rescan_entities_button")
             ) {
                 Row(
@@ -732,12 +773,20 @@ private fun EntitySampleCard(
                         color = SignalEmerald,
                         fontSize = 10.sp
                     )
+                    val isWasmStruct = entity.sampleKeys.contains("WASM_STRUCT")
+                    val secondaryLine = if (isWasmStruct) {
+                        entity.sampleKeys.filter { it != "WASM_STRUCT" }.joinToString(" • ")
+                    } else {
+                        "Screen: (${fmt2(entity.screenX)}px, ${fmt2(entity.screenY)}px)"
+                    }
                     Text(
-                        text = "Screen: (${fmt2(entity.screenX)}px, ${fmt2(entity.screenY)}px)",
+                        text = secondaryLine,
                         style = MaterialTheme.typography.labelSmall,
                         fontFamily = JetBrainsMonoFontFamily,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        fontSize = 10.sp
+                        fontSize = 10.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
 

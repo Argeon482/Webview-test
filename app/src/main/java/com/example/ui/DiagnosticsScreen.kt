@@ -109,6 +109,10 @@ fun DiagnosticsScreen(
         runCatching { WebSettings.getDefaultUserAgent(context) }.getOrDefault("")
     }
 
+    LaunchedEffect(viewModel, context) {
+        viewModel.attachContext(context)
+    }
+
     val telemetryBridge = remember(viewModel) {
         TelemetryBridge(
             onTelemetryReceived = { category, payload ->
@@ -131,6 +135,12 @@ fun DiagnosticsScreen(
             },
             onWasmFloatCandidatesUpdated = { jsonPayload ->
                 viewModel.onWasmFloatCandidatesUpdatedFromBridge(jsonPayload)
+            },
+            onWasmPointersUpdated = { jsonPayload ->
+                viewModel.onWasmPointersUpdatedFromBridge(jsonPayload)
+            },
+            onWasmEntitiesUpdated = { jsonPayload ->
+                viewModel.onWasmEntitiesUpdatedFromBridge(jsonPayload)
             }
         )
     }
@@ -307,7 +317,11 @@ fun DiagnosticsScreen(
                         onUnlockFloatCoords = viewModel::onUnlockWasmFloatCoords,
                         onFindWasmPointers = { viewModel.runWasmPointerScan() },
                         onVerifyWasmPointers = viewModel::runVerifyWasmPointerChains,
+                        onToggleWatchWasmPointers = viewModel::onToggleWatchWasmPointers,
+                        onStreamPointerToHud = viewModel::onStreamPointerChainToHud,
+                        onPruneWasmPointers = viewModel::onPruneZeroAndStalePointers,
                         onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
+                        onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
                         modifier = Modifier
                             .weight(if (state.isConsoleExpanded) 0.58f else 0.40f)
                             .fillMaxHeight()
@@ -402,7 +416,11 @@ fun DiagnosticsScreen(
                         onUnlockFloatCoords = viewModel::onUnlockWasmFloatCoords,
                         onFindWasmPointers = { viewModel.runWasmPointerScan() },
                         onVerifyWasmPointers = viewModel::runVerifyWasmPointerChains,
+                        onToggleWatchWasmPointers = viewModel::onToggleWatchWasmPointers,
+                        onStreamPointerToHud = viewModel::onStreamPointerChainToHud,
+                        onPruneWasmPointers = viewModel::onPruneZeroAndStalePointers,
                         onTogglePinPointerChain = viewModel::onTogglePinWasmPointerChain,
+                        onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
                         modifier = Modifier
                             .weight(if (state.isConsoleExpanded) 0.66f else 0.42f)
                             .fillMaxWidth()

@@ -145,7 +145,11 @@ fun TelemetryConsolePanel(
     onUnlockFloatCoords: () -> Unit,
     onFindWasmPointers: () -> Unit,
     onVerifyWasmPointers: () -> Unit,
+    onToggleWatchWasmPointers: () -> Unit,
+    onStreamPointerToHud: (String) -> Unit,
+    onPruneWasmPointers: () -> Unit,
     onTogglePinPointerChain: (String) -> Unit,
+    onToggleWasmEntitiesLive: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     if (state.isJsDrawerOpen) {
@@ -164,6 +168,51 @@ fun TelemetryConsolePanel(
                 onClearLogs = onClearLogs,
                 onToggleExpanded = onToggleExpanded
             )
+
+            // Persistent compact Live Coords HUD strip when streaming via pointer or locked coords
+            state.livePlayerCoords?.let { hudCoords ->
+                HorizontalDivider(color = SignalEmerald.copy(alpha = 0.45f), thickness = 1.dp)
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(SignalEmerald.copy(alpha = 0.09f))
+                        .clickable {
+                            onCopyPayload(
+                                "${hudCoords.path} -> X=${fmtCoord(hudCoords.x)}, Y=${fmtCoord(hudCoords.y)}, Z=${fmtCoord(hudCoords.z)}"
+                            )
+                        }
+                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                        .testTag("live_coords_hud_strip"),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.MyLocation,
+                        contentDescription = null,
+                        tint = SignalEmerald,
+                        modifier = Modifier.size(13.dp)
+                    )
+                    Text(
+                        text = "X:${fmtCoord(hudCoords.x)}  Y:${fmtCoord(hudCoords.y)}  Z:${fmtCoord(hudCoords.z)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        fontWeight = FontWeight.Bold,
+                        color = SignalEmerald,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        text = hudCoords.path,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
 
             HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
@@ -199,6 +248,9 @@ fun TelemetryConsolePanel(
                         onUnlockFloatCoords = onUnlockFloatCoords,
                         onFindWasmPointers = onFindWasmPointers,
                         onVerifyWasmPointers = onVerifyWasmPointers,
+                        onToggleWatchWasmPointers = onToggleWatchWasmPointers,
+                        onStreamPointerToHud = onStreamPointerToHud,
+                        onPruneWasmPointers = onPruneWasmPointers,
                         onTogglePinPointerChain = onTogglePinPointerChain,
                         onExportWasmMemoryMap = onExportWasmMemoryMap,
                         onCopyPayload = onCopyPayload,
@@ -253,6 +305,7 @@ fun TelemetryConsolePanel(
                     EntityInspectionConsoleView(
                         state = state,
                         onRescanEntities = onRunStep3,
+                        onToggleLiveEntities = onToggleWasmEntitiesLive,
                         onPinPath = { path, detail -> onPinExternalPath(path, "Step 3", detail) },
                         onCopyPayload = onCopyPayload,
                         modifier = Modifier
@@ -513,6 +566,22 @@ private fun ConsoleHeaderBar(
                     )
                 }
             }
+            if (state.wasmFloatDelta.isWatchingPointers) {
+                Surface(
+                    color = TelemetryViolet.copy(alpha = 0.2f),
+                    shape = RoundedCornerShape(4.dp),
+                    border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.65f))
+                ) {
+                    Text(
+                        text = "PTR 200ms",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = TelemetryViolet,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                    )
+                }
+            }
             if (state.wasmFloatDelta.isLiveWatching) {
                 Surface(
                     color = SignalEmerald.copy(alpha = 0.16f),
@@ -605,6 +674,9 @@ private fun GuidedFourStepWizard(
     onUnlockFloatCoords: () -> Unit,
     onFindWasmPointers: () -> Unit,
     onVerifyWasmPointers: () -> Unit,
+    onToggleWatchWasmPointers: () -> Unit,
+    onStreamPointerToHud: (String) -> Unit,
+    onPruneWasmPointers: () -> Unit,
     onTogglePinPointerChain: (String) -> Unit,
     onExportWasmMemoryMap: () -> Unit,
     onCopyPayload: (String) -> Unit,
@@ -707,6 +779,9 @@ private fun GuidedFourStepWizard(
                         onUnlockCoords = onUnlockFloatCoords,
                         onFindPointers = onFindWasmPointers,
                         onVerifyPointers = onVerifyWasmPointers,
+                        onToggleWatchPointers = onToggleWatchWasmPointers,
+                        onStreamPointerToHud = onStreamPointerToHud,
+                        onPrunePointers = onPruneWasmPointers,
                         onTogglePinPointerChain = onTogglePinPointerChain,
                         onExportMemoryMap = onExportWasmMemoryMap,
                         onCopyText = onCopyPayload
@@ -755,13 +830,13 @@ private fun GuidedFourStepWizard(
                 }
             }
 
-            // STEP 3 — Visual Entity Inspection
+            // STEP 3 — Visual Entity Inspection (WASM Nearby Entities + JS Fallback)
             WizardStepCard(
                 title = stringResource(R.string.wizard_step_3_title),
                 badge = state.step3Badge,
                 accent = TelemetryViolet
             ) {
-                val canRunStep3 = !state.discoveredPlayerPath.isNullOrBlank()
+                val canRunStep3 = !state.discoveredPlayerPath.isNullOrBlank() || state.hasLiveWasmPlayerAnchor
                 StepActionButton(
                     label = stringResource(R.string.step_3_scan_entities),
                     icon = Icons.Default.ViewInAr,
@@ -772,18 +847,24 @@ private fun GuidedFourStepWizard(
                     onClick = onRunStep3
                 )
                 Text(
-                    text = stringResource(R.string.wizard_step_3_instruction),
+                    text = stringResource(
+                        if (state.step2ScanMode == Step2ScanMode.WASM_FLOAT_HEAP || state.hasLiveWasmPlayerAnchor) {
+                            R.string.wasm_step3_instruction
+                        } else {
+                            R.string.wizard_step_3_instruction
+                        }
+                    ),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
                 if (!state.discoveredEntityArrayPath.isNullOrBlank() && state.discoveredEntities.isNotEmpty()) {
                     val sampleLine = state.discoveredEntities.take(2).joinToString("\n") { e ->
-                        "• ${e.name} world(${fmtCoord(e.worldX)}, ${fmtCoord(e.worldY)}, ${fmtCoord(e.worldZ)}) -> screen(${fmtCoord(e.screenX)}, ${fmtCoord(e.screenY)})"
+                        "• ${e.name} world(${fmtCoord(e.worldX)}, ${fmtCoord(e.worldY)}, ${fmtCoord(e.worldZ)}) • ${fmtCoord(e.distanceToPlayer)}u"
                     }
                     CapturedSnippetBox(
                         accent = TelemetryViolet,
-                        text = "Array: ${state.discoveredEntityArrayPath} (${state.discoveredEntities.size} detected)\n$sampleLine",
+                        text = "Source: ${state.discoveredEntityArrayPath} (${state.discoveredEntities.size} detected)\n$sampleLine",
                         actionLabel = "Open Entity Console (${state.discoveredEntities.size}) ›",
                         onActionClick = onOpenEntities
                     )

@@ -1506,6 +1506,7 @@ object WasmHeapScripts {
             const inputChains = $chainsJsonArray;
             const results = [];
             let validCount = 0;
+            let zeroCount = 0;
 
             for (let i = 0; i < inputChains.length; i++) {
               const c = inputChains[i];
@@ -1528,21 +1529,32 @@ object WasmHeapScripts {
               }
 
               let x = 0, y = 0, z = 0;
+              let status = 'STALE';
               if (ok) {
                 const fIdx = addr >>> 2;
                 if (fIdx < lenF32 && Number.isFinite(hf32[fIdx]) && Math.abs(hf32[fIdx]) <= 500000) {
                   x = Number(hf32[fIdx].toFixed(4));
                   y = (fIdx + 1 < lenF32 && Number.isFinite(hf32[fIdx + 1])) ? Number(hf32[fIdx + 1].toFixed(4)) : 0;
                   z = (fIdx + 2 < lenF32 && Number.isFinite(hf32[fIdx + 2])) ? Number(hf32[fIdx + 2].toFixed(4)) : 0;
-                  validCount++;
+                  const isZero = Math.abs(x) < 0.00001 && Math.abs(y) < 0.00001 && Math.abs(z) < 0.00001;
+                  if (isZero) {
+                    status = 'ZERO';
+                    ok = false;
+                    zeroCount++;
+                  } else {
+                    status = 'LIVE';
+                    validCount++;
+                  }
                 } else {
                   ok = false;
+                  status = 'STALE';
                 }
               }
 
               results.push({
                 id: c.id,
-                resolvedTargetAddress: ok ? addr : 0,
+                status: status,
+                resolvedTargetAddress: (status === 'LIVE' || status === 'ZERO') ? addr : 0,
                 resolvedX: x,
                 resolvedY: y,
                 resolvedZ: z,
@@ -1550,10 +1562,11 @@ object WasmHeapScripts {
               });
             }
 
-            __setFloatStatus('COMPLETED', 'Verified ' + validCount + '/' + results.length + ' pointer chains live');
+            __setFloatStatus('COMPLETED', 'Verified ' + validCount + '/' + results.length + ' live (' + zeroCount + ' zeroed)');
             __emitFloat({
               stage: 'WASM_POINTER_CHAINS_VERIFIED',
               validCount: validCount,
+              zeroCount: zeroCount,
               totalCount: results.length,
               results: results
             });

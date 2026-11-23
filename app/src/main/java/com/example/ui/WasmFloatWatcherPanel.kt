@@ -26,6 +26,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
+import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.MyLocation
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Timeline
@@ -65,6 +67,7 @@ import com.example.Step2ScanMode
 import com.example.WasmFloatDeltaCandidate
 import com.example.WasmFloatDeltaState
 import com.example.WasmPointerChain
+import com.example.WasmPointerStatus
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
 import com.example.ui.theme.ElectricCyan
@@ -164,6 +167,9 @@ fun Step2FloatModeControls(
     onUnlockCoords: () -> Unit,
     onFindPointers: () -> Unit,
     onVerifyPointers: () -> Unit,
+    onToggleWatchPointers: () -> Unit,
+    onStreamPointerToHud: (String) -> Unit,
+    onPrunePointers: () -> Unit,
     onTogglePinPointerChain: (String) -> Unit,
     onExportMemoryMap: () -> Unit,
     onCopyText: (String) -> Unit,
@@ -382,11 +388,14 @@ fun Step2FloatModeControls(
             )
         }
 
-        // Persistent Pointer Chains Results Card (L1 & L2 HEAPU32 pointer chains)
-        if (floatState.pointerChains.isNotEmpty() || floatState.pointerStatusMessage.isNotBlank() || floatState.isScanningPointers) {
+        // Persistent Pointer Chains Results Card (L1 & L2 HEAPU32 pointer chains + 200ms Live Watch)
+        if (floatState.pointerChains.isNotEmpty() || floatState.pointerStatusMessage.isNotBlank() || floatState.isScanningPointers || floatState.isAutoVerifyingOnReload) {
             PersistentPointerChainsCard(
                 floatState = floatState,
                 onVerifyPointers = onVerifyPointers,
+                onToggleWatchPointers = onToggleWatchPointers,
+                onStreamPointerToHud = onStreamPointerToHud,
+                onPrunePointers = onPrunePointers,
                 onTogglePinChain = onTogglePinPointerChain,
                 onExportMemoryMap = onExportMemoryMap,
                 onCopyText = onCopyText
@@ -637,14 +646,25 @@ private fun LockedAxisTile(
 private fun PersistentPointerChainsCard(
     floatState: WasmFloatDeltaState,
     onVerifyPointers: () -> Unit,
+    onToggleWatchPointers: () -> Unit,
+    onStreamPointerToHud: (String) -> Unit,
+    onPrunePointers: () -> Unit,
     onTogglePinChain: (String) -> Unit,
     onExportMemoryMap: () -> Unit,
     onCopyText: (String) -> Unit
 ) {
+    val hasPrunable = floatState.pointerChains.any { chain ->
+        !chain.isPinned && !chain.isSavedLocally &&
+            (chain.status == WasmPointerStatus.ZERO || chain.status == WasmPointerStatus.STALE)
+    }
+
     Surface(
         color = ObsidianBg,
         shape = RoundedCornerShape(8.dp),
-        border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.65f)),
+        border = BorderStroke(
+            1.dp,
+            if (floatState.isWatchingPointers) SignalEmerald.copy(alpha = 0.7f) else TelemetryViolet.copy(alpha = 0.65f)
+        ),
         modifier = Modifier
             .fillMaxWidth()
             .testTag("persistent_pointer_chains_card")
@@ -661,31 +681,90 @@ private fun PersistentPointerChainsCard(
                 Icon(
                     imageVector = Icons.Default.AccountTree,
                     contentDescription = null,
-                    tint = TelemetryViolet,
+                    tint = if (floatState.isWatchingPointers) SignalEmerald else TelemetryViolet,
                     modifier = Modifier.size(15.dp)
                 )
                 Text(
                     text = stringResource(R.string.wasm_pointer_chains_title),
                     style = MaterialTheme.typography.labelSmall,
                     fontWeight = FontWeight.Bold,
-                    color = TelemetryViolet,
+                    color = if (floatState.isWatchingPointers) SignalEmerald else TelemetryViolet,
                     modifier = Modifier.weight(1f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-                Surface(
-                    color = TelemetryViolet.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(4.dp)
-                ) {
-                    Text(
-                        text = "L1:${floatState.pointerScanTotalL1} • L2:${floatState.pointerScanTotalL2}",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        fontWeight = FontWeight.Bold,
-                        color = TelemetryViolet,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
-                    )
+                if (floatState.savedPointerCountForHost > 0) {
+                    Surface(
+                        color = AssetAmber.copy(alpha = 0.18f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = "SAVED:${floatState.savedPointerCountForHost}",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = AssetAmber,
+                            fontSize = 8.sp,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                        )
+                    }
+                }
+                if (floatState.isAutoVerifyingOnReload) {
+                    Surface(
+                        color = ElectricCyan.copy(alpha = 0.18f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(9.dp),
+                                strokeWidth = 1.5.dp,
+                                color = ElectricCyan
+                            )
+                            Text(
+                                text = "AUTO-VERIFY",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = JetBrainsMonoFontFamily,
+                                fontWeight = FontWeight.Bold,
+                                color = ElectricCyan,
+                                fontSize = 8.sp
+                            )
+                        }
+                    }
+                } else if (floatState.isWatchingPointers) {
+                    Surface(
+                        color = SignalEmerald.copy(alpha = 0.2f),
+                        shape = RoundedCornerShape(4.dp),
+                        border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.55f))
+                    ) {
+                        Text(
+                            text = "WATCH #${floatState.pointerWatchTickCount}",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = SignalEmerald,
+                            fontSize = 8.sp,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
+                } else if (floatState.pointerScanTotalL1 > 0 || floatState.pointerScanTotalL2 > 0) {
+                    Surface(
+                        color = TelemetryViolet.copy(alpha = 0.16f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = "L1:${floatState.pointerScanTotalL1} • L2:${floatState.pointerScanTotalL2}",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = TelemetryViolet,
+                            fontSize = 8.sp,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
                 }
             }
 
@@ -699,20 +778,24 @@ private fun PersistentPointerChainsCard(
             }
 
             if (floatState.pointerChains.isNotEmpty()) {
+                // Primary Live Watch + Verify row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Surface(
-                        onClick = onVerifyPointers,
+                        onClick = onToggleWatchPointers,
                         shape = RoundedCornerShape(6.dp),
-                        color = SignalEmerald.copy(alpha = 0.18f),
-                        border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.65f)),
+                        color = if (floatState.isWatchingPointers) AlertCoral.copy(alpha = 0.16f) else SignalEmerald.copy(alpha = 0.2f),
+                        border = BorderStroke(
+                            1.dp,
+                            if (floatState.isWatchingPointers) AlertCoral.copy(alpha = 0.7f) else SignalEmerald.copy(alpha = 0.75f)
+                        ),
                         modifier = Modifier
                             .weight(1f)
-                            .heightIn(min = 38.dp)
-                            .testTag("wasm_verify_pointers_button")
+                            .heightIn(min = 48.dp)
+                            .testTag("wasm_toggle_watch_pointers_button")
                     ) {
                         Row(
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
@@ -720,28 +803,104 @@ private fun PersistentPointerChainsCard(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Icon(
+                                imageVector = if (floatState.isWatchingPointers) Icons.Default.Stop else Icons.Default.PlayArrow,
+                                contentDescription = null,
+                                tint = if (floatState.isWatchingPointers) AlertCoral else SignalEmerald,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                text = stringResource(
+                                    if (floatState.isWatchingPointers) R.string.action_stop_watch_pointers
+                                    else R.string.action_watch_pointers_live
+                                ),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (floatState.isWatchingPointers) AlertCoral else SignalEmerald,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+
+                    Surface(
+                        onClick = onVerifyPointers,
+                        shape = RoundedCornerShape(6.dp),
+                        color = ElectricCyan.copy(alpha = 0.16f),
+                        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f)),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .testTag("wasm_verify_pointers_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
                                 imageVector = Icons.Default.Verified,
                                 contentDescription = null,
-                                tint = SignalEmerald,
-                                modifier = Modifier.size(14.dp)
+                                tint = ElectricCyan,
+                                modifier = Modifier.size(15.dp)
                             )
-                            Spacer(Modifier.width(5.dp))
+                            Spacer(Modifier.width(4.dp))
                             Text(
                                 text = stringResource(R.string.action_verify_pointers),
                                 style = MaterialTheme.typography.labelSmall,
                                 fontWeight = FontWeight.Bold,
-                                color = SignalEmerald
+                                color = ElectricCyan
                             )
+                        }
+                    }
+                }
+
+                // Secondary Prune Zero/Stale + Export JSON row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (hasPrunable) {
+                        Surface(
+                            onClick = onPrunePointers,
+                            shape = RoundedCornerShape(6.dp),
+                            color = AssetAmber.copy(alpha = 0.14f),
+                            border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.55f)),
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 40.dp)
+                                .testTag("wasm_prune_pointers_button")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.Center,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.CleaningServices,
+                                    contentDescription = null,
+                                    tint = AssetAmber,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(Modifier.width(4.dp))
+                                Text(
+                                    text = stringResource(R.string.action_prune_pointers),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = AssetAmber
+                                )
+                            }
                         }
                     }
 
                     Surface(
                         onClick = onExportMemoryMap,
                         shape = RoundedCornerShape(6.dp),
-                        color = AssetAmber.copy(alpha = 0.16f),
-                        border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.65f)),
+                        color = ObsidianSurfaceElevated,
+                        border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.55f)),
                         modifier = Modifier
-                            .heightIn(min = 38.dp)
+                            .weight(1f)
+                            .heightIn(min = 40.dp)
                             .testTag("wasm_pointer_export_button")
                     ) {
                         Row(
@@ -778,15 +937,16 @@ private fun PersistentPointerChainsCard(
                     modifier = Modifier
                         .fillMaxWidth()
                         .testTag("wasm_pointer_chain_list"),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
                 ) {
                     floatState.pointerChains.forEach { chain ->
                         WasmPointerChainRow(
                             chain = chain,
+                            onStreamToHud = { onStreamPointerToHud(chain.id) },
                             onTogglePin = { onTogglePinChain(chain.id) },
                             onCopy = {
                                 onCopyText(
-                                    "${chain.expression} -> ${DiagnosticsViewModel.formatHexAddress(chain.resolvedTargetAddress)} (${fmtDec(chain.resolvedX)}, ${fmtDec(chain.resolvedY)}, ${fmtDec(chain.resolvedZ)})"
+                                    "${chain.expression} [${chain.status.label}] -> ${DiagnosticsViewModel.formatHexAddress(chain.resolvedTargetAddress)} (${fmtDec(chain.resolvedX)}, ${fmtDec(chain.resolvedY)}, ${fmtDec(chain.resolvedZ)})"
                                 )
                             }
                         )
@@ -800,20 +960,35 @@ private fun PersistentPointerChainsCard(
 @Composable
 private fun WasmPointerChainRow(
     chain: WasmPointerChain,
+    onStreamToHud: () -> Unit,
     onTogglePin: () -> Unit,
     onCopy: () -> Unit
 ) {
     val regionAccent = if (chain.isLikelyStatic) SignalEmerald else AssetAmber
+    val statusAccent = when (chain.status) {
+        WasmPointerStatus.MOVING -> SignalEmerald
+        WasmPointerStatus.LIVE -> ElectricCyan
+        WasmPointerStatus.ZERO -> AssetAmber
+        WasmPointerStatus.STALE -> AlertCoral
+        WasmPointerStatus.PENDING -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val rowBg = when {
+        chain.isStreamingToHud -> SignalEmerald.copy(alpha = 0.14f)
+        chain.status == WasmPointerStatus.MOVING -> SignalEmerald.copy(alpha = 0.09f)
+        else -> ObsidianSurface
+    }
     val borderColor = when {
-        chain.isPinned -> AssetAmber.copy(alpha = 0.8f)
-        !chain.isVerifiedLive -> AlertCoral.copy(alpha = 0.55f)
-        chain.isLikelyStatic -> SignalEmerald.copy(alpha = 0.55f)
+        chain.isStreamingToHud -> SignalEmerald
+        chain.status == WasmPointerStatus.MOVING -> SignalEmerald.copy(alpha = 0.8f)
+        chain.isPinned || chain.isSavedLocally -> AssetAmber.copy(alpha = 0.75f)
+        chain.status == WasmPointerStatus.ZERO -> AssetAmber.copy(alpha = 0.5f)
+        chain.status == WasmPointerStatus.STALE -> AlertCoral.copy(alpha = 0.55f)
         else -> ObsidianBorder
     }
 
     Surface(
         shape = RoundedCornerShape(6.dp),
-        color = ObsidianSurface,
+        color = rowBg,
         border = BorderStroke(1.dp, borderColor),
         modifier = Modifier
             .fillMaxWidth()
@@ -823,9 +998,9 @@ private fun WasmPointerChainRow(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 7.dp, vertical = 5.dp),
+                .padding(horizontal = 7.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(5.dp)
+            horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Column(
                 modifier = Modifier.weight(1f),
@@ -850,7 +1025,7 @@ private fun WasmPointerChainRow(
                         )
                     }
                     Surface(
-                        color = regionAccent.copy(alpha = 0.18f),
+                        color = regionAccent.copy(alpha = 0.16f),
                         shape = RoundedCornerShape(3.dp)
                     ) {
                         Text(
@@ -864,18 +1039,66 @@ private fun WasmPointerChainRow(
                         )
                     }
                     Surface(
-                        color = (if (chain.isVerifiedLive) SignalEmerald else AlertCoral).copy(alpha = 0.18f),
+                        color = statusAccent.copy(alpha = 0.2f),
                         shape = RoundedCornerShape(3.dp)
                     ) {
                         Text(
-                            text = if (chain.isVerifiedLive) "LIVE ✓" else "STALE",
+                            text = chain.status.label,
                             style = MaterialTheme.typography.labelSmall,
                             fontFamily = JetBrainsMonoFontFamily,
                             fontWeight = FontWeight.Bold,
-                            color = if (chain.isVerifiedLive) SignalEmerald else AlertCoral,
+                            color = statusAccent,
                             fontSize = 8.sp,
                             modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
                         )
+                    }
+                    if (chain.changeCount > 0) {
+                        Surface(
+                            color = SignalEmerald.copy(alpha = 0.22f),
+                            shape = RoundedCornerShape(3.dp)
+                        ) {
+                            Text(
+                                text = "Δ×${chain.changeCount}",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = JetBrainsMonoFontFamily,
+                                fontWeight = FontWeight.Bold,
+                                color = SignalEmerald,
+                                fontSize = 8.sp,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
+                    }
+                    if (chain.isStreamingToHud) {
+                        Surface(
+                            color = SignalEmerald,
+                            shape = RoundedCornerShape(3.dp)
+                        ) {
+                            Text(
+                                text = "HUD",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = JetBrainsMonoFontFamily,
+                                fontWeight = FontWeight.Bold,
+                                color = ObsidianBg,
+                                fontSize = 8.sp,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
+                    }
+                    if (chain.isSavedLocally) {
+                        Surface(
+                            color = AssetAmber.copy(alpha = 0.22f),
+                            shape = RoundedCornerShape(3.dp)
+                        ) {
+                            Text(
+                                text = "SAVED",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontFamily = JetBrainsMonoFontFamily,
+                                fontWeight = FontWeight.Bold,
+                                color = AssetAmber,
+                                fontSize = 8.sp,
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
                     }
                 }
 
@@ -890,33 +1113,65 @@ private fun WasmPointerChainRow(
                     overflow = TextOverflow.Ellipsis
                 )
 
-                val targetText = if (chain.isVerifiedLive) {
-                    "-> ${DiagnosticsViewModel.formatHexAddress(chain.resolvedTargetAddress)} • (${fmtDec(chain.resolvedX)}, ${fmtDec(chain.resolvedY)}, ${fmtDec(chain.resolvedZ)})"
-                } else {
-                    "Pointer dereference out-of-bounds or invalid on current heap"
+                val targetText = when (chain.status) {
+                    WasmPointerStatus.MOVING, WasmPointerStatus.LIVE ->
+                        "-> ${DiagnosticsViewModel.formatHexAddress(chain.resolvedTargetAddress)} • (${fmtDec(chain.resolvedX)}, ${fmtDec(chain.resolvedY)}, ${fmtDec(chain.resolvedZ)})"
+                    WasmPointerStatus.ZERO ->
+                        "-> ${DiagnosticsViewModel.formatHexAddress(chain.resolvedTargetAddress)} • (0.0, 0.0, 0.0) [zeroed]"
+                    WasmPointerStatus.PENDING ->
+                        "Saved chain awaiting live WASM heap verification…"
+                    WasmPointerStatus.STALE ->
+                        "Pointer dereference out-of-bounds or null on current heap"
                 }
                 Text(
                     text = targetText,
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = JetBrainsMonoFontFamily,
-                    color = if (chain.isVerifiedLive) MaterialTheme.colorScheme.onSurfaceVariant else AlertCoral,
+                    color = when (chain.status) {
+                        WasmPointerStatus.MOVING -> SignalEmerald
+                        WasmPointerStatus.LIVE -> MaterialTheme.colorScheme.onSurface
+                        WasmPointerStatus.ZERO -> AssetAmber
+                        WasmPointerStatus.STALE -> AlertCoral
+                        WasmPointerStatus.PENDING -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
                     fontSize = 9.sp,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
             }
 
+            // Stream to HUD action button (48dp touch target)
+            IconButton(
+                onClick = onStreamToHud,
+                enabled = chain.status == WasmPointerStatus.MOVING || chain.status == WasmPointerStatus.LIVE || chain.isStreamingToHud,
+                modifier = Modifier
+                    .size(44.dp)
+                    .testTag("stream_pointer_hud_${chain.id}")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.MyLocation,
+                    contentDescription = stringResource(R.string.cd_stream_pointer_hud),
+                    tint = when {
+                        chain.isStreamingToHud -> SignalEmerald
+                        chain.status == WasmPointerStatus.MOVING || chain.status == WasmPointerStatus.LIVE -> ElectricCyan
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
+                    },
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+
+            // Bookmark / Save per-site action button (44dp touch target)
             IconButton(
                 onClick = onTogglePin,
                 modifier = Modifier
-                    .size(32.dp)
+                    .size(44.dp)
                     .testTag("pin_pointer_chain_${chain.id}")
             ) {
                 Icon(
                     imageVector = if (chain.isPinned) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
                     contentDescription = stringResource(R.string.cd_pin_pointer_chain),
                     tint = if (chain.isPinned) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(16.dp)
+                    modifier = Modifier.size(18.dp)
                 )
             }
         }

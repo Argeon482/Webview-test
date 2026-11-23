@@ -1,11 +1,11 @@
 package com.example
 
-import android.app.Application
 import android.content.Context
+import android.net.Uri
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -21,122 +21,436 @@ class ExampleRobolectricTest {
     @Test
     fun `read app name string from context`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        assertEquals("WebViewDiagnosticsApp", context.getString(R.string.app_name))
+        val appName = context.getString(R.string.app_name)
+        assertEquals("WebViewDiagnosticsApp", appName)
     }
 
     @Test
-    fun `lock profile store persists signature and parent pointers in SharedPreferences`() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
-        val store = LockProfileStore(context)
-        store.clearProfile()
-        assertNull(store.loadProfile())
+    fun `url normalization prepends https and blocks disallowed schemes`() {
+        val bareDomain = DiagnosticsViewModel.normalizeAndValidateUrl("example.com/demo")
+        assertTrue(bareDomain is UrlValidationResult.Valid)
+        assertEquals("https://example.com/demo", (bareDomain as UrlValidationResult.Valid).normalizedUrl)
 
-        val profile = SavedLockProfile(
-            baseIndex = 581246,
-            host = "example.com",
-            aobPatternHex = "[-4]:3F800000 [+3]:00000001",
-            floatPatternSummary = "[-4]=1.0",
-            anchorCount = 8,
-            signatureJson = """{"v":2,"anchors":[{"off":-4,"u32":1065353216}]}""",
-            parentPointers = listOf(
-                ParentPointerMatch(
-                    pointerHeapIndex = 4096,
-                    pointerByteAddress = 16384L,
-                    targetByteAddress = 581246L * 4L,
-                    fieldOffsetBytes = 0,
-                    isExactMatch = true
-                )
-            ),
-            autoRelockOnReload = true,
-            savedAtEpochMs = 1700000000000L
+        val blank = DiagnosticsViewModel.normalizeAndValidateUrl("")
+        assertEquals("about:blank", (blank as UrlValidationResult.Valid).normalizedUrl)
+
+        val jsScheme = DiagnosticsViewModel.normalizeAndValidateUrl("javascript:alert(1)")
+        assertTrue(jsScheme is UrlValidationResult.Invalid)
+
+        val fileScheme = DiagnosticsViewModel.normalizeAndValidateUrl("file:///etc/hosts")
+        assertTrue(fileScheme is UrlValidationResult.Invalid)
+
+        assertTrue(DiagnosticsViewModel.isAllowedNavigationUri(Uri.parse("https://threejs.org/examples/")))
+        assertFalse(DiagnosticsViewModel.isAllowedNavigationUri(Uri.parse("content://com.example/secret")))
+    }
+
+    @Test
+    fun `asset request matcher identifies wasm json bin and chunk files`() {
+        assertEquals(".wasm", DiagnosticsViewModel.matchTrackedAssetExtension("/build/engine.wasm"))
+        assertEquals(".json", DiagnosticsViewModel.matchTrackedAssetExtension("/assets/scene.json?v=2"))
+        assertEquals(".bin", DiagnosticsViewModel.matchTrackedAssetExtension("/models/mesh.bin"))
+        assertEquals("chunk", DiagnosticsViewModel.matchTrackedAssetExtension("/static/js/412.chunk.js"))
+        assertNull(DiagnosticsViewModel.matchTrackedAssetExtension("/styles/main.css"))
+    }
+
+    @Test
+    fun `staging buffer accumulates across multiple scans without overwriting and preserves pins`() {
+        val scan1 = DiagnosticsViewModel.mergeIntoStagingBuffer(
+            existing = emptyList(),
+            incoming = listOf("window.game" to "GameEngine (12 keys)", "window.scene" to "Scene (5 keys)"),
+            sourceStep = "Step 1",
+            scanNumber = 1,
+            timestamp = "12:00:01.000"
         )
-        store.saveProfile(profile)
+        assertEquals(2, scan1.size)
 
-        val restored = store.loadProfile()
-        assertNotNull(restored)
-        assertEquals(581246, restored!!.baseIndex)
-        assertEquals(8, restored.anchorCount)
-        assertEquals(1, restored.parentPointers.size)
-        assertEquals(4096, restored.parentPointers.first().pointerHeapIndex)
-        assertTrue(restored.autoRelockOnReload)
+        // Pin window.game
+        val withPin = scan1.map { if (it.path == "window.game") it.copy(isPinned = true) else it }
 
-        store.clearProfile()
-        assertNull(store.loadProfile())
+        // Second scan discovers new player path and re-observes window.game
+        val scan2 = DiagnosticsViewModel.mergeIntoStagingBuffer(
+            existing = withPin,
+            incoming = listOf("window.game" to "GameEngine (14 keys)", "window.game.player.pos" to "Δ +4.20"),
+            sourceStep = "Step 2B",
+            scanNumber = 2,
+            timestamp = "12:00:08.500"
+        )
+
+        assertEquals(3, scan2.size)
+        val pinnedGame = scan2.first()
+        assertEquals("window.game", pinnedGame.path)
+        assertTrue(pinnedGame.isPinned)
+        assertEquals(2, pinnedGame.seenCount)
+        assertTrue(scan2.any { it.path == "window.scene" })
+        assertTrue(scan2.any { it.path == "window.game.player.pos" })
     }
 
     @Test
-    fun `telemetry bridge forwards direct 200ms coords and live delta previews on main thread`() {
-        val coords = mutableListOf<Triple<Int, Double, String>>()
-        val previews = mutableListOf<String>()
+    fun `telemetry bridge guards exportReport and forwards scan status and live 200ms player coords`() {
+        val logged = mutableListOf<Pair<String, String>>()
         val exported = mutableListOf<String>()
+        val statuses = mutableListOf<Pair<AsyncScanStatus, String>>()
+        val coords = mutableListOf<PlayerCoordinates>()
 
         val bridge = TelemetryBridge(
-            onTelemetryReceived = { _, _ -> },
-            onReportPayloadReceived = { exported.add(it) },
-            onDirectHeapCoordsUpdated = { idx, x, _, _, _, src -> coords.add(Triple(idx, x, src)) },
-            onFloatDeltaPreviewUpdated = { previews.add(it) }
+            onTelemetryReceived = { cat, payload -> logged.add(cat to payload) },
+            onReportPayloadReceived = { json -> exported.add(json) },
+            onScanStatusChanged = { status, detail -> statuses.add(status to detail) },
+            onPlayerCoordsUpdated = { path, x, y, z -> coords.add(PlayerCoordinates(path, x, y, z)) }
         )
 
-        bridge.exportReport("""{"blocked":true}""")
+        bridge.exportReport("""{"injected":true}""")
         shadowOf(Looper.getMainLooper()).idle()
         assertTrue(exported.isEmpty())
+        assertEquals("ERR", logged.first().first)
 
         bridge.armExport()
-        bridge.exportReport("""{"ok":true}""")
+        bridge.exportReport("""{"url":"https://example.com"}""")
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(1, exported.size)
 
-        bridge.updateDirectHeapCoords(581246, 128.5, 4.25, -92.75, 67_108_864L, "window.HEAPF32")
-        bridge.updateFloatDeltaPreview("""{"updates":[{"heapIndex":581246,"currentValue":129.0}]}""")
+        bridge.updateScanStatus("COMPLETED", "Step 1: 12 globals\nin 1.1ms")
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(AsyncScanStatus.COMPLETED, statuses.first().first)
+        assertEquals("Step 1: 12 globals in 1.1ms", statuses.first().second)
+
+        bridge.updatePlayerCoords("window.game.player.pos", Double.NaN, 0.0, 0.0)
+        bridge.updatePlayerCoords("window.game.player.pos", 12.5, 3.0, -44.25)
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(1, coords.size)
-        assertEquals(128.5, coords.first().second, 0.001)
-        assertEquals(1, previews.size)
+        assertEquals("window.game.player.pos", coords.first().path)
+        assertEquals(12.5, coords.first().x, 0.001)
     }
 
     @Test
-    fun `viewmodel runs full step 1 scan step 2 pointer analysis profile save and step 3 relock`() {
-        val app = ApplicationProvider.getApplicationContext<Application>()
-        LockProfileStore(app).clearProfile()
-        val vm = DiagnosticsViewModel(app)
+    fun `diagnostic scripts support 100-item batched scanning with pause resume and direct liveRef`() {
+        val step1 = DiagnosticsScripts.buildInspectGlobalScopeScript()
+        val pauseScript = DiagnosticsScripts.buildPauseScopeScanScript()
+        val resumeScript = DiagnosticsScripts.buildResumeScopeScanScript()
+        val step2b = DiagnosticsScripts.buildComputeDeltaScript()
+        val step3 = DiagnosticsScripts.buildScanEntitiesScript("window.game.player.position")
 
-        // Step 1A + 1B: Baseline & Movement Delta candidates
-        vm.onTelemetryFromBridge(
-            "SCAN",
-            """{"type":"FLOAT_BASELINE_CAPTURED","sampledCount":18000,"prunedJitterCount":92,"durationMs":24.0}"""
+        // Step 1 strict built-in blacklist, 100-item batching, staggered async delays, and pause/resume
+        assertTrue(step1.contains("const BATCH_SIZE = 100;"))
+        assertTrue(step1.contains("Scanning batch "))
+        assertTrue(step1.contains("GLOBAL_SCOPE_BATCH"))
+        assertTrue(step1.contains("WebSocket"))
+        assertTrue(step1.contains("Iterator"))
+        assertTrue(step1.contains("DataTransfer"))
+        assertTrue(step1.contains("[native code]"))
+        assertTrue(pauseScript.contains("job.paused = true"))
+        assertTrue(resumeScript.contains("job.paused = false"))
+
+        // Step 2B direct nested reference (`parentObject[propName]` + `refObject`) and 200ms polling
+        assertTrue(step2b.contains("parentObject:"))
+        assertTrue(step2b.contains("propName:"))
+        assertTrue(step2b.contains("refObject:"))
+        assertTrue(step2b.contains("ref.parentObject[ref.propName]"))
+        assertTrue(step2b.contains("__LIVE_POLL_INTERVAL_MS = 200"))
+        assertTrue(step2b.contains("setInterval(pushNow, __LIVE_POLL_INTERVAL_MS)"))
+
+        // Step 3 parent-climbing visual entity discovery
+        assertTrue(step3.contains("window.game.player.position"))
+        assertTrue(step3.contains("for (let climb = 1; climb <= 3; climb++)"))
+    }
+
+    @Test
+    fun `staging keyword search filters by multi-token query and telemetry bridge reports batch progress`() {
+        val items = listOf(
+            CandidateStagingItem("window.game.player.pos", "Step 2B", "Vec3(12, 0, -5)", 2, 2, true, "12:00:01.000"),
+            CandidateStagingItem("window.game.actors", "Step 1 B1", "Array (8 keys)", 1, 1, false, "12:00:00.500"),
+            CandidateStagingItem("window.uiTheme", "Step 1 B2", "Object (3 keys)", 1, 1, false, "12:00:00.800")
         )
-        assertTrue(vm.uiState.value.floatScanner.baselineCaptured)
+
+        val posMatches = DiagnosticsViewModel.filterStagingBuffer(items, showPinnedOnly = false, rawQuery = "pos")
+        assertEquals(1, posMatches.size)
+        assertEquals("window.game.player.pos", posMatches.first().path)
+
+        val actorMatches = DiagnosticsViewModel.filterStagingBuffer(items, showPinnedOnly = false, rawQuery = "actor")
+        assertEquals(1, actorMatches.size)
+        assertEquals("window.game.actors", actorMatches.first().path)
+
+        val pinnedActorMatches = DiagnosticsViewModel.filterStagingBuffer(items, showPinnedOnly = true, rawQuery = "actor")
+        assertTrue(pinnedActorMatches.isEmpty())
+
+        val progressEvents = mutableListOf<ScopeBatchProgress>()
+        val bridge = TelemetryBridge(
+            onTelemetryReceived = { _, _ -> },
+            onReportPayloadReceived = {},
+            onBatchProgressChanged = { progressEvents.add(it) }
+        )
+        bridge.updateBatchProgress(
+            currentBatch = 2,
+            totalBatches = 10,
+            itemStart = 101,
+            itemEnd = 200,
+            totalItems = 950,
+            foundCount = 4,
+            isActive = true,
+            isPaused = false
+        )
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(1, progressEvents.size)
+        assertEquals("Scanning batch 2/10 (items 101–200)…", progressEvents.first().statusText)
+    }
+
+    @Test
+    fun `full log dump text includes staged variables entities assets and rolling log history`() {
+        val state = DiagnosticsUiState(
+            activeUrl = "https://example.com/game",
+            pageTitle = "Demo World",
+            scanCounter = 2,
+            discoveredPlayerPath = "window.game.player.pos",
+            playerPropertyKeys = "x, y, z",
+            livePlayerCoords = PlayerCoordinates("window.game.player.pos", 10.5, 2.0, -4.25),
+            stagingBuffer = listOf(
+                CandidateStagingItem("window.game.player.pos", "Step 2B", "Live ref", 2, 2, true, "12:01:00.000")
+            ),
+            discoveredEntityArrayPath = "window.game.entities",
+            discoveredEntities = listOf(
+                DiscoveredEntitySample("Goblin", "e1", "window.game.entities[0]", 15.0, 2.0, -1.0, 5.5, 320.0, 180.0, true, listOf("x", "y", "z"))
+            ),
+            interceptedAssets = listOf(
+                InterceptedAsset("https://example.com/engine.wasm", ".wasm", "GET", "12:00:10.000", false)
+            ),
+            logs = listOf(
+                TelemetryLogEntry(1L, "12:00:11.000", 1700000000000L, LogCategory.SCOPE, "Batch 1/10 complete", "{\"ok\":true}")
+            )
+        )
+
+        val dump = DiagnosticsViewModel.buildFullLogDumpText(state)
+        assertTrue(dump.contains("WebViewDiagnosticsApp — Complete Diagnostic Log Dump"))
+        assertTrue(dump.contains("[PINNED] window.game.player.pos"))
+        assertTrue(dump.contains("Goblin #e1 (IN VIEW)"))
+        assertTrue(dump.contains("https://example.com/engine.wasm"))
+        assertTrue(dump.contains("Batch 1/10 complete"))
+    }
+
+    @Test
+    fun `binary asset inspector decodes wasm json and float32 bin headers via ByteBuffer`() {
+        // 1. Minimal WASM binary: \0asm + version 1 + Type section (id=1, size=1, body=0x00)
+        val wasmBytes = byteArrayOf(
+            0x00, 0x61, 0x73, 0x6D,
+            0x01, 0x00, 0x00, 0x00,
+            0x01, 0x01, 0x00
+        )
+        val wasmAudit = BinaryAssetInspector.inspectBytes(wasmBytes, ".wasm")
+        assertEquals("WASM v1", wasmAudit.magicSignature)
+        assertTrue(wasmAudit.structuralDetails.contains("Type(1 B)"))
+        assertTrue(wasmAudit.hexHeaderPreview.startsWith("00 61 73 6D 01 00 00 00"))
+
+        // 2. JSON asset inspection
+        val jsonBytes = """{"scene":"dungeon","entities":[1,2,3],"version":4}""".toByteArray(Charsets.UTF_8)
+        val jsonAudit = BinaryAssetInspector.inspectBytes(jsonBytes, ".json", "application/json")
+        assertEquals("JSON Object (3 keys)", jsonAudit.magicSignature)
+        assertTrue(jsonAudit.structuralSummary.contains("scene"))
+
+        // 3. Little-endian Float32 .bin buffer inspection
+        val bb = java.nio.ByteBuffer.allocate(24).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        listOf(12.5f, 3.0f, -44.25f, 1.0f, 0.0f, 2.5f).forEach { bb.putFloat(it) }
+        val binAudit = BinaryAssetInspector.inspectBytes(bb.array(), ".bin")
+        assertEquals("Binary Float32 Buffer", binAudit.magicSignature)
+        assertTrue(binAudit.structuralDetails.contains("12.50, 3.00, -44.25"))
+
+        // 4. Filename sanitization prevents path traversal
+        val safeName = BinaryAssetInspector.extractFileName("https://cdn.example.com/../../evil?x=1", ".bin")
+        assertFalse(safeName.contains("/"))
+        assertFalse(safeName.contains("\\"))
+    }
+
+    @Test
+    fun `step 1 async yielding batches targeted game roots and manual path inspector stage immediately`() {
+        val step1 = DiagnosticsScripts.buildInspectGlobalScopeScript()
+        val queryScript = DiagnosticsScripts.buildQueryPropertyPathScript("game.player")
+
+        // Verify true async yielding loop (15ms Promise yield + rAF) and targeted engine roots
+        assertTrue(step1.contains("(async function()"))
+        assertTrue(step1.contains("const BATCH_YIELD_MS = 15;"))
+        assertTrue(step1.contains("await __yieldBatchAsync(BATCH_YIELD_MS)"))
+        assertTrue(step1.contains("GAME_NAMESPACE_DETECTED"))
+        assertTrue(step1.contains("'Phaser'"))
+        assertTrue(step1.contains("'PIXI'"))
+        assertTrue(step1.contains("'BABYLON'"))
+        assertTrue(step1.contains("'Module'"))
+        assertTrue(step1.contains("ArrayBuffer.isView(val)"))
+
+        // Verify manual property inspector script
+        assertTrue(queryScript.contains("MANUAL_PATH_QUERY"))
+        assertTrue(queryScript.contains("game.player"))
+
+        // Verify ViewModel stages auto-detected game roots and pins manual path queries
+        val vm = DiagnosticsViewModel()
+        vm.onTelemetryFromBridge(
+            "SCOPE",
+            """{"stage":"GAME_NAMESPACE_DETECTED","detectedNamespaces":["window.game","window.Module"],"detectedEntries":[{"key":"game","path":"window.game","constructor":"GameEngine","keyCount":14,"previewKeys":["player","scene"]},{"key":"Module","path":"window.Module","constructor":"Object","keyCount":42,"previewKeys":["HEAPU8","asm"]}]}"""
+        )
+        assertTrue(vm.uiState.value.detectedGameNamespaces.contains("window.game"))
+        assertTrue(vm.uiState.value.detectedGameNamespaces.contains("window.Module"))
+        assertTrue(vm.uiState.value.stagingBuffer.any { it.path == "window.game" && it.sourceStep == "Auto-Root" })
 
         vm.onTelemetryFromBridge(
-            "SCAN",
-            """{"type":"FLOAT_DELTAS_SCANNED","scanRound":1,"totalMatches":4,"stillCount":3,"durationMs":11.2,"candidates":[{"heapIndex":581246,"byteAddress":2324984,"baselineValue":100.0,"currentValue":104.5,"delta":4.5,"previewY":12.0,"previewZ":-40.0,"isStillNow":true,"clusterSize":3,"axisHint":"X"}]}"""
+            "SCOPE",
+            """{"stage":"MANUAL_PATH_QUERY","found":true,"requestedPath":"game.player","normalizedPath":"window.game.player","rootKey":"game","type":"object","constructor":"PlayerEntity","keyCount":9,"detail":"PlayerEntity Vec3(12.00, 1.50, -8.25)","childEntries":[{"path":"window.game.player.position","detail":"Vector3 (3 keys)"}]}"""
         )
-        assertEquals(1, vm.uiState.value.floatScanner.candidates.size)
+        val stagedPlayer = vm.uiState.value.stagingBuffer.firstOrNull { it.path == "window.game.player" }
+        assertTrue(stagedPlayer != null)
+        assertTrue(stagedPlayer!!.isPinned)
+        assertEquals("Manual Query", stagedPlayer.sourceStep)
+        assertTrue(vm.uiState.value.stagingBuffer.any { it.path == "window.game.player.position" })
+        assertTrue(vm.uiState.value.lastManualQuerySummary.contains("window.game.player"))
+    }
 
-        // Step 2: Pointer & Signature analysis + Save & Lock Profile into SharedPreferences
+    @Test
+    fun `step 2a and 2b explicitly exclude wasm heaps wasmTableMirror and typed arrays with sub-5ms cap`() {
+        val step2a = DiagnosticsScripts.buildCaptureBaselineScript()
+        val step2b = DiagnosticsScripts.buildComputeDeltaScript()
+
+        // Explicit WebAssembly memory keys & wasmTableMirror exclusions
+        listOf(
+            "HEAP8", "HEAPU8", "HEAP16", "HEAPU16", "HEAP32", "HEAPU32",
+            "HEAPF32", "HEAPF64", "HEAP64", "HEAPU64", "wasmTableMirror"
+        ).forEach { wasmKey ->
+            assertTrue("Step 2A must exclude $wasmKey", step2a.contains("'$wasmKey'"))
+            assertTrue("Step 2B must exclude $wasmKey", step2b.contains("'$wasmKey'"))
+        }
+
+        // Strict binary / TypedArray / ArrayBuffer / plain-object filtering and <5ms cap
+        assertTrue(step2a.contains("const MAX_TOTAL_MS = 4.5;"))
+        assertTrue(step2a.contains("const MAX_DEPTH = 2;"))
+        assertTrue(step2a.contains("__isSafeBaselineObject"))
+        assertTrue(step2a.contains("__isExcludedBinaryOrWasmObject"))
+        assertTrue(step2a.contains("ArrayBuffer.isView(val)"))
+        assertTrue(step2a.contains("val instanceof ArrayBuffer"))
+        assertTrue(step2a.contains("WebAssembly.Memory"))
+        assertTrue(step2b.contains("__isExcludedWasmKey(p)"))
+        assertTrue(step2b.contains("__isSafeBaselineObject(parentObj)"))
+    }
+
+    @Test
+    fun `telemetry bridge forwards wasm neighboring memory snapshots on main thread`() {
+        val snapshots = mutableListOf<String>()
+        val bridge = TelemetryBridge(
+            onTelemetryReceived = { _, _ -> },
+            onReportPayloadReceived = {},
+            onWasmNeighborsUpdated = { snapshots.add(it) }
+        )
+
+        bridge.updateWasmNeighbors("""{"stage":"WASM_NEIGHBORS_TICK","isolatedIndex":1024,"neighbors":[]}""")
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(1, snapshots.size)
+        assertTrue(snapshots.first().contains("WASM_NEIGHBORS_TICK"))
+        assertTrue(snapshots.first().contains("1024"))
+    }
+
+    @Test
+    fun `wasm heap viewmodel tracks scan delta neighbors and exports memory map json`() {
+        val vm = DiagnosticsViewModel()
+        vm.onWasmTargetValueChanged("4338")
+        assertEquals("4338", vm.uiState.value.wasmHeap.targetValueInput)
+
+        // 1. Simulate initial scan finding 42 matches
         vm.onTelemetryFromBridge(
-            "PTR",
-            """{"type":"POINTER_SIGNATURE_ANALYZED","baseIndex":581246,"byteAddress":2324984,"aobPatternHex":"[-4]:3F800000 [+3]:00000001","floatPatternSummary":"[-4]=1.0","anchorCount":6,"signatureJson":"{\"v\":2,\"anchors\":[{\"off\":-4,\"u32\":1065353216}]}","parentPointers":[{"pointerHeapIndex":2048,"pointerByteAddress":8192,"targetByteAddress":2324984,"fieldOffsetBytes":0,"isExactMatch":true}],"surroundingSlots":[],"durationMs":31.5}"""
+            "WASM",
+            """{"stage":"WASM_HEAP_SCAN_COMPLETE","durationMs":14.2,"heapSourceLabel":"window.HEAP32 / window.HEAPF32","heapByteLength":67108864,"targetValue":4338,"totalMatches":42,"heap32MatchCount":40,"heapF32MatchCount":2,"samples":[{"heapType":"HEAP32","index":8192,"byteAddress":32768,"currentValue":"4338"}]}"""
         )
-        assertEquals(LockStatus.LOCKED, vm.uiState.value.heapFeed.lockStatus)
-        assertEquals(1, vm.uiState.value.pointerAnalysis.parentPointers.size)
+        val afterScan = vm.uiState.value.wasmHeap
+        assertEquals(42, afterScan.totalMatches)
+        assertEquals(40, afterScan.heap32MatchCount)
+        assertEquals(2, afterScan.heapF32MatchCount)
+        assertFalse(afterScan.isNeighborPolling)
 
-        vm.saveAndLockProfile()
-        assertNotNull(vm.uiState.value.savedProfile)
-
-        // Step 3: Relock after reload restores LOCKED state on relocated index
-        vm.onPageStarted("https://example.com/reloaded")
-        assertEquals(LockStatus.UNLOCKED, vm.uiState.value.heapFeed.lockStatus)
-        assertNotNull(vm.uiState.value.savedProfile)
-
+        // 2. Simulate Value-Delta filter narrowing to 1 isolated address
         vm.onTelemetryFromBridge(
-            "RELOCK",
-            """{"type":"RELOCK_COMPLETE","oldBaseIndex":581246,"newBaseIndex":600120,"confidencePercent":96,"matchedAnchors":6,"totalAnchors":6,"method":"Parent Pointer Dereference","x":105.25,"y":12.0,"z":-39.5,"durationMs":0.6,"heapByteLength":67108864,"heapSource":"window.HEAPF32","note":"Instant pointer relock -> HEAPF32[600120] (96% match)"}"""
+            "WASM",
+            """{"stage":"WASM_HEAP_DELTA_FILTERED","durationMs":0.4,"heapSourceLabel":"window.HEAP32 / window.HEAPF32","heapByteLength":67108864,"filterRound":1,"newValue":4120,"previousCount":42,"totalMatches":1,"heap32MatchCount":1,"heapF32MatchCount":0,"samples":[{"heapType":"HEAP32","index":8192,"byteAddress":32768,"currentValue":"4120"}],"autoIsolated":{"heapType":"HEAP32","index":8192,"byteAddress":32768,"currentValue":"4120"}}"""
         )
-        assertEquals(LockStatus.LOCKED, vm.uiState.value.heapFeed.lockStatus)
-        assertEquals(600120, vm.uiState.value.heapFeed.baseIndex)
-        assertEquals(96, vm.uiState.value.heapFeed.relockConfidencePercent)
+        val afterFilter = vm.uiState.value.wasmHeap
+        assertEquals(1, afterFilter.totalMatches)
+        assertEquals(8192, afterFilter.isolatedIndex)
+        assertEquals("HEAP32", afterFilter.isolatedHeapType)
+        assertEquals(32768L, afterFilter.isolatedByteAddress)
+        assertTrue(afterFilter.isNeighborPolling)
 
-        LockProfileStore(app).clearProfile()
+        // 3. Simulate two neighbor polling ticks where +4B (X coord) changes as player walks
+        vm.onWasmNeighborsUpdatedFromBridge(
+            """{"stage":"WASM_NEIGHBORS_TICK","heapSourceLabel":"window.HEAP32 / window.HEAPF32","heapByteLength":67108864,"heapType":"HEAP32","isolatedIndex":8192,"isolatedByteAddress":32768,"currentValue":"4120","tick":1,"neighbors":[{"byteOffset":-4,"heapIndex":8191,"byteAddress":32764,"floatValue":100.0,"intValue":1120403456},{"byteOffset":0,"heapIndex":8192,"byteAddress":32768,"floatValue":0.0,"intValue":4120},{"byteOffset":4,"heapIndex":8193,"byteAddress":32772,"floatValue":250.5,"intValue":1132085248}]}"""
+        )
+        vm.onWasmNeighborsUpdatedFromBridge(
+            """{"stage":"WASM_NEIGHBORS_TICK","heapSourceLabel":"window.HEAP32 / window.HEAPF32","heapByteLength":67108864,"heapType":"HEAP32","isolatedIndex":8192,"isolatedByteAddress":32768,"currentValue":"4120","tick":2,"neighbors":[{"byteOffset":-4,"heapIndex":8191,"byteAddress":32764,"floatValue":100.0,"intValue":1120403456},{"byteOffset":0,"heapIndex":8192,"byteAddress":32768,"floatValue":0.0,"intValue":4120},{"byteOffset":4,"heapIndex":8193,"byteAddress":32772,"floatValue":256.25,"intValue":1132470272}]}"""
+        )
+
+        val neighbors = vm.uiState.value.wasmHeap.neighborFloats
+        assertEquals(3, neighbors.size)
+        val movingCoord = neighbors.first { it.byteOffset == 4 }
+        assertTrue(movingCoord.changedFromPrev)
+        assertEquals(1, movingCoord.changeCount)
+        assertEquals(256.25, movingCoord.floatValue, 0.001)
+
+        val staticNeighbor = neighbors.first { it.byteOffset == -4 }
+        assertFalse(staticNeighbor.changedFromPrev)
+        assertEquals(0, staticNeighbor.changeCount)
+
+        // 4. Verify exported Memory Map JSON contains isolated address & dynamic coordinate candidate
+        val mapJson = DiagnosticsViewModel.buildWasmMemoryMapJson(vm.uiState.value)
+        assertTrue(mapJson.contains("wasm_heap_memory_map"))
+        assertTrue(mapJson.contains("0x00008000"))
+        assertTrue(mapJson.contains("\"isDynamicCoordinateCandidate\": true"))
+        assertTrue(mapJson.contains("256.25"))
+    }
+
+    @Test
+    fun `telemetry bridge and viewmodel track wasm float heap baseline movement deltas live watch and pinning`() {
+        val ticks = mutableListOf<String>()
+        val bridge = TelemetryBridge(
+            onTelemetryReceived = { _, _ -> },
+            onReportPayloadReceived = {},
+            onWasmFloatCandidatesUpdated = { ticks.add(it) }
+        )
+
+        bridge.updateWasmFloatCandidates("""{"stage":"WASM_FLOAT_WATCH_TICK","tick":1,"candidates":[]}""")
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(1, ticks.size)
+
+        val vm = DiagnosticsViewModel()
+        assertEquals(Step2ScanMode.WASM_FLOAT_HEAP, vm.uiState.value.step2ScanMode)
+
+        // 1. Baseline captured
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_FLOAT_BASELINE_CAPTURED","durationMs":18.5,"heapSourceLabel":"window.HEAPF32","heapByteLength":67108864,"sampledCount":24000,"prunedJitterCount":115}"""
+        )
+        assertTrue(vm.uiState.value.wasmFloatDelta.baselineCaptured)
+        assertEquals(24000, vm.uiState.value.wasmFloatDelta.baselineSampleCount)
+        assertEquals(WizardStepBadge.READY, vm.uiState.value.step2Badge)
+
+        // 2. Movement delta scan isolates X/Y/Z cluster
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_FLOAT_DELTA_SCANNED","durationMs":3.2,"heapSourceLabel":"window.HEAPF32","heapByteLength":67108864,"scanRound":1,"totalMatches":9,"candidates":[{"heapIndex":5000,"byteAddress":20000,"baselineValue":100.0,"currentValue":105.5,"delta":5.5,"clusterSize":3,"axisHint":"X"},{"heapIndex":5001,"byteAddress":20004,"baselineValue":10.0,"currentValue":10.0,"delta":0.0,"clusterSize":3,"axisHint":"Y"},{"heapIndex":5002,"byteAddress":20008,"baselineValue":-20.0,"currentValue":-16.25,"delta":3.75,"clusterSize":3,"axisHint":"Z"}]}"""
+        )
+        assertTrue(vm.uiState.value.wasmFloatDelta.isLiveWatching)
+        assertEquals(3, vm.uiState.value.wasmFloatDelta.candidates.size)
+        assertEquals(WizardStepBadge.CAPTURED, vm.uiState.value.step2Badge)
+
+        // 3. Live watch tick updates X coordinate and increments changeCount
+        vm.onWasmFloatCandidatesUpdatedFromBridge(
+            """{"stage":"WASM_FLOAT_WATCH_TICK","heapSourceLabel":"window.HEAPF32","heapByteLength":67108864,"tick":2,"candidates":[{"heapIndex":5000,"byteAddress":20000,"baselineValue":100.0,"currentValue":108.25,"delta":8.25,"clusterSize":3,"axisHint":"X","isPinned":false}]}"""
+        )
+        val xCand = vm.uiState.value.wasmFloatDelta.candidates.first { it.heapIndex == 5000 }
+        assertTrue(xCand.changedFromPrev)
+        assertEquals(1, xCand.changeCount)
+        assertEquals(108.25, xCand.currentValue, 0.001)
+
+        // 4. Pinning X candidate adds it to pinnedIndices and pins in Staging buffer
+        vm.onTogglePinWasmFloatCandidate(5000)
+        assertTrue(vm.uiState.value.wasmFloatDelta.pinnedIndices.contains(5000))
+        assertTrue(vm.uiState.value.stagingBuffer.any { it.path == "window.HEAPF32[5000]" && it.isPinned })
+
+        // 5. Fresh reload clears stale baseline & candidates cleanly
+        vm.onReloadRequested()
+        assertFalse(vm.uiState.value.wasmFloatDelta.baselineCaptured)
+        assertTrue(vm.uiState.value.wasmFloatDelta.candidates.isEmpty())
+        assertEquals(0, vm.uiState.value.wasmFloatDelta.scanRound)
     }
 }

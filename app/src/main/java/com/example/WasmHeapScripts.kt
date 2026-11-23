@@ -1,1484 +1,1249 @@
 package com.example
 
 /**
- * Pure read-only JavaScript inspection routines for WebAssembly `window.HEAPF32` & `window.HEAPU32`
- * scanning, pointer/AOB signature analysis, and persistent coordinate relocking.
+ * Targeted WebAssembly Heap Value-Tracker JavaScript routines.
  *
- * Strictly observational:
- * - Zero memory writes to `HEAPF32` / `HEAP32` / `HEAPU32` / `HEAPU8`
- * - Zero touch, keyboard, mouse, or navigation dispatching
- * - Zero `org.json` dependencies so script generation stays 100% testable on pure JVM
+ * Strictly observational and read-only:
+ * - Never writes to WebAssembly linear memory.
+ * - Uses chunked async yields (`await new Promise(r => setTimeout(r, 12))`) across large
+ *   `HEAP32` / `HEAPF32` views so the browser render thread and WebSocket loop never freeze.
+ * - Supports initial exact-value scanning (e.g. HP = 4338), instant delta filtering after
+ *   in-game HP changes, and live 200 ms inspection of neighboring floats (±4 to ±16 bytes)
+ *   around the isolated memory address.
  */
 object WasmHeapScripts {
 
-    const val DEFAULT_POLL_INTERVAL_MS = 200
-    const val DEFAULT_ENTITY_SCAN_RADIUS = 50_000
+    private const val WASM_RUNTIME = """
+        const __bridge = window.TelemetryBridge;
+        const __wasm = (window.__wvWasmTracker = window.__wvWasmTracker || {
+          scanSeq: 0,
+          sourceLabel: '',
+          heapByteLength: 0,
+          candidates32: [],
+          candidatesF32: [],
+          totalMatches32: 0,
+          totalMatchesF32: 0,
+          filterRound: 0,
+          isolated: null,
+          pollId: null,
+          pollTick: 0
+        });
 
-    internal fun quoteJsString(value: String): String {
-        val sb = StringBuilder(value.length + 16)
-        sb.append('"')
-        for (ch in value) {
-            when (ch) {
-                '\\' -> sb.append("\\\\")
-                '"' -> sb.append("\\\"")
-                '\n' -> sb.append("\\n")
-                '\r' -> sb.append("\\r")
-                '\t' -> sb.append("\\t")
-                '\b' -> sb.append("\\b")
-                '\u000C' -> sb.append("\\f")
-                '\u2028' -> sb.append("\\u2028")
-                '\u2029' -> sb.append("\\u2029")
-                else -> {
-                    if (ch.code < 0x20) {
-                        sb.append("\\u")
-                        sb.append(ch.code.toString(16).padStart(4, '0'))
-                    } else {
-                        sb.append(ch)
-                    }
-                }
+        const __emitWasm = function(obj) {
+          try {
+            if (__bridge && typeof __bridge.logTelemetry === 'function') {
+              __bridge.logTelemetry('WASM', JSON.stringify(obj));
             }
-        }
-        sb.append('"')
-        return sb.toString()
-    }
+          } catch (_) {}
+        };
 
-    /**
-     * Shared read-only helper resolving synchronized `Float32Array` (`hf32`), `Int32Array` (`h32`),
-     * and `Uint32Array` (`hu32`) views over the active WebAssembly linear memory buffer.
-     */
-    private const val HEAP_RESOLVER_JS = """
-function __wvResolveWasmHeap() {
-  try {
-    var fromBuffer = function(buf, byteOffset, byteLength, label) {
-      if (!buf || byteLength < 64) return null;
-      var alignedOffset = (byteOffset || 0);
-      var alignedCount = Math.floor(byteLength / 4);
-      if ((alignedOffset % 4) !== 0 || alignedCount < 16) return null;
-      return {
-        hf32: new Float32Array(buf, alignedOffset, alignedCount),
-        h32: new Int32Array(buf, alignedOffset, alignedCount),
-        hu32: new Uint32Array(buf, alignedOffset, alignedCount),
-        length: alignedCount,
-        byteLength: alignedCount * 4,
-        label: label
-      };
-    };
+        const __setWasmStatus = function(status, detail) {
+          try {
+            if (__bridge && typeof __bridge.updateScanStatus === 'function') {
+              __bridge.updateScanStatus(String(status || 'IDLE'), String(detail || ''));
+            }
+          } catch (_) {}
+        };
 
-    var makeFromF32 = function(f32, label) {
-      if (!f32 || !(f32 instanceof Float32Array) || f32.length < 16) return null;
-      var i32 = null;
-      var u32 = null;
-      try {
-        if ((f32.byteOffset % 4) === 0) {
-          i32 = new Int32Array(f32.buffer, f32.byteOffset, f32.length);
-          u32 = new Uint32Array(f32.buffer, f32.byteOffset, f32.length);
-        }
-      } catch (_e) {}
-      return {
-        hf32: f32,
-        h32: i32,
-        hu32: u32,
-        length: f32.length,
-        byteLength: f32.byteLength,
-        label: label
-      };
-    };
-
-    if (window.HEAPF32 instanceof Float32Array && window.HEAPF32.length >= 16) {
-      return makeFromF32(window.HEAPF32, 'window.HEAPF32');
-    }
-    if (window.Module && window.Module.HEAPF32 instanceof Float32Array && window.Module.HEAPF32.length >= 16) {
-      return makeFromF32(window.Module.HEAPF32, 'window.Module.HEAPF32');
-    }
-    if (window.HEAPU32 instanceof Uint32Array && window.HEAPU32.length >= 16) {
-      return fromBuffer(window.HEAPU32.buffer, window.HEAPU32.byteOffset, window.HEAPU32.byteLength, 'window.HEAPU32->Float32');
-    }
-    if (window.HEAP32 instanceof Int32Array && window.HEAP32.length >= 16) {
-      return fromBuffer(window.HEAP32.buffer, window.HEAP32.byteOffset, window.HEAP32.byteLength, 'window.HEAP32->Float32');
-    }
-    if (window.Module && window.Module.HEAPU32 instanceof Uint32Array && window.Module.HEAPU32.length >= 16) {
-      return fromBuffer(window.Module.HEAPU32.buffer, window.Module.HEAPU32.byteOffset, window.Module.HEAPU32.byteLength, 'window.Module.HEAPU32->Float32');
-    }
-    if (window.Module && window.Module.HEAP32 instanceof Int32Array && window.Module.HEAP32.length >= 16) {
-      return fromBuffer(window.Module.HEAP32.buffer, window.Module.HEAP32.byteOffset, window.Module.HEAP32.byteLength, 'window.Module.HEAP32->Float32');
-    }
-    if (window.HEAPU8 instanceof Uint8Array && window.HEAPU8.byteLength >= 64) {
-      return fromBuffer(window.HEAPU8.buffer, window.HEAPU8.byteOffset, window.HEAPU8.byteLength, 'window.HEAPU8->Float32');
-    }
-    if (window.Module && window.Module.HEAPU8 instanceof Uint8Array && window.Module.HEAPU8.byteLength >= 64) {
-      return fromBuffer(window.Module.HEAPU8.buffer, window.Module.HEAPU8.byteOffset, window.Module.HEAPU8.byteLength, 'window.Module.HEAPU8->Float32');
-    }
-    if (window.wasmMemory && window.wasmMemory.buffer) {
-      return fromBuffer(window.wasmMemory.buffer, 0, window.wasmMemory.buffer.byteLength, 'window.wasmMemory');
-    }
-    if (window.Module && window.Module.wasmMemory && window.Module.wasmMemory.buffer) {
-      return fromBuffer(window.Module.wasmMemory.buffer, 0, window.Module.wasmMemory.buffer.byteLength, 'window.Module.wasmMemory');
-    }
-    var roots = ['game', 'app', 'engine', 'unityInstance', 'Unity', 'instance'];
-    for (var r = 0; r < roots.length; r++) {
-      var rootName = roots[r];
-      var obj = window[rootName];
-      if (!obj || typeof obj !== 'object') continue;
-      if (obj.HEAPF32 instanceof Float32Array && obj.HEAPF32.length >= 16) {
-        return makeFromF32(obj.HEAPF32, 'window.' + rootName + '.HEAPF32');
-      }
-      if (obj.Module && obj.Module.HEAPF32 instanceof Float32Array && obj.Module.HEAPF32.length >= 16) {
-        return makeFromF32(obj.Module.HEAPF32, 'window.' + rootName + '.Module.HEAPF32');
-      }
-    }
-  } catch (_err) {}
-  return null;
-}
-
-function __wvIsPlausibleCoord(v) {
-  if (typeof v !== 'number' || !Number.isFinite(v)) return false;
-  var av = Math.abs(v);
-  if (av > 1000000) return false;
-  if (av > 0 && av < 1e-6) return false;
-  return true;
-}
-
-function __wvHexU32(u) {
-  var h = ((u >>> 0).toString(16)).toUpperCase();
-  while (h.length < 8) h = '0' + h;
-  return h;
-}
-
-function __wvEnsureState(defaultBase) {
-  return window.__wvDiagState || (window.__wvDiagState = {
-    feedTimerId: null,
-    deltaPreviewTimerId: null,
-    baseIndex: defaultBase,
-    signature: null,
-    parentPointers: [],
-    relockToken: 0,
-    entityScanToken: 0,
-    floatScanToken: 0,
-    analyzeToken: 0,
-    notifiedMissing: false,
-    baselineHeap: null,
-    baselineLength: 0,
-    jitterMask: null,
-    prevMovedMap: null,
-    deltaCandidates: [],
-    scanRound: 0
-  });
-}
-
-function __wvExtractStructSignature(res, baseIndex, radius) {
-  var hf32 = res.hf32;
-  var hu32 = res.hu32;
-  var len = res.length;
-  var rad = radius || 16;
-  if (baseIndex < 0 || baseIndex + 2 >= len) return null;
-
-  var anchors = [];
-  var zeroOffsets = [];
-  var slots = [];
-
-  for (var off = -rad; off <= rad; off++) {
-    var idx = baseIndex + off;
-    if (idx < 0 || idx >= len) continue;
-    var uVal = hu32 ? (hu32[idx] >>> 0) : 0;
-    var fVal = hf32[idx];
-    var isCoord = (off === 0 || off === 1 || off === 2);
-    slots.push({
-      offset: off,
-      heapIndex: idx,
-      byteAddress: idx * 4,
-      floatValue: Number.isFinite(fVal) ? (Math.round(fVal * 10000) / 10000) : 0,
-      uint32Hex: '0x' + __wvHexU32(uVal),
-      isCoordAxis: isCoord,
-      isAnchor: false
-    });
-
-    if (isCoord) continue;
-    if (uVal === 0) {
-      if (zeroOffsets.length < 10) zeroOffsets.push(off);
-      continue;
-    }
-
-    var isCleanFloat = Number.isFinite(fVal) && Math.abs(fVal) >= 1e-3 && Math.abs(fVal) <= 10000;
-    var isHeaderWord = (uVal > 0 && uVal <= 0x00FFFFFF) || ((uVal & 0xFFFF) === 0 && uVal > 0);
-    var pri = 1;
-    if (isHeaderWord) pri = 3;
-    else if (isCleanFloat) pri = 2;
-
-    anchors.push({
-      off: off,
-      u32: uVal,
-      hex: __wvHexU32(uVal),
-      fval: isCleanFloat ? (Math.round(fVal * 10000) / 10000) : null,
-      pri: pri
-    });
-  }
-
-  anchors.sort(function(a, b) {
-    if (b.pri !== a.pri) return b.pri - a.pri;
-    return Math.abs(a.off) - Math.abs(b.off);
-  });
-  var selected = anchors.slice(0, 14);
-  var anchorOffsetMap = Object.create(null);
-  for (var s = 0; s < selected.length; s++) {
-    anchorOffsetMap[selected[s].off] = true;
-  }
-  for (var k = 0; k < slots.length; k++) {
-    if (anchorOffsetMap[slots[k].offset]) slots[k].isAnchor = true;
-  }
-
-  // Build readable AOB pattern string & float pattern summary sorted by memory offset
-  var ordered = selected.slice().sort(function(a, b) { return a.off - b.off; });
-  var aobParts = [];
-  var floatParts = [];
-  for (var p = 0; p < ordered.length; p++) {
-    var item = ordered[p];
-    var sign = item.off >= 0 ? ('+' + item.off) : String(item.off);
-    aobParts.push('[' + sign + ']:' + item.hex);
-    if (item.fval !== null && floatParts.length < 6) {
-      floatParts.push('[' + sign + ']=' + item.fval);
-    }
-  }
-
-  var sigObj = {
-    v: 2,
-    capturedAtIndex: baseIndex,
-    capturedCoords: [hf32[baseIndex], hf32[baseIndex + 1], hf32[baseIndex + 2]],
-    anchors: selected,
-    zeroOffsets: zeroOffsets.slice(0, 6)
-  };
-
-  return {
-    signature: sigObj,
-    aobPatternHex: aobParts.join(' '),
-    floatPatternSummary: floatParts.length > 0 ? floatParts.join(', ') : 'Uint32 header anchors only',
-    slots: slots
-  };
-}
-"""
-
-    // =========================================================================
-    // Permanent 200ms Direct Coordinate Feed
-    // =========================================================================
-
-    fun buildStartDirectFeedScript(
-        baseIndex: Int = VERIFIED_PLAYER_BASE_INDEX,
-        savedSignatureJson: String? = null
-    ): String {
-        val safeBase = baseIndex.coerceAtLeast(0)
-        val sigLiteral = if (savedSignatureJson.isNullOrBlank()) "null" else quoteJsString(savedSignatureJson)
-        return """
-(function() {
-  $HEAP_RESOLVER_JS
-  try {
-    var st = __wvEnsureState($safeBase);
-    if (st.feedTimerId !== null) {
-      clearInterval(st.feedTimerId);
-      st.feedTimerId = null;
-    }
-    st.baseIndex = $safeBase;
-    st.notifiedMissing = false;
-
-    var persistedSigStr = $sigLiteral;
-    if (persistedSigStr) {
-      try {
-        var parsedSig = JSON.parse(persistedSigStr);
-        if (parsedSig && Array.isArray(parsedSig.anchors)) {
-          st.signature = parsedSig;
-        }
-      } catch (_sigErr) {}
-    }
-
-    var pollTick = function() {
-      var res = __wvResolveWasmHeap();
-      var idx = st.baseIndex;
-      if (!res || idx < 0 || idx + 2 >= res.length) {
-        if (!st.notifiedMissing) {
-          st.notifiedMissing = true;
-          if (window.TelemetryBridge) {
-            window.TelemetryBridge.logTelemetry('FEED', JSON.stringify({
-              type: 'FEED_STATUS',
-              active: true,
-              heapReady: false,
-              baseIndex: idx,
-              message: res
-                ? ('Index ' + idx + ' out of bounds (heap len ' + res.length + ')')
-                : 'Waiting for window.HEAPF32 initialization...'
-            }));
-          }
-        }
-        return;
-      }
-
-      st.notifiedMissing = false;
-      var x = res.hf32[idx];
-      var y = res.hf32[idx + 1];
-      var z = res.hf32[idx + 2];
-      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
-
-      if (window.TelemetryBridge && window.TelemetryBridge.updateDirectHeapCoords) {
-        window.TelemetryBridge.updateDirectHeapCoords(idx, x, y, z, res.byteLength, res.label);
-      }
-    };
-
-    pollTick();
-    st.feedTimerId = setInterval(pollTick, $DEFAULT_POLL_INTERVAL_MS);
-
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('COMPLETED', 'LIVE 200ms @ HEAPF32[' + $safeBase + '..' + ($safeBase + 2) + ']');
-      window.TelemetryBridge.logTelemetry('FEED', JSON.stringify({
-        type: 'FEED_STATUS',
-        active: true,
-        heapReady: !!__wvResolveWasmHeap(),
-        baseIndex: $safeBase,
-        message: 'Direct 200ms polling active on window.HEAPF32[' + $safeBase + ', ' + ($safeBase + 1) + ', ' + ($safeBase + 2) + ']'
-      }));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.logTelemetry('ERR', 'Direct feed startup error: ' + String(e));
-    }
-  }
-})();
-""".trimIndent()
-    }
-
-    fun buildStopDirectFeedScript(): String = """
-(function() {
-  try {
-    var st = window.__wvDiagState;
-    if (st && st.feedTimerId !== null) {
-      clearInterval(st.feedTimerId);
-      st.feedTimerId = null;
-    }
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('IDLE', 'Direct feed paused');
-      window.TelemetryBridge.logTelemetry('FEED', JSON.stringify({
-        type: 'FEED_STATUS',
-        active: false,
-        heapReady: true,
-        baseIndex: st ? st.baseIndex : $VERIFIED_PLAYER_BASE_INDEX,
-        message: 'Direct 200ms HEAPF32 feed paused.'
-      }));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.logTelemetry('ERR', 'Feed pause error: ' + String(e));
-    }
-  }
-})();
-""".trimIndent()
-
-    // =========================================================================
-    // Step 1: Movement Float Delta Scanner (window.HEAPF32)
-    // =========================================================================
-
-    /**
-     * Step 1A / 2A ("Capture Standing Baseline"):
-     * Creates a TRUE isolated clone of the active `window.HEAPF32` memory buffer via
-     * `new Float32Array(hf32.buffer.slice(...))` (with manual indexed-loop fallback) so baseline
-     * values NEVER alias or update live alongside character movement.
-     */
-    fun buildCaptureStandingBaselineScript(): String = """
-(async function() {
-  $HEAP_RESOLVER_JS
-  try {
-    var st = __wvEnsureState($VERIFIED_PLAYER_BASE_INDEX);
-    var token = ++st.floatScanToken;
-    if (st.deltaPreviewTimerId !== null) {
-      clearInterval(st.deltaPreviewTimerId);
-      st.deltaPreviewTimerId = null;
-    }
-
-    var res = __wvResolveWasmHeap();
-    if (!res) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not found');
-        window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
-          type: 'FLOAT_BASELINE_ERROR',
-          reason: 'window.HEAPF32 is not initialized on this page yet.'
-        }));
-      }
-      return;
-    }
-
-    var hf32 = res.hf32;
-    var len = res.length;
-    var startTime = performance.now();
-
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('RUNNING', 'Cloning isolated Float32Array baseline...');
-    }
-
-    // Create a true, isolated Float32Array clone (never aliases live window.HEAPF32.buffer)
-    var clonedHeap = null;
-    try {
-      var slicedBuffer = hf32.buffer.slice(hf32.byteOffset, hf32.byteOffset + hf32.byteLength);
-      clonedHeap = new Float32Array(slicedBuffer);
-    } catch (_sliceErr) {
-      clonedHeap = new Float32Array(len);
-      for (var c = 0; c < len; c++) {
-        clonedHeap[c] = hf32[c];
-      }
-    }
-
-    // Safety invariant: guarantee the clone does not share the live ArrayBuffer
-    if (clonedHeap.buffer === hf32.buffer) {
-      var manualClone = new Float32Array(len);
-      for (var mc = 0; mc < len; mc++) {
-        manualClone[mc] = hf32[mc];
-      }
-      clonedHeap = manualClone;
-    }
-
-    // Brief 100ms idle observation to flag high-frequency animated timers (> 0.05 jump while idle)
-    // without mutating the isolated clone or dropping 0.0 / subtle server sync ticks.
-    await new Promise(function(resolve) { setTimeout(resolve, 100); });
-    if (st.floatScanToken !== token) return;
-
-    var liveRes = __wvResolveWasmHeap();
-    var liveF32 = liveRes ? liveRes.hf32 : hf32;
-    var jitterMask = new Uint8Array(len);
-    var startIndex = len > 4096 ? 64 : 0;
-    var chunkSize = 524288;
-    var validFloatCount = 0;
-    var prunedJitter = 0;
-
-    for (var s = startIndex; s < len; s += chunkSize) {
-      if (st.floatScanToken !== token) return;
-      var e = Math.min(len, s + chunkSize);
-      for (var i = s; i < e; i++) {
-        var bv = clonedHeap[i];
-        if (!Number.isFinite(bv) || Math.abs(bv) > 100000) continue;
-        validFloatCount++;
-        if (i < liveF32.length) {
-          var lv = liveF32[i];
-          if (Number.isFinite(lv) && Math.abs(lv - bv) > 0.05) {
-            jitterMask[i] = 1;
-            prunedJitter++;
-          }
-        }
-      }
-      await new Promise(function(resolve) { setTimeout(resolve, 8); });
-    }
-
-    if (st.floatScanToken !== token) return;
-
-    st.baselineHeap = clonedHeap;
-    st.baselineLength = len;
-    st.jitterMask = jitterMask;
-    st.prevMovedMap = null;
-    st.deltaCandidates = [];
-    st.scanRound = 0;
-
-    var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Cloned ' + len + ' floats (' + durationMs + 'ms)');
-      window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
-        type: 'FLOAT_BASELINE_CAPTURED',
-        sampledCount: validFloatCount,
-        clonedLength: len,
-        prunedJitterCount: prunedJitter,
-        isolatedClone: clonedHeap.buffer !== hf32.buffer,
-        durationMs: durationMs,
-        heapByteLength: res.byteLength,
-        heapSource: res.label
-      }));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('ERROR', 'Baseline error');
-      window.TelemetryBridge.logTelemetry('ERR', 'Float baseline error: ' + String(e));
-    }
-  }
-})();
-""".trimIndent()
-
-    /**
-     * Step 1B / 2B ("Scan Movement Deltas"):
-     * Compares live `window.HEAPF32` against the isolated `baselineHeap` clone using permissive
-     * movement thresholds (`0.02` to `500.0`), clusters adjacent `X, Y, Z` floats (including
-     * flat-ground `X + Z` movement with constant `Y`), and streams live 200ms previews immediately.
-     */
-    fun buildScanMovementDeltasScript(
-        minDelta: Double = 0.02,
-        maxDelta: Double = 500.0
-    ): String = """
-(async function() {
-  $HEAP_RESOLVER_JS
-  try {
-    var st = __wvEnsureState($VERIFIED_PLAYER_BASE_INDEX);
-    var token = ++st.floatScanToken;
-
-    if (!st.baselineHeap || st.baselineLength === 0) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'Capture baseline first');
-        window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
-          type: 'FLOAT_DELTA_ERROR',
-          reason: 'Tap "1. Capture Standing Baseline" while standing still first.'
-        }));
-      }
-      return;
-    }
-
-    var res = __wvResolveWasmHeap();
-    if (!res) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not found');
-        window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
-          type: 'FLOAT_DELTA_ERROR',
-          reason: 'window.HEAPF32 is not available.'
-        }));
-      }
-      return;
-    }
-
-    var hf32 = res.hf32;
-    var baseHeap = st.baselineHeap;
-    var jitterMask = st.jitterMask;
-    var scanLen = Math.min(res.length, st.baselineLength);
-    var startIndex = scanLen > 4096 ? 64 : 0;
-    var startTime = performance.now();
-    var MIN_DELTA = $minDelta;
-    var MAX_DELTA = $maxDelta;
-    var chunkSize = 262144;
-    var totalChunks = Math.max(1, Math.ceil((scanLen - startIndex) / chunkSize));
-
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('RUNNING', 'Scanning float deltas (' + MIN_DELTA + '..' + MAX_DELTA + ')...');
-    }
-
-    var hits = [];
-    var movedSet = Object.create(null);
-    var chunkNo = 0;
-
-    for (var s = startIndex; s < scanLen; s += chunkSize) {
-      if (st.floatScanToken !== token) return;
-      chunkNo++;
-      var e = Math.min(scanLen, s + chunkSize);
-      for (var i = s; i < e; i++) {
-        if (jitterMask && jitterMask[i] === 1) continue;
-        var base = baseHeap[i];
-        var cur = hf32[i];
-        if (!Number.isFinite(base) || !Number.isFinite(cur)) continue;
-        if (Math.abs(base) > 100000 || Math.abs(cur) > 100000) continue;
-
-        var diff = cur - base;
-        var absDiff = Math.abs(diff);
-        if (absDiff >= MIN_DELTA && absDiff <= MAX_DELTA) {
-          hits.push({
-            idx: i,
-            base: base,
-            cur: cur,
-            delta: diff
+        const __yieldWasmChunk = function() {
+          return new Promise(function(resolve) {
+            setTimeout(resolve, 12);
           });
-          movedSet[i] = true;
-          if (hits.length >= 30000) break;
-        }
-      }
-      if (hits.length >= 30000) break;
-      if (window.TelemetryBridge && (chunkNo % 4 === 0 || chunkNo === totalChunks)) {
-        window.TelemetryBridge.updateScanStatus(
-          'RUNNING',
-          'Delta slice ' + chunkNo + '/' + totalChunks + ' (' + hits.length + ' hits)'
-        );
-      }
-      await new Promise(function(resolve) { setTimeout(resolve, 10); });
-    }
+        };
 
-    if (st.floatScanToken !== token) return;
+        /**
+         * Safely resolves live Int32Array (HEAP32) and Float32Array (HEAPF32) views over the
+         * page's WebAssembly linear memory, checking window globals first and Emscripten Module
+         * containers as automatic fallback. Handles detached buffers after memory.grow().
+         */
+        const __resolveWasmHeaps = function() {
+          let h32 = null;
+          let hf32 = null;
+          let label = '';
 
-    // Soft 80ms stability check: NEVER discards moving/server-ticking coords; used strictly as ranking bonus
-    await new Promise(function(resolve) { setTimeout(resolve, 80); });
-    if (st.floatScanToken !== token) return;
-
-    var liveRes = __wvResolveWasmHeap();
-    var liveF32 = liveRes ? liveRes.hf32 : hf32;
-    var stillCount = 0;
-    var prevMap = st.prevMovedMap;
-    var nextMovedMap = Object.create(null);
-
-    // Group adjacent X, Y, Z floats (supports both full 3D movement & flat-ground X+Z movement)
-    var enriched = [];
-    for (var j = 0; j < hits.length; j++) {
-      var item = hits[j];
-      var idx = item.idx;
-      var nowVal = idx < liveF32.length ? liveF32[idx] : item.cur;
-      if (!Number.isFinite(nowVal)) nowVal = item.cur;
-      var isStillNow = Math.abs(nowVal - item.cur) <= 0.02;
-      if (isStillNow) stillCount++;
-
-      var movedPrev2 = !!movedSet[idx - 2];
-      var movedPrev1 = !!movedSet[idx - 1];
-      var movedNext1 = !!movedSet[idx + 1];
-      var movedNext2 = !!movedSet[idx + 2];
-
-      var py = (idx + 1 < liveF32.length && Number.isFinite(liveF32[idx + 1])) ? liveF32[idx + 1] : 0;
-      var pz = (idx + 2 < liveF32.length && Number.isFinite(liveF32[idx + 2])) ? liveF32[idx + 2] : 0;
-      var validMidY = Math.abs(py) <= 100000;
-
-      // Determine cluster size & axis role:
-      // - Contiguous [X, Y, Z] all moved -> clusterSize = 3
-      // - Flat-ground [X, static Y, Z] where idx & idx+2 moved -> clusterSize = 3, axisHint = 'X'
-      // - Adjacent 2-axis pair [X, Y] -> clusterSize = 2
-      var cluster = 1;
-      var axis = 'X';
-      if (!movedPrev1 && movedNext1 && movedNext2) {
-        cluster = 3;
-        axis = 'X';
-      } else if (!movedPrev1 && !movedPrev2 && movedNext2 && validMidY) {
-        cluster = 3;
-        axis = 'X';
-      } else if (movedPrev1 && movedNext1) {
-        cluster = 3;
-        axis = 'Y';
-      } else if (movedPrev1 && movedPrev2) {
-        cluster = 3;
-        axis = 'Z';
-      } else if (!movedPrev1 && movedPrev2 && !movedNext1) {
-        cluster = 3;
-        axis = 'Z';
-      } else if (!movedPrev1 && movedNext1) {
-        cluster = 2;
-        axis = 'X';
-      } else if (movedPrev1 && !movedNext1) {
-        cluster = 2;
-        axis = 'Y';
-      }
-
-      var repeatedHit = !!(prevMap && prevMap[idx] !== undefined && Math.abs(nowVal - prevMap[idx]) >= MIN_DELTA);
-      nextMovedMap[idx] = nowVal;
-
-      enriched.push({
-        heapIndex: idx,
-        byteAddress: idx * 4,
-        baselineValue: Math.round(item.base * 1000) / 1000,
-        currentValue: Math.round(nowVal * 1000) / 1000,
-        delta: Math.round((nowVal - item.base) * 1000) / 1000,
-        previewY: Math.round(py * 1000) / 1000,
-        previewZ: Math.round(pz * 1000) / 1000,
-        isStillNow: isStillNow,
-        clusterSize: cluster,
-        axisHint: axis,
-        repeatedHit: repeatedHit
-      });
-    }
-
-    // Rank Vec3 X-heads, multi-round confirmed movement, stopped coords, and realistic walking deltas first
-    enriched.sort(function(a, b) {
-      if (a.repeatedHit !== b.repeatedHit) return a.repeatedHit ? -1 : 1;
-      var aVec3Head = (a.clusterSize >= 3 && a.axisHint === 'X') ? 1 : 0;
-      var bVec3Head = (b.clusterSize >= 3 && b.axisHint === 'X') ? 1 : 0;
-      if (bVec3Head !== aVec3Head) return bVec3Head - aVec3Head;
-      var aPairHead = (a.clusterSize >= 2 && a.axisHint === 'X') ? 1 : 0;
-      var bPairHead = (b.clusterSize >= 2 && b.axisHint === 'X') ? 1 : 0;
-      if (bPairHead !== aPairHead) return bPairHead - aPairHead;
-      if (b.clusterSize !== a.clusterSize) return b.clusterSize - a.clusterSize;
-      if (a.isStillNow !== b.isStillNow) return a.isStillNow ? -1 : 1;
-      return Math.abs(a.delta) - Math.abs(b.delta);
-    });
-
-    var topCandidates = enriched.slice(0, 80);
-    st.prevMovedMap = nextMovedMap;
-    st.deltaCandidates = topCandidates;
-    st.scanRound = (st.scanRound || 0) + 1;
-
-    // Immediately start 200ms live preview loop for displayed candidates
-    if (st.deltaPreviewTimerId !== null) {
-      clearInterval(st.deltaPreviewTimerId);
-      st.deltaPreviewTimerId = null;
-    }
-    if (topCandidates.length > 0) {
-      st.deltaPreviewTimerId = setInterval(function() {
-        var rNow = __wvResolveWasmHeap();
-        if (!rNow || !st.deltaCandidates || st.deltaCandidates.length === 0) return;
-        var fNow = rNow.hf32;
-        var updates = [];
-        for (var u = 0; u < st.deltaCandidates.length; u++) {
-          var c = st.deltaCandidates[u];
-          if (c.heapIndex + 2 >= fNow.length) continue;
-          var vx = fNow[c.heapIndex];
-          var vy = fNow[c.heapIndex + 1];
-          var vz = fNow[c.heapIndex + 2];
-          if (!Number.isFinite(vx)) continue;
-          updates.push({
-            heapIndex: c.heapIndex,
-            currentValue: Math.round(vx * 1000) / 1000,
-            previewY: Number.isFinite(vy) ? (Math.round(vy * 1000) / 1000) : 0,
-            previewZ: Number.isFinite(vz) ? (Math.round(vz * 1000) / 1000) : 0
-          });
-        }
-        if (window.TelemetryBridge && window.TelemetryBridge.updateFloatDeltaPreview) {
-          window.TelemetryBridge.updateFloatDeltaPreview(JSON.stringify({ updates: updates }));
-        }
-      }, $DEFAULT_POLL_INTERVAL_MS);
-    }
-
-    var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Isolated ' + hits.length + ' movement deltas');
-      window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
-        type: 'FLOAT_DELTAS_SCANNED',
-        scanRound: st.scanRound,
-        totalMatches: hits.length,
-        stillCount: stillCount,
-        durationMs: durationMs,
-        candidates: topCandidates
-      }));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('ERROR', 'Delta scan error');
-      window.TelemetryBridge.logTelemetry('ERR', 'Float delta scan error: ' + String(e));
-    }
-  }
-})();
-""".trimIndent()
-
-    fun buildResetFloatScanScript(): String = """
-(function() {
-  try {
-    var st = window.__wvDiagState;
-    if (st) {
-      st.floatScanToken++;
-      if (st.deltaPreviewTimerId !== null) {
-        clearInterval(st.deltaPreviewTimerId);
-        st.deltaPreviewTimerId = null;
-      }
-      st.baselineHeap = null;
-      st.baselineLength = 0;
-      st.jitterMask = null;
-      st.prevMovedMap = null;
-      st.deltaCandidates = [];
-      st.scanRound = 0;
-    }
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('IDLE', 'Float delta scan reset');
-    }
-  } catch (_e) {}
-})();
-""".trimIndent()
-
-    // =========================================================================
-    // Step 2: Pointer & Memory Signature Analyzer (±16 block + HEAPU32 reverse pointer scan)
-    // =========================================================================
-
-    fun buildAnalyzePointerAndSignatureScript(baseIndex: Int): String {
-        val safeBase = baseIndex.coerceAtLeast(0)
-        return """
-(async function() {
-  $HEAP_RESOLVER_JS
-  try {
-    var st = __wvEnsureState($safeBase);
-    var token = ++st.analyzeToken;
-    var res = __wvResolveWasmHeap();
-    if (!res) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not found');
-        window.TelemetryBridge.logTelemetry('PTR', JSON.stringify({
-          type: 'POINTER_SIGNATURE_ERROR',
-          reason: 'window.HEAPF32 / window.HEAPU32 is not initialized on this page.'
-        }));
-      }
-      return;
-    }
-
-    if ($safeBase + 2 >= res.length) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'Base index out of bounds');
-        window.TelemetryBridge.logTelemetry('PTR', JSON.stringify({
-          type: 'POINTER_SIGNATURE_ERROR',
-          reason: 'Index ' + $safeBase + ' exceeds heap length (' + res.length + ').'
-        }));
-      }
-      return;
-    }
-
-    var startTime = performance.now();
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('RUNNING', 'Analyzing ±16 block & scanning HEAPU32 pointers...');
-    }
-
-    // 1. Extract ±16 surrounding HEAPF32 / HEAPU32 memory block & AOB/Float signature
-    var extracted = __wvExtractStructSignature(res, $safeBase, 16);
-    if (!extracted) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.logTelemetry('PTR', JSON.stringify({
-          type: 'POINTER_SIGNATURE_ERROR',
-          reason: 'Unable to extract ±16 memory signature around index ' + $safeBase
-        }));
-      }
-      return;
-    }
-
-    // 2. Non-blocking chunked Reverse Pointer Lookup across window.HEAPU32
-    var hu32 = res.hu32;
-    var targetByteAddr = ($safeBase * 4) >>> 0;
-    var minStructBase = targetByteAddr >= 64 ? (targetByteAddr - 64) : 0;
-    var exactPointers = [];
-    var structBasePointers = [];
-
-    if (hu32 && targetByteAddr > 0) {
-      var len = hu32.length;
-      var chunkSize = 262144;
-      var totalChunks = Math.max(1, Math.ceil(len / chunkSize));
-      var chunkNo = 0;
-
-      for (var s = 0; s < len; s += chunkSize) {
-        if (st.analyzeToken !== token) return;
-        chunkNo++;
-        var e = Math.min(len, s + chunkSize);
-        for (var p = s; p < e; p++) {
-          var val = hu32[p];
-          if (val === targetByteAddr) {
-            if (exactPointers.length < 16) {
-              exactPointers.push({
-                pointerHeapIndex: p,
-                pointerByteAddress: p * 4,
-                targetByteAddress: val,
-                fieldOffsetBytes: 0,
-                isExactMatch: true
-              });
-            }
-          } else if (val >= minStructBase && val < targetByteAddr && ((targetByteAddr - val) % 4) === 0) {
-            if (structBasePointers.length < 16) {
-              structBasePointers.push({
-                pointerHeapIndex: p,
-                pointerByteAddress: p * 4,
-                targetByteAddress: val,
-                fieldOffsetBytes: targetByteAddr - val,
-                isExactMatch: false
-              });
-            }
-          }
-        }
-        if (window.TelemetryBridge && (chunkNo % 4 === 0 || chunkNo === totalChunks)) {
-          window.TelemetryBridge.updateScanStatus(
-            'RUNNING',
-            'Reverse HEAPU32 pointer scan ' + chunkNo + '/' + totalChunks + '...'
-          );
-        }
-        await new Promise(function(resolve) { setTimeout(resolve, 12); });
-      }
-    }
-
-    if (st.analyzeToken !== token) return;
-
-    structBasePointers.sort(function(a, b) { return a.fieldOffsetBytes - b.fieldOffsetBytes; });
-    var parentPointers = exactPointers.concat(structBasePointers).slice(0, 24);
-
-    // Update live state immediately so the user sees LOCKED coords right away
-    st.baseIndex = $safeBase;
-    st.signature = extracted.signature;
-    st.parentPointers = parentPointers;
-
-    var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
-    var cx = res.hf32[$safeBase];
-    var cy = res.hf32[$safeBase + 1];
-    var cz = res.hf32[$safeBase + 2];
-
-    if (window.TelemetryBridge) {
-      if (window.TelemetryBridge.updateDirectHeapCoords && Number.isFinite(cx) && Number.isFinite(cy) && Number.isFinite(cz)) {
-        window.TelemetryBridge.updateDirectHeapCoords($safeBase, cx, cy, cz, res.byteLength, res.label);
-      }
-      window.TelemetryBridge.updateScanStatus(
-        'COMPLETED',
-        'Analyzed ' + extracted.signature.anchors.length + ' anchors, ' + parentPointers.length + ' ptrs'
-      );
-      window.TelemetryBridge.logTelemetry('PTR', JSON.stringify({
-        type: 'POINTER_SIGNATURE_ANALYZED',
-        baseIndex: $safeBase,
-        byteAddress: targetByteAddr,
-        aobPatternHex: extracted.aobPatternHex,
-        floatPatternSummary: extracted.floatPatternSummary,
-        anchorCount: extracted.signature.anchors.length,
-        signatureJson: JSON.stringify(extracted.signature),
-        parentPointers: parentPointers,
-        surroundingSlots: extracted.slots,
-        durationMs: durationMs,
-        heapByteLength: res.byteLength,
-        heapSource: res.label
-      }));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('ERROR', 'Pointer analysis error');
-      window.TelemetryBridge.logTelemetry('ERR', 'Pointer/Signature error: ' + String(e));
-    }
-  }
-})();
-""".trimIndent()
-    }
-
-    // =========================================================================
-    // Step 3: One-Tap & Automatic Relock Across Reloads (Pointer Deref -> AOB/Float Scan)
-    // =========================================================================
-
-    fun buildAutoRelockScript(
-        currentBaseIndex: Int = VERIFIED_PLAYER_BASE_INDEX,
-        savedSignatureJson: String? = null,
-        savedPointersJson: String? = null
-    ): String {
-        val safeBase = currentBaseIndex.coerceAtLeast(0)
-        val sigLiteral = if (savedSignatureJson.isNullOrBlank()) "null" else quoteJsString(savedSignatureJson)
-        val ptrLiteral = if (savedPointersJson.isNullOrBlank()) "null" else quoteJsString(savedPointersJson)
-        return """
-(async function() {
-  $HEAP_RESOLVER_JS
-  try {
-    var st = __wvEnsureState($safeBase);
-    var token = ++st.relockToken;
-
-    var persistedSigStr = $sigLiteral;
-    if (persistedSigStr) {
-      try {
-        var parsedSig = JSON.parse(persistedSigStr);
-        if (parsedSig && Array.isArray(parsedSig.anchors) && parsedSig.anchors.length > 0) {
-          st.signature = parsedSig;
-        }
-      } catch (_pe) {}
-    }
-
-    var persistedPtrsStr = $ptrLiteral;
-    if (persistedPtrsStr) {
-      try {
-        var parsedPtrs = JSON.parse(persistedPtrsStr);
-        if (Array.isArray(parsedPtrs)) {
-          st.parentPointers = parsedPtrs;
-        }
-      } catch (_pp) {}
-    }
-
-    var res = __wvResolveWasmHeap();
-    if (!res) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not found');
-        window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-          type: 'RELOCK_FAILED',
-          reason: 'window.HEAPF32 is not initialized on this page yet.'
-        }));
-      }
-      return;
-    }
-
-    // If no signature exists yet, capture from current base index immediately
-    if (!st.signature || !Array.isArray(st.signature.anchors) || st.signature.anchors.length === 0) {
-      if ($safeBase + 2 < res.length) {
-        var fresh = __wvExtractStructSignature(res, $safeBase, 16);
-        if (fresh && fresh.signature.anchors.length > 0) {
-          st.signature = fresh.signature;
-          var fx = res.hf32[$safeBase], fy = res.hf32[$safeBase + 1], fz = res.hf32[$safeBase + 2];
-          if (window.TelemetryBridge) {
-            window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-              type: 'RELOCK_COMPLETE',
-              oldBaseIndex: $safeBase,
-              newBaseIndex: $safeBase,
-              confidencePercent: 100,
-              matchedAnchors: fresh.signature.anchors.length,
-              totalAnchors: fresh.signature.anchors.length,
-              method: 'Baseline Signature Lock',
-              x: Number.isFinite(fx) ? fx : 0,
-              y: Number.isFinite(fy) ? fy : 0,
-              z: Number.isFinite(fz) ? fz : 0,
-              durationMs: 1,
-              heapByteLength: res.byteLength,
-              heapSource: res.label,
-              signatureJson: JSON.stringify(fresh.signature),
-              aobPatternHex: fresh.aobPatternHex,
-              note: 'Captured signature and locked onto HEAPF32[' + $safeBase + ']'
-            }));
-          }
-          return;
-        }
-      }
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'No saved profile');
-        window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-          type: 'RELOCK_FAILED',
-          reason: 'No saved signature profile. Use Step 1 & Step 2 to inspect and lock a coordinate first.'
-        }));
-      }
-      return;
-    }
-
-    var sig = st.signature;
-    var anchors = sig.anchors;
-    var zeroOffsets = sig.zeroOffsets || [];
-    var totalWeight = anchors.length * 2 + zeroOffsets.length;
-    var hf32 = res.hf32;
-    var hu32 = res.hu32;
-    var len = res.length;
-    var startTime = performance.now();
-
-    var scoreCandidate = function(idx) {
-      if (idx < 16 || idx + 18 >= len) return null;
-      var x = hf32[idx], y = hf32[idx + 1], z = hf32[idx + 2];
-      if (!__wvIsPlausibleCoord(x) || !__wvIsPlausibleCoord(y) || !__wvIsPlausibleCoord(z)) return null;
-      var score = 0;
-      var matched = 0;
-      for (var a = 0; a < anchors.length; a++) {
-        var an = anchors[a];
-        var pos = idx + an.off;
-        if (pos < 0 || pos >= len) continue;
-        var expectedU32 = (an.u32 !== undefined ? an.u32 : an.bits) >>> 0;
-        if (hu32 && (hu32[pos] >>> 0) === expectedU32) {
-          score += 2;
-          matched++;
-        } else if (an.fval !== null && an.fval !== undefined) {
-          var fv = hf32[pos];
-          if (Number.isFinite(fv) && Math.abs(fv - an.fval) <= 0.005) {
-            score += 1;
-            matched++;
-          }
-        }
-      }
-      for (var zIdx = 0; zIdx < zeroOffsets.length; zIdx++) {
-        var zPos = idx + zeroOffsets[zIdx];
-        if (zPos >= 0 && zPos < len && hu32 && hu32[zPos] === 0) {
-          score += 1;
-        }
-      }
-      var conf = totalWeight > 0 ? Math.min(100, Math.round((score * 100) / totalWeight)) : 0;
-      return { score: score, matched: matched, confidence: conf };
-    };
-
-    // Tier 1: O(1) Reverse Parent Pointer Dereference check
-    var savedPtrs = st.parentPointers || [];
-    if (hu32 && savedPtrs.length > 0) {
-      for (var pi = 0; pi < savedPtrs.length; pi++) {
-        var ptr = savedPtrs[pi];
-        var pIdx = ptr.pointerHeapIndex;
-        if (pIdx >= 0 && pIdx < len) {
-          var pointedBaseAddr = hu32[pIdx] >>> 0;
-          var fieldOff = ptr.fieldOffsetBytes || 0;
-          var resolvedByteAddr = pointedBaseAddr + fieldOff;
-          if (resolvedByteAddr > 0 && (resolvedByteAddr % 4) === 0) {
-            var candidateIdx = resolvedByteAddr >>> 2;
-            var ptrEval = scoreCandidate(candidateIdx);
-            if (ptrEval && ptrEval.confidence >= 60) {
-              st.baseIndex = candidateIdx;
-              var px = hf32[candidateIdx], py = hf32[candidateIdx + 1], pz = hf32[candidateIdx + 2];
-              var ptrDur = Math.round((performance.now() - startTime) * 10) / 10;
-              if (window.TelemetryBridge) {
-                if (window.TelemetryBridge.updateDirectHeapCoords) {
-                  window.TelemetryBridge.updateDirectHeapCoords(candidateIdx, px, py, pz, res.byteLength, res.label);
-                }
-                window.TelemetryBridge.updateScanStatus('COMPLETED', 'Pointer Relock @ ' + candidateIdx + ' (' + ptrEval.confidence + '%)');
-                window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-                  type: 'RELOCK_COMPLETE',
-                  oldBaseIndex: $safeBase,
-                  newBaseIndex: candidateIdx,
-                  confidencePercent: ptrEval.confidence,
-                  matchedAnchors: ptrEval.matched,
-                  totalAnchors: anchors.length,
-                  method: 'Parent Pointer Dereference (HEAPU32[' + pIdx + ']+0x' + fieldOff.toString(16).toUpperCase() + ')',
-                  x: px,
-                  y: py,
-                  z: pz,
-                  durationMs: ptrDur,
-                  heapByteLength: res.byteLength,
-                  heapSource: res.label,
-                  note: 'Instant pointer relock -> HEAPF32[' + candidateIdx + '] (' + ptrEval.confidence + '% match)'
-                }));
+          const tryContainer = function(obj, prefix) {
+            if (!obj || typeof obj !== 'object') return false;
+            try {
+              const c32 = obj.HEAP32;
+              const cf32 = obj.HEAPF32;
+              if (c32 instanceof Int32Array && c32.buffer && c32.buffer.byteLength > 0) {
+                h32 = c32;
+                hf32 = (cf32 instanceof Float32Array && cf32.buffer === c32.buffer)
+                  ? cf32
+                  : new Float32Array(c32.buffer);
+                label = prefix + 'HEAP32 / ' + prefix + 'HEAPF32';
+                return true;
               }
+              if (cf32 instanceof Float32Array && cf32.buffer && cf32.buffer.byteLength > 0) {
+                hf32 = cf32;
+                h32 = new Int32Array(cf32.buffer);
+                label = prefix + 'HEAPF32 (derived HEAP32)';
+                return true;
+              }
+              const h8 = obj.HEAPU8 || obj.HEAP8;
+              if (h8 && ArrayBuffer.isView(h8) && h8.buffer && h8.buffer.byteLength >= 4) {
+                h32 = new Int32Array(h8.buffer);
+                hf32 = new Float32Array(h8.buffer);
+                label = prefix + 'HEAPU8 buffer (Int32/Float32 views)';
+                return true;
+              }
+              const mem = obj.wasmMemory || (obj.asm && obj.asm.memory) || (obj.wasmExports && obj.wasmExports.memory);
+              if (typeof WebAssembly !== 'undefined' && mem instanceof WebAssembly.Memory && mem.buffer && mem.buffer.byteLength >= 4) {
+                h32 = new Int32Array(mem.buffer);
+                hf32 = new Float32Array(mem.buffer);
+                label = prefix + 'wasmMemory.buffer';
+                return true;
+              }
+            } catch (_) {}
+            return false;
+          };
+
+          if (tryContainer(window, 'window.')) {
+            return { heap32: h32, heapF32: hf32, label: label, byteLength: h32.buffer.byteLength };
+          }
+          if (tryContainer(window.Module, 'window.Module.')) {
+            return { heap32: h32, heapF32: hf32, label: label, byteLength: h32.buffer.byteLength };
+          }
+          const fallbackRoots = ['unityInstance', 'game', 'app', 'engine', 'Game', 'App', 'Engine'];
+          for (let i = 0; i < fallbackRoots.length; i++) {
+            const rk = fallbackRoots[i];
+            try {
+              const root = window[rk];
+              if (!root || typeof root !== 'object') continue;
+              if (tryContainer(root, 'window.' + rk + '.')) {
+                return { heap32: h32, heapF32: hf32, label: label, byteLength: h32.buffer.byteLength };
+              }
+              if (root.Module && tryContainer(root.Module, 'window.' + rk + '.Module.')) {
+                return { heap32: h32, heapF32: hf32, label: label, byteLength: h32.buffer.byteLength };
+              }
+            } catch (_) {}
+          }
+          return null;
+        };
+
+        const __stopWasmNeighborPoll = function() {
+          try {
+            if (__wasm.pollId !== null) {
+              clearInterval(__wasm.pollId);
+              __wasm.pollId = null;
+            }
+          } catch (_) {}
+        };
+
+        /**
+         * Reads neighboring ±4 to ±16 byte slots (offsets -16, -12, -8, -4, 0, +4, +8, +12, +16)
+         * around the isolated 32-bit element index from both HEAPF32 and HEAP32, and pushes
+         * a live snapshot every 200 ms through TelemetryBridge.updateWasmNeighbors().
+         */
+        const __startWasmNeighborPoll = function(heapType, targetIndex) {
+          __stopWasmNeighborPoll();
+          __wasm.isolated = { heapType: heapType, index: targetIndex };
+          __wasm.pollTick = 0;
+
+          const pushSnapshot = function() {
+            try {
+              const heaps = __resolveWasmHeaps();
+              if (!heaps) return;
+              const h32 = heaps.heap32;
+              const hf32 = heaps.heapF32;
+              const len = Math.min(h32.length, hf32.length);
+              if (targetIndex < 0 || targetIndex >= len) return;
+
+              __wasm.pollTick++;
+              const neighbors = [];
+              for (let step = -4; step <= 4; step++) {
+                const idx = targetIndex + step;
+                if (idx < 0 || idx >= len) continue;
+                const fv = hf32[idx];
+                const iv = h32[idx];
+                neighbors.push({
+                  byteOffset: step * 4,
+                  heapIndex: idx,
+                  byteAddress: idx * 4,
+                  floatValue: Number.isFinite(fv) ? Number(fv.toFixed(5)) : 0,
+                  intValue: iv
+                });
+              }
+
+              const curVal = heapType === 'HEAPF32'
+                ? (Number.isFinite(hf32[targetIndex]) ? hf32[targetIndex].toFixed(3) : 'NaN')
+                : String(h32[targetIndex]);
+
+              const payload = {
+                stage: 'WASM_NEIGHBORS_TICK',
+                heapSourceLabel: heaps.label,
+                heapByteLength: heaps.byteLength,
+                heapType: heapType,
+                isolatedIndex: targetIndex,
+                isolatedByteAddress: targetIndex * 4,
+                currentValue: curVal,
+                tick: __wasm.pollTick,
+                neighbors: neighbors
+              };
+
+              if (__bridge && typeof __bridge.updateWasmNeighbors === 'function') {
+                __bridge.updateWasmNeighbors(JSON.stringify(payload));
+              }
+            } catch (_) {}
+          };
+
+          pushSnapshot();
+          __wasm.pollId = setInterval(pushSnapshot, 200);
+        };
+    """
+
+    /**
+     * Step 1: Non-blocking chunked scan across `window.HEAP32` and `window.HEAPF32`
+     * (with automatic `window.Module` fallback) to find all memory indices matching
+     * the exact entered stat/HP value.
+     */
+    fun buildInitialScanScript(targetValue: Double): String {
+        val valueLiteral = if (targetValue.isFinite()) targetValue.toString() else "0"
+        return """
+        (async function() {
+          try {
+            $WASM_RUNTIME
+            const targetVal = Number($valueLiteral);
+            if (!Number.isFinite(targetVal)) {
+              __emitWasm({ stage: 'WASM_HEAP_ERROR', message: 'Enter a valid numeric stat value (e.g. 4338).' });
               return;
             }
+
+            const heaps = __resolveWasmHeaps();
+            if (!heaps) {
+              __setWasmStatus('ERROR', 'No WASM HEAP32/HEAPF32 found');
+              __emitWasm({
+                stage: 'WASM_HEAP_ERROR',
+                message: 'Could not locate window.HEAP32, window.HEAPF32, or window.Module.HEAP32 on this page.'
+              });
+              return;
+            }
+
+            __stopWasmNeighborPoll();
+            const mySeq = ++__wasm.scanSeq;
+            const startMs = performance.now();
+            const h32 = heaps.heap32;
+            const hf32 = heaps.heapF32;
+            const len32 = h32.length;
+            const lenF32 = hf32.length;
+            const isExactInt = Number.isInteger(targetVal) && targetVal >= -2147483648 && targetVal <= 2147483647;
+            const targetInt = isExactInt ? (targetVal | 0) : 0;
+            const EPS = 0.001;
+            const CHUNK_ITEMS = 262144; // 1 MB per async slice
+            const MAX_STORED = 120000;
+
+            const matches32 = [];
+            const matchesF32 = [];
+            let totalCount32 = 0;
+            let totalCountF32 = 0;
+
+            __wasm.sourceLabel = heaps.label;
+            __wasm.heapByteLength = heaps.byteLength;
+            __wasm.filterRound = 0;
+            __wasm.isolated = null;
+
+            const totalElements = Math.max(len32, lenF32);
+            __setWasmStatus('RUNNING', 'WASM Scan: 0% (' + heaps.label + ')…');
+
+            let lastProgressPct = -1;
+            for (let base = 0; base < totalElements; base += CHUNK_ITEMS) {
+              if (mySeq !== __wasm.scanSeq) return;
+              const end = Math.min(base + CHUNK_ITEMS, totalElements);
+
+              if (isExactInt && base < len32) {
+                const end32 = Math.min(end, len32);
+                for (let i = base; i < end32; i++) {
+                  if (h32[i] === targetInt) {
+                    totalCount32++;
+                    if (matches32.length < MAX_STORED) matches32.push(i);
+                  }
+                }
+              }
+
+              if (base < lenF32) {
+                const endF = Math.min(end, lenF32);
+                for (let i = base; i < endF; i++) {
+                  const fv = hf32[i];
+                  if (fv === targetVal || (Number.isFinite(fv) && Math.abs(fv - targetVal) < EPS)) {
+                    totalCountF32++;
+                    if (matchesF32.length < MAX_STORED) matchesF32.push(i);
+                  }
+                }
+              }
+
+              const pct = Math.min(99, Math.floor((end / Math.max(1, totalElements)) * 100));
+              if (pct >= lastProgressPct + 10) {
+                lastProgressPct = pct;
+                __setWasmStatus('RUNNING', 'WASM Scan ' + pct + '% (' + (totalCount32 + totalCountF32) + ' matches)…');
+              }
+
+              if (end < totalElements) {
+                await __yieldWasmChunk();
+              }
+            }
+
+            if (mySeq !== __wasm.scanSeq) return;
+
+            __wasm.candidates32 = matches32;
+            __wasm.candidatesF32 = matchesF32;
+            __wasm.totalMatches32 = totalCount32;
+            __wasm.totalMatchesF32 = totalCountF32;
+
+            const totalMatches = totalCount32 + totalCountF32;
+            const durationMs = Number((performance.now() - startMs).toFixed(1));
+            const samples = [];
+            for (let i = 0; i < matches32.length && samples.length < 10; i++) {
+              const idx = matches32[i];
+              samples.push({ heapType: 'HEAP32', index: idx, byteAddress: idx * 4, currentValue: String(h32[idx]) });
+            }
+            for (let i = 0; i < matchesF32.length && samples.length < 12; i++) {
+              const idx = matchesF32[i];
+              samples.push({ heapType: 'HEAPF32', index: idx, byteAddress: idx * 4, currentValue: hf32[idx].toFixed(3) });
+            }
+
+            let autoIsolated = null;
+            if (totalMatches === 1 && samples.length === 1) {
+              autoIsolated = samples[0];
+              __startWasmNeighborPoll(autoIsolated.heapType, autoIsolated.index);
+            }
+
+            __setWasmStatus(
+              'COMPLETED',
+              'WASM Scan: ' + totalMatches + ' matches (' + durationMs + 'ms)'
+            );
+            __emitWasm({
+              stage: 'WASM_HEAP_SCAN_COMPLETE',
+              durationMs: durationMs,
+              heapSourceLabel: heaps.label,
+              heapByteLength: heaps.byteLength,
+              targetValue: targetVal,
+              totalMatches: totalMatches,
+              heap32MatchCount: totalCount32,
+              heapF32MatchCount: totalCountF32,
+              cappedStored: (totalCount32 > MAX_STORED) || (totalCountF32 > MAX_STORED),
+              samples: samples,
+              autoIsolated: autoIsolated
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.updateScanStatus('ERROR', 'WASM scan failed');
+                window.TelemetryBridge.logTelemetry('ERR', 'WASM Heap Scan error: ' + String(err));
+              }
+            } catch (_) {}
           }
-        }
-      }
+        })();
+        """.trimIndent()
     }
 
-    // Tier 2: Full non-blocking chunked AOB / Float Signature Scan across window.HEAPU32 / HEAPF32
-    var primary = anchors[0];
-    var primaryU32 = (primary.u32 !== undefined ? primary.u32 : primary.bits) >>> 0;
-    var chunkSize = 262144;
-    var minIdx = 18;
-    var maxIdx = len - 20;
-    var totalChunks = Math.max(1, Math.ceil((maxIdx - minIdx) / chunkSize));
-
-    var bestIdx = -1;
-    var bestScore = -1;
-    var bestMatched = 0;
-    var bestConf = 0;
-
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('RUNNING', 'Auto-Relock scanning AOB/Float signature...');
-    }
-
-    var curEval = scoreCandidate($safeBase);
-    if (curEval && curEval.confidence >= 55) {
-      bestIdx = $safeBase;
-      bestScore = curEval.score;
-      bestMatched = curEval.matched;
-      bestConf = curEval.confidence;
-    }
-
-    var chunkNo = 0;
-    for (var start = minIdx; start < maxIdx; start += chunkSize) {
-      if (st.relockToken !== token) return;
-      chunkNo++;
-      var end = Math.min(maxIdx, start + chunkSize);
-
-      for (var i = start; i < end; i++) {
-        if (hu32 && (hu32[i + primary.off] >>> 0) !== primaryU32) continue;
-        var ev = scoreCandidate(i);
-        if (!ev) continue;
-        if (ev.score > bestScore ||
-            (ev.score === bestScore && bestIdx !== -1 && Math.abs(i - $safeBase) < Math.abs(bestIdx - $safeBase))) {
-          bestScore = ev.score;
-          bestMatched = ev.matched;
-          bestConf = ev.confidence;
-          bestIdx = i;
-        }
-      }
-
-      if (window.TelemetryBridge && (chunkNo % 4 === 0 || chunkNo === totalChunks)) {
-        window.TelemetryBridge.updateScanStatus('RUNNING', 'Auto-Relock slice ' + chunkNo + '/' + totalChunks + '...');
-      }
-      await new Promise(function(resolve) { setTimeout(resolve, 12); });
-    }
-
-    if (st.relockToken !== token) return;
-    var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
-
-    if (bestIdx === -1 || bestConf < 35) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'Auto-Relock match not found');
-        window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-          type: 'RELOCK_FAILED',
-          reason: 'Signature not matched above 35% confidence (best ' + bestConf + '%, ' + durationMs + 'ms).'
-        }));
-      }
-      return;
-    }
-
-    st.baseIndex = bestIdx;
-    var nx = hf32[bestIdx], ny = hf32[bestIdx + 1], nz = hf32[bestIdx + 2];
-    if (window.TelemetryBridge) {
-      if (window.TelemetryBridge.updateDirectHeapCoords) {
-        window.TelemetryBridge.updateDirectHeapCoords(bestIdx, nx, ny, nz, res.byteLength, res.label);
-      }
-      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Relocked @ HEAPF32[' + bestIdx + '] (' + bestConf + '%)');
-      window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-        type: 'RELOCK_COMPLETE',
-        oldBaseIndex: $safeBase,
-        newBaseIndex: bestIdx,
-        confidencePercent: bestConf,
-        matchedAnchors: bestMatched,
-        totalAnchors: anchors.length,
-        method: 'AOB / Float Signature Scan',
-        x: nx,
-        y: ny,
-        z: nz,
-        durationMs: durationMs,
-        heapByteLength: res.byteLength,
-        heapSource: res.label,
-        note: bestIdx === $safeBase
-          ? ('Verified HEAPF32[' + bestIdx + '] intact (' + bestConf + '% match)')
-          : ('Relocated ' + $safeBase + ' -> ' + bestIdx + ' (' + bestConf + '% signature match)')
-      }));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('ERROR', 'Relock error');
-      window.TelemetryBridge.logTelemetry('ERR', 'Auto-relock error: ' + String(e));
-    }
-  }
-})();
-""".trimIndent()
-    }
-
-    // =========================================================================
-    // Nearby Entity Struct Scanner (±50,000), Manual JS & Viewport Metrics
-    // =========================================================================
-
-    fun buildScanNearbyEntitiesScript(
-        playerBaseIndex: Int = VERIFIED_PLAYER_BASE_INDEX,
-        searchRadius: Int = DEFAULT_ENTITY_SCAN_RADIUS
-    ): String {
-        val safeBase = playerBaseIndex.coerceAtLeast(0)
-        val safeRadius = searchRadius.coerceIn(500, 250_000)
+    /**
+     * Step 2: Instant Value-Delta Filter (Change Detection).
+     * Narrows down the stored matching indices to only those whose current value in
+     * `HEAP32` / `HEAPF32` updated to match the new entered HP/stat value. Automatically
+     * starts the live ±4..±16 byte Neighboring Memory Inspector as soon as an address is isolated.
+     */
+    fun buildFilterDeltaScript(newTargetValue: Double): String {
+        val valueLiteral = if (newTargetValue.isFinite()) newTargetValue.toString() else "0"
         return """
-(async function() {
-  $HEAP_RESOLVER_JS
-  try {
-    var st = __wvEnsureState($safeBase);
-    var token = ++st.entityScanToken;
+        (function() {
+          try {
+            $WASM_RUNTIME
+            const newVal = Number($valueLiteral);
+            if (!Number.isFinite(newVal)) {
+              __emitWasm({ stage: 'WASM_HEAP_ERROR', message: 'Enter a valid updated HP value before filtering.' });
+              return;
+            }
 
-    var res = __wvResolveWasmHeap();
-    if (!res) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not ready');
-        window.TelemetryBridge.logTelemetry('ENTITY', JSON.stringify({
-          type: 'ENTITIES_SCANNED',
-          error: 'window.HEAPF32 is not initialized on this page.',
-          entities: []
-        }));
-      }
-      return;
+            if ((!__wasm.candidates32 || __wasm.candidates32.length === 0) &&
+                (!__wasm.candidatesF32 || __wasm.candidatesF32.length === 0)) {
+              __emitWasm({
+                stage: 'WASM_HEAP_ERROR',
+                message: 'Run Step 1 (Scan HEAP32 / F32) with your initial HP value first.'
+              });
+              return;
+            }
+
+            const heaps = __resolveWasmHeaps();
+            if (!heaps) {
+              __emitWasm({ stage: 'WASM_HEAP_ERROR', message: 'WASM heap is no longer accessible.' });
+              return;
+            }
+
+            const startMs = performance.now();
+            const h32 = heaps.heap32;
+            const hf32 = heaps.heapF32;
+            const len32 = h32.length;
+            const lenF32 = hf32.length;
+            const isExactInt = Number.isInteger(newVal) && newVal >= -2147483648 && newVal <= 2147483647;
+            const targetInt = isExactInt ? (newVal | 0) : 0;
+            const EPS = 0.001;
+
+            const prevTotal = __wasm.candidates32.length + __wasm.candidatesF32.length;
+            const next32 = [];
+            const nextF32 = [];
+
+            if (isExactInt) {
+              for (let i = 0; i < __wasm.candidates32.length; i++) {
+                const idx = __wasm.candidates32[i];
+                if (idx >= 0 && idx < len32 && h32[idx] === targetInt) {
+                  next32.push(idx);
+                }
+              }
+            }
+
+            for (let i = 0; i < __wasm.candidatesF32.length; i++) {
+              const idx = __wasm.candidatesF32[i];
+              if (idx >= 0 && idx < lenF32) {
+                const fv = hf32[idx];
+                if (fv === newVal || (Number.isFinite(fv) && Math.abs(fv - newVal) < EPS)) {
+                  nextF32.push(idx);
+                }
+              }
+            }
+
+            __wasm.candidates32 = next32;
+            __wasm.candidatesF32 = nextF32;
+            __wasm.totalMatches32 = next32.length;
+            __wasm.totalMatchesF32 = nextF32.length;
+            __wasm.filterRound = (__wasm.filterRound || 0) + 1;
+
+            const samples = [];
+            for (let i = 0; i < next32.length && samples.length < 12; i++) {
+              const idx = next32[i];
+              samples.push({ heapType: 'HEAP32', index: idx, byteAddress: idx * 4, currentValue: String(h32[idx]) });
+            }
+            for (let i = 0; i < nextF32.length && samples.length < 16; i++) {
+              const idx = nextF32[i];
+              samples.push({ heapType: 'HEAPF32', index: idx, byteAddress: idx * 4, currentValue: hf32[idx].toFixed(3) });
+            }
+
+            const remaining = next32.length + nextF32.length;
+            const durationMs = Number((performance.now() - startMs).toFixed(2));
+
+            // Automatically start Neighboring Memory Inspector when narrowed to 1 address (or <= 2 identical-offset views)
+            let autoIsolated = null;
+            if (samples.length === 1) {
+              autoIsolated = samples[0];
+              __startWasmNeighborPoll(autoIsolated.heapType, autoIsolated.index);
+            } else if (remaining > 0 && remaining <= 2 && next32.length === 1 && nextF32.length === 1 && next32[0] === nextF32[0]) {
+              autoIsolated = samples[0];
+              __startWasmNeighborPoll(autoIsolated.heapType, autoIsolated.index);
+            }
+
+            __setWasmStatus(
+              remaining > 0 ? 'COMPLETED' : 'IDLE',
+              remaining === 1
+                ? ('Isolated ' + autoIsolated.heapType + '[' + autoIsolated.index + '] — polling ±16B')
+                : ('Filter #' + __wasm.filterRound + ': ' + remaining + ' remaining')
+            );
+
+            __emitWasm({
+              stage: 'WASM_HEAP_DELTA_FILTERED',
+              durationMs: durationMs,
+              heapSourceLabel: heaps.label,
+              heapByteLength: heaps.byteLength,
+              filterRound: __wasm.filterRound,
+              newValue: newVal,
+              previousCount: prevTotal,
+              totalMatches: remaining,
+              heap32MatchCount: next32.length,
+              heapF32MatchCount: nextF32.length,
+              samples: samples,
+              autoIsolated: autoIsolated
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.updateScanStatus('ERROR', 'WASM filter failed');
+                window.TelemetryBridge.logTelemetry('ERR', 'WASM Filter error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+        """.trimIndent()
     }
 
-    var hf32 = res.hf32;
-    var len = res.length;
-    var pIdx = $safeBase;
-    if (pIdx + 2 >= len) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'Player index out of bounds');
-        window.TelemetryBridge.logTelemetry('ENTITY', JSON.stringify({
-          type: 'ENTITIES_SCANNED',
-          error: 'Player base index ' + pIdx + ' exceeds heap length ' + len,
-          entities: []
-        }));
-      }
-      return;
+    /**
+     * Step 3: Manually lock onto any surviving WASM candidate address and begin live 200 ms
+     * polling of its neighboring floats (±4 to ±16 bytes).
+     */
+    fun buildInspectNeighborsScript(heapType: String, index: Int): String {
+        val safeType = if (heapType == "HEAPF32") "'HEAPF32'" else "'HEAP32'"
+        val safeIdx = index.coerceAtLeast(0)
+        return """
+        (function() {
+          try {
+            $WASM_RUNTIME
+            const heaps = __resolveWasmHeaps();
+            if (!heaps) {
+              __emitWasm({ stage: 'WASM_HEAP_ERROR', message: 'WASM heap is not available on this page.' });
+              return;
+            }
+            __startWasmNeighborPoll($safeType, $safeIdx);
+            __setWasmStatus('COMPLETED', 'Polling ±16B around ' + $safeType + '[' + $safeIdx + ']');
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.logTelemetry('ERR', 'WASM Neighbor Inspector error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+        """.trimIndent()
     }
 
-    var px = hf32[pIdx], py = hf32[pIdx + 1], pz = hf32[pIdx + 2];
-    var hasPlayerOrigin = __wvIsPlausibleCoord(px) && __wvIsPlausibleCoord(py) && __wvIsPlausibleCoord(pz) &&
-      (Math.abs(px) + Math.abs(py) + Math.abs(pz) > 0.05);
+    /**
+     * Stops the live 200 ms neighboring memory polling loop cleanly.
+     */
+    fun buildStopNeighborPollScript(): String = """
+        (function() {
+          try {
+            $WASM_RUNTIME
+            __stopWasmNeighborPoll();
+            __setWasmStatus('IDLE', 'WASM neighbor polling stopped');
+          } catch (_) {}
+        })();
+    """.trimIndent()
 
-    var startIdx = Math.max(0, pIdx - $safeRadius);
-    var endIdx = Math.min(len - 3, pIdx + $safeRadius);
-    var chunkSize = 16384;
-    var totalChunks = Math.max(1, Math.ceil((endIdx - startIdx) / chunkSize));
-    var startTime = performance.now();
+    /**
+     * Stops polling and clears all stored candidate arrays in the WebView.
+     */
+    fun buildResetTrackerScript(): String = """
+        (function() {
+          try {
+            $WASM_RUNTIME
+            __wasm.scanSeq++;
+            __stopWasmNeighborPoll();
+            __wasm.candidates32 = [];
+            __wasm.candidatesF32 = [];
+            __wasm.totalMatches32 = 0;
+            __wasm.totalMatchesF32 = 0;
+            __wasm.filterRound = 0;
+            __wasm.isolated = null;
+            __wasm.pollTick = 0;
+            __setWasmStatus('IDLE', 'WASM Heap Tracker reset');
+          } catch (_) {}
+        })();
+    """.trimIndent()
 
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('RUNNING', 'Scanning ±$safeRadius around ' + pIdx + '...');
-    }
+    // ============================================================================================
+    // WebAssembly Float Heap Delta Scanner (Step 2A / 2B — Float Mode targeting window.HEAPF32)
+    // ============================================================================================
 
-    var rawMatches = [];
-    var chunkCount = 0;
-
-    var isCleanWorldFloat = function(v) {
-      if (typeof v !== 'number' || !Number.isFinite(v)) return false;
-      var av = Math.abs(v);
-      if (av > 100000) return false;
-      if (av > 0 && av < 1e-4) return false;
-      return true;
-    };
-
-    for (var s = startIdx; s < endIdx; s += chunkSize) {
-      if (st.entityScanToken !== token) return;
-      chunkCount++;
-      var e = Math.min(endIdx, s + chunkSize);
-
-      for (var i = s; i < e; i++) {
-        if (Math.abs(i - pIdx) < 4) continue;
-        var ex = hf32[i];
-        if (!isCleanWorldFloat(ex)) continue;
-        var ey = hf32[i + 1];
-        if (!isCleanWorldFloat(ey)) continue;
-        var ez = hf32[i + 2];
-        if (!isCleanWorldFloat(ez)) continue;
-
-        var mag = Math.abs(ex) + Math.abs(ey) + Math.abs(ez);
-        if (mag < 0.25) continue;
-        if (ex === ey && ey === ez) continue;
-        if ((ex === 0 || Math.abs(ex) === 1) && (ey === 0 || Math.abs(ey) === 1) && (ez === 0 || Math.abs(ez) === 1)) continue;
-
-        var dist = 0;
-        if (hasPlayerOrigin) {
-          var dx = ex - px, dy = ey - py, dz = ez - pz;
-          if (Math.abs(dy) > 150) continue;
-          if (Math.abs(dx) > 1500 || Math.abs(dz) > 1500) continue;
-          dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-          if (dist < 0.5 || dist > 1800) continue;
-        } else {
-          dist = Math.sqrt(ex * ex + ey * ey + ez * ez);
-          if (dist < 1 || dist > 50000) continue;
-        }
-
-        rawMatches.push({
-          idx: i,
-          offset: i - pIdx,
-          x: Math.round(ex * 1000) / 1000,
-          y: Math.round(ey * 1000) / 1000,
-          z: Math.round(ez * 1000) / 1000,
-          dist: Math.round(dist * 100) / 100
+    private const val FLOAT_DELTA_RUNTIME = """
+        const __fBridge = window.TelemetryBridge;
+        const __fd = (window.__wvWasmFloatDelta = window.__wvWasmFloatDelta || {
+          scanSeq: 0,
+          sourceLabel: '',
+          heapByteLength: 0,
+          baselineClone: null,
+          baselineLength: 0,
+          isIsolatedClone: false,
+          snapCount: 0,
+          candidateIndices: null,
+          candidateBaselines: null,
+          candidateCount: 0,
+          pinnedIndices: [],
+          watchedItems: [],
+          scanRound: 0,
+          pollId: null,
+          pollTick: 0
         });
-        i += 2;
-        if (rawMatches.length >= 4000) break;
-      }
 
-      if (rawMatches.length >= 4000) break;
-      if (window.TelemetryBridge && (chunkCount % 2 === 0 || chunkCount === totalChunks)) {
-        window.TelemetryBridge.updateScanStatus('RUNNING', 'Entity scan ' + chunkCount + '/' + totalChunks + ' (' + rawMatches.length + ' hits)');
-      }
-      await new Promise(function(resolve) { setTimeout(resolve, 10); });
-    }
+        const __emitFloat = function(obj) {
+          try {
+            if (__fBridge && typeof __fBridge.logTelemetry === 'function') {
+              __fBridge.logTelemetry('WASM', JSON.stringify(obj));
+            }
+          } catch (_) {}
+        };
 
-    if (st.entityScanToken !== token) return;
+        const __setFloatStatus = function(status, detail) {
+          try {
+            if (__fBridge && typeof __fBridge.updateScanStatus === 'function') {
+              __fBridge.updateScanStatus(String(status || 'IDLE'), String(detail || ''));
+            }
+          } catch (_) {}
+        };
 
-    var strideCounts = Object.create(null);
-    for (var m = 1; m < rawMatches.length; m++) {
-      var delta = rawMatches[m].idx - rawMatches[m - 1].idx;
-      if (delta >= 4 && delta <= 2048) {
-        strideCounts[delta] = (strideCounts[delta] || 0) + 1;
-      }
-    }
+        const __yieldFloatSlice = function(ms) {
+          return new Promise(function(resolve) {
+            setTimeout(resolve, ms || 10);
+          });
+        };
 
-    var dominantStride = 0, dominantCount = 0;
-    var strideKeys = Object.keys(strideCounts);
-    for (var k = 0; k < strideKeys.length; k++) {
-      var sk = parseInt(strideKeys[k], 10);
-      if (strideCounts[sk] > dominantCount) {
-        dominantCount = strideCounts[sk];
-        dominantStride = sk;
-      }
-    }
-    if (dominantCount < 2) dominantStride = 0;
+        const __resolveFloatHeap = function() {
+          const tryObj = function(obj, prefix) {
+            if (!obj || typeof obj !== 'object') return null;
+            try {
+              if (obj.HEAPF32 instanceof Float32Array && obj.HEAPF32.buffer && obj.HEAPF32.buffer.byteLength >= 4) {
+                return {
+                  heapF32: obj.HEAPF32,
+                  label: prefix + 'HEAPF32',
+                  byteLength: obj.HEAPF32.byteLength
+                };
+              }
+              const h32 = obj.HEAP32 || obj.HEAPU8 || obj.HEAP8;
+              if (h32 && ArrayBuffer.isView(h32) && h32.buffer && h32.buffer.byteLength >= 4) {
+                return {
+                  heapF32: new Float32Array(h32.buffer),
+                  label: prefix + 'HEAPF32 (buffer view)',
+                  byteLength: h32.buffer.byteLength
+                };
+              }
+              const mem = obj.wasmMemory || (obj.asm && obj.asm.memory) || (obj.wasmExports && obj.wasmExports.memory);
+              if (typeof WebAssembly !== 'undefined' && mem instanceof WebAssembly.Memory && mem.buffer && mem.buffer.byteLength >= 4) {
+                return {
+                  heapF32: new Float32Array(mem.buffer),
+                  label: prefix + 'wasmMemory Float32Array',
+                  byteLength: mem.buffer.byteLength
+                };
+              }
+            } catch (_) {}
+            return null;
+          };
 
-    var scored = [];
-    for (var j = 0; j < rawMatches.length; j++) {
-      var item = rawMatches[j];
-      var conf = 50;
-      var strideGroup = 0;
-      if (dominantStride > 0) {
-        var prevDelta = j > 0 ? (item.idx - rawMatches[j - 1].idx) : -1;
-        var nextDelta = j + 1 < rawMatches.length ? (rawMatches[j + 1].idx - item.idx) : -1;
-        if (prevDelta === dominantStride || nextDelta === dominantStride) {
-          conf += 35;
-          strideGroup = dominantStride;
-        } else if (Math.abs(item.offset) % dominantStride === 0) {
-          conf += 25;
-          strideGroup = dominantStride;
-        }
-      }
-      if (hasPlayerOrigin && item.dist <= 250) conf += 15;
-      else if (hasPlayerOrigin && item.dist <= 600) conf += 8;
-
-      scored.push({
-        baseIndex: item.idx,
-        byteAddress: item.idx * 4,
-        offsetFromPlayer: item.offset,
-        x: item.x,
-        y: item.y,
-        z: item.z,
-        distanceToPlayer: item.dist,
-        strideGroup: strideGroup,
-        confidenceScore: Math.min(100, conf)
-      });
-    }
-
-    scored.sort(function(a, b) {
-      if (b.confidenceScore !== a.confidenceScore) return b.confidenceScore - a.confidenceScore;
-      return a.distanceToPlayer - b.distanceToPlayer;
-    });
-
-    var topEntities = scored.slice(0, 80);
-    var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
-
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Found ' + topEntities.length + ' entities (' + durationMs + 'ms)');
-      window.TelemetryBridge.logTelemetry('ENTITY', JSON.stringify({
-        type: 'ENTITIES_SCANNED',
-        playerBaseIndex: pIdx,
-        searchRadius: $safeRadius,
-        totalCandidates: rawMatches.length,
-        dominantStride: dominantStride,
-        durationMs: durationMs,
-        entities: topEntities
-      }));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('ERROR', 'Entity scan failed');
-      window.TelemetryBridge.logTelemetry('ERR', 'Entity struct scan error: ' + String(e));
-    }
-  }
-})();
-""".trimIndent()
-    }
-
-    fun buildManualEvalScript(userCode: String): String {
-        val quoted = quoteJsString(userCode)
-        return """
-(function() {
-  try {
-    var code = $quoted;
-    var result = (0, eval)(code);
-    var formatted;
-    if (result === undefined) {
-      formatted = 'undefined';
-    } else if (result === null) {
-      formatted = 'null';
-    } else if (typeof result === 'object') {
-      try {
-        var seen = new WeakSet();
-        formatted = JSON.stringify(result, function(_k, v) {
-          if (typeof v === 'object' && v !== null) {
-            if (ArrayBuffer.isView(v)) return v.constructor.name + '(' + v.length + ')';
-            if (seen.has(v)) return '[Circular]';
-            seen.add(v);
+          const direct = tryObj(window, 'window.');
+          if (direct) return direct;
+          const mod = tryObj(window.Module, 'window.Module.');
+          if (mod) return mod;
+          const roots = ['unityInstance', 'game', 'app', 'engine', 'Game', 'App', 'Engine'];
+          for (let i = 0; i < roots.length; i++) {
+            try {
+              const r = window[roots[i]];
+              if (!r || typeof r !== 'object') continue;
+              const hit = tryObj(r, 'window.' + roots[i] + '.') || (r.Module ? tryObj(r.Module, 'window.' + roots[i] + '.Module.') : null);
+              if (hit) return hit;
+            } catch (_) {}
           }
-          return v;
-        }, 2);
-      } catch (_je) {
-        formatted = String(result);
-      }
-    } else {
-      formatted = String(result);
-    }
-    if (formatted && formatted.length > 4000) {
-      formatted = formatted.slice(0, 4000) + '... [truncated]';
-    }
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.logTelemetry('JS', JSON.stringify({
-        type: 'MANUAL_EVAL',
-        expression: code,
-        result: formatted
-      }));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.logTelemetry('ERR', 'Manual JS Error: ' + String(e));
-    }
-  }
-})();
-""".trimIndent()
+          return null;
+        };
+
+        const __stopFloatWatch = function() {
+          try {
+            if (__fd.pollId !== null) {
+              clearInterval(__fd.pollId);
+              __fd.pollId = null;
+            }
+          } catch (_) {}
+        };
+
+        const __startFloatWatch = function() {
+          __stopFloatWatch();
+          __fd.pollTick = 0;
+
+          const pushWatchTick = function() {
+            try {
+              const resolved = __resolveFloatHeap();
+              if (!resolved) return;
+              const hf32 = resolved.heapF32;
+              const len = hf32.length;
+              const baseClone = __fd.baselineClone;
+              const baseLen = baseClone ? baseClone.length : 0;
+
+              const mergedMap = new Map();
+              const pinned = Array.isArray(__fd.pinnedIndices) ? __fd.pinnedIndices : [];
+              for (let i = 0; i < pinned.length; i++) {
+                const idx = pinned[i] | 0;
+                if (idx >= 0 && idx < len) {
+                  const staticBase = (baseClone && idx < baseLen && Number.isFinite(baseClone[idx]))
+                    ? baseClone[idx]
+                    : hf32[idx];
+                  mergedMap.set(idx, {
+                    heapIndex: idx,
+                    baselineValue: staticBase,
+                    clusterSize: 1,
+                    axisHint: 'PIN',
+                    isPinned: true
+                  });
+                }
+              }
+
+              const watched = Array.isArray(__fd.watchedItems) ? __fd.watchedItems : [];
+              for (let i = 0; i < watched.length; i++) {
+                const item = watched[i];
+                const idx = item.heapIndex | 0;
+                if (idx < 0 || idx >= len) continue;
+                const existing = mergedMap.get(idx);
+                mergedMap.set(idx, {
+                  heapIndex: idx,
+                  baselineValue: item.baselineValue,
+                  clusterSize: item.clusterSize || 1,
+                  axisHint: item.axisHint || (existing ? existing.axisHint : ''),
+                  isPinned: existing ? true : false
+                });
+              }
+
+              if (mergedMap.size === 0) return;
+
+              __fd.pollTick++;
+              const out = [];
+              mergedMap.forEach(function(meta, idx) {
+                const rawVal = hf32[idx];
+                const cur = Number.isFinite(rawVal) ? Number(rawVal.toFixed(4)) : 0;
+                const base = Number.isFinite(meta.baselineValue) ? Number(meta.baselineValue.toFixed(4)) : cur;
+                const d = Number((cur - base).toFixed(4));
+                out.push({
+                  heapIndex: idx,
+                  byteAddress: idx * 4,
+                  baselineValue: base,
+                  currentValue: cur,
+                  delta: d,
+                  clusterSize: meta.clusterSize,
+                  axisHint: meta.axisHint,
+                  isPinned: meta.isPinned
+                });
+              });
+
+              const payload = {
+                stage: 'WASM_FLOAT_WATCH_TICK',
+                heapSourceLabel: resolved.label,
+                heapByteLength: resolved.byteLength,
+                tick: __fd.pollTick,
+                candidates: out
+              };
+              if (__fBridge && typeof __fBridge.updateWasmFloatCandidates === 'function') {
+                __fBridge.updateWasmFloatCandidates(JSON.stringify(payload));
+              }
+            } catch (_) {}
+          };
+
+          pushWatchTick();
+          __fd.pollId = setInterval(pushWatchTick, 200);
+        };
+    """
+
+    /**
+     * Step 2A (Float Mode): Creates a true, isolated static clone of the active `window.HEAPF32`
+     * buffer (`new Float32Array(hf32.buffer.slice(...))` with a non-blocking indexed copy fallback)
+     * so baseline values are completely decoupled from live WASM linear memory and never mutate
+     * alongside character movement. Strictly read-only on `window.HEAPF32`.
+     */
+    fun buildFloatBaselineSnapshotScript(): String = """
+        (async function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            const resolved = __resolveFloatHeap();
+            if (!resolved) {
+              __setFloatStatus('ERROR', 'window.HEAPF32 not found');
+              __emitFloat({
+                stage: 'WASM_FLOAT_ERROR',
+                message: 'Could not locate window.HEAPF32 (or Module.HEAPF32) on this page. Switch Step 2 to JS Objects mode if this page does not use WebAssembly.'
+              });
+              return;
+            }
+
+            __stopFloatWatch();
+            const mySeq = ++__fd.scanSeq;
+            const startMs = performance.now();
+            const hf32 = resolved.heapF32;
+            const len = hf32.length;
+
+            // Skip low static/guard slots on full WASM heaps while preserving all indices on small test heaps
+            const START_INDEX = len > 4096 ? 256 : 0;
+            const CHUNK_FLOATS = 262144; // 1 MB per non-blocking async yield slice
+            const MAX_ABS = 1000000.0;
+
+            __setFloatStatus('RUNNING', 'Float Baseline: cloning ' + resolved.label + '…');
+
+            // Create a true isolated Float32Array clone whose backing ArrayBuffer is completely separate from live HEAPF32
+            let clone = null;
+            let cloneMethod = 'buffer.slice';
+            try {
+              const slicedBuffer = (hf32.byteOffset === 0 && hf32.byteLength === hf32.buffer.byteLength)
+                ? hf32.buffer.slice(0)
+                : hf32.buffer.slice(hf32.byteOffset, hf32.byteOffset + hf32.byteLength);
+              clone = new Float32Array(slicedBuffer);
+            } catch (_) {
+              clone = null;
+            }
+
+            // Fallback: chunked non-blocking indexed copy into a brand-new isolated Float32Array
+            if (!clone || clone.buffer === hf32.buffer || clone.length !== len) {
+              cloneMethod = 'indexed-copy';
+              clone = new Float32Array(len);
+              for (let base = 0; base < len; base += CHUNK_FLOATS) {
+                if (mySeq !== __fd.scanSeq) return;
+                const end = Math.min(base + CHUNK_FLOATS, len);
+                for (let i = base; i < end; i++) {
+                  clone[i] = hf32[i];
+                }
+                if (end < len) {
+                  await __yieldFloatSlice(8);
+                }
+              }
+            }
+
+            if (mySeq !== __fd.scanSeq) return;
+            const isIsolated = (clone.buffer !== hf32.buffer);
+
+            // Non-blocking audit pass to count valid finite float slots in the isolated clone
+            let validCount = 0;
+            let lastPct = -1;
+            for (let base = START_INDEX; base < len; base += CHUNK_FLOATS) {
+              if (mySeq !== __fd.scanSeq) return;
+              const end = Math.min(base + CHUNK_FLOATS, len);
+              for (let i = base; i < end; i++) {
+                const v = clone[i];
+                if (v === v) {
+                  const av = v < 0 ? -v : v;
+                  if (av <= MAX_ABS) {
+                    validCount++;
+                  }
+                }
+              }
+              const pct = Math.min(99, Math.floor(((end - START_INDEX) / Math.max(1, len - START_INDEX)) * 100));
+              if (pct >= lastPct + 25) {
+                lastPct = pct;
+                __setFloatStatus('RUNNING', 'Float Baseline clone ' + pct + '% (' + validCount + ' floats)…');
+              }
+              if (end < len) {
+                await __yieldFloatSlice(8);
+              }
+            }
+
+            if (mySeq !== __fd.scanSeq) return;
+
+            __fd.sourceLabel = resolved.label;
+            __fd.heapByteLength = resolved.byteLength;
+            __fd.baselineClone = clone;
+            __fd.baselineLength = clone.length;
+            __fd.isIsolatedClone = isIsolated;
+            __fd.snapCount = validCount;
+            __fd.candidateIndices = null;
+            __fd.candidateBaselines = null;
+            __fd.candidateCount = 0;
+            __fd.watchedItems = [];
+            __fd.scanRound = 0;
+
+            const durationMs = Number((performance.now() - startMs).toFixed(1));
+            __setFloatStatus('COMPLETED', 'Float Baseline cloned: ' + validCount + ' floats (' + durationMs + 'ms)');
+            __emitFloat({
+              stage: 'WASM_FLOAT_BASELINE_CAPTURED',
+              durationMs: durationMs,
+              heapSourceLabel: __fd.sourceLabel,
+              heapByteLength: __fd.heapByteLength,
+              totalHeapFloats: len,
+              sampledCount: validCount,
+              prunedJitterCount: 0,
+              cloneMethod: cloneMethod,
+              isIsolatedClone: isIsolated
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.updateScanStatus('ERROR', 'Float baseline failed');
+                window.TelemetryBridge.logTelemetry('ERR', 'WASM Float Baseline error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+    """.trimIndent()
+
+    /**
+     * Step 2B (Float Mode): Non-blocking movement delta scanner comparing live `window.HEAPF32`
+     * against the isolated static `baselineClone` using permissive positional delta thresholds
+     * (`0.02 <= |delta| <= 500.0`), grouping adjacent `X, Y, Z` float triplets cleanly, and
+     * immediately streaming the top candidates at 200 ms.
+     */
+    fun buildFloatDeltaScanScript(
+        minDelta: Double = 0.02,
+        maxDelta: Double = 500.0
+    ): String {
+        val minLit = if (minDelta.isFinite() && minDelta > 0.0) minDelta.toString() else "0.02"
+        val maxLit = if (maxDelta.isFinite() && maxDelta > minDelta) maxDelta.toString() else "500.0"
+        return """
+        (async function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            if (!__fd.baselineClone || __fd.baselineLength <= 0) {
+              __setFloatStatus('IDLE', 'Capture Float Baseline first');
+              __emitFloat({
+                stage: 'WASM_FLOAT_ERROR',
+                message: 'Stand still and tap 2A. Capture Float Baseline before scanning for movement deltas.'
+              });
+              return;
+            }
+
+            const resolved = __resolveFloatHeap();
+            if (!resolved) {
+              __setFloatStatus('ERROR', 'window.HEAPF32 unavailable');
+              __emitFloat({
+                stage: 'WASM_FLOAT_ERROR',
+                message: 'window.HEAPF32 is no longer accessible on this page.'
+              });
+              return;
+            }
+
+            const mySeq = ++__fd.scanSeq;
+            const startMs = performance.now();
+            const hf32 = resolved.heapF32;
+            const liveLen = hf32.length;
+            const baseClone = __fd.baselineClone;
+            const compareLen = Math.min(liveLen, baseClone.length);
+            const START_INDEX = compareLen > 4096 ? 256 : 0;
+
+            const MIN_DELTA = Number($minLit);
+            const MAX_DELTA = Number($maxLit);
+            const MAX_ABS = 1000000.0;
+            const CHUNK_CHECK = 262144;
+            const MAX_CANDIDATES = 80000;
+
+            __setFloatStatus('RUNNING', 'Scanning HEAPF32 movement deltas (0.02..500)…');
+
+            let hitIndices = [];
+            let hitBaselines = [];
+            let hitCurrents = [];
+            let hitDeltas = [];
+            let totalMatches = 0;
+            let comparedCount = 0;
+
+            const scanFullIsolatedClone = async function() {
+              hitIndices = [];
+              hitBaselines = [];
+              hitCurrents = [];
+              hitDeltas = [];
+              totalMatches = 0;
+              comparedCount = Math.max(0, compareLen - START_INDEX);
+
+              for (let base = START_INDEX; base < compareLen; base += CHUNK_CHECK) {
+                if (mySeq !== __fd.scanSeq) return false;
+                const end = Math.min(base + CHUNK_CHECK, compareLen);
+                for (let i = base; i < end; i++) {
+                  const cur = hf32[i];
+                  if (cur !== cur) continue; // NaN check
+                  const prev = baseClone[i];
+                  if (prev !== prev) continue;
+                  const absCur = cur < 0 ? -cur : cur;
+                  const absPrev = prev < 0 ? -prev : prev;
+                  if (absCur > MAX_ABS || absPrev > MAX_ABS) continue;
+                  const diff = cur - prev;
+                  const absDiff = diff < 0 ? -diff : diff;
+                  if (absDiff >= MIN_DELTA && absDiff <= MAX_DELTA) {
+                    totalMatches++;
+                    if (hitIndices.length < MAX_CANDIDATES) {
+                      hitIndices.push(i);
+                      hitBaselines.push(prev);
+                      hitCurrents.push(cur);
+                      hitDeltas.push(diff);
+                    }
+                  }
+                }
+                if (end < compareLen) {
+                  await __yieldFloatSlice(10);
+                }
+              }
+              return true;
+            };
+
+            // On round 1 scan the full isolated baseline clone; on subsequent rounds refine surviving candidates
+            const canRefine = (__fd.scanRound > 0 && __fd.candidateIndices && __fd.candidateBaselines && __fd.candidateCount > 0);
+            if (canRefine) {
+              const srcIndices = __fd.candidateIndices;
+              const srcBaselines = __fd.candidateBaselines;
+              const srcLen = __fd.candidateCount;
+              comparedCount = srcLen;
+
+              for (let base = 0; base < srcLen; base += CHUNK_CHECK) {
+                if (mySeq !== __fd.scanSeq) return;
+                const end = Math.min(base + CHUNK_CHECK, srcLen);
+                for (let j = base; j < end; j++) {
+                  const idx = srcIndices[j];
+                  if (idx < 0 || idx >= liveLen) continue;
+                  const cur = hf32[idx];
+                  if (cur !== cur) continue;
+                  const prev = srcBaselines[j];
+                  if (prev !== prev) continue;
+                  const absCur = cur < 0 ? -cur : cur;
+                  if (absCur > MAX_ABS) continue;
+                  const diff = cur - prev;
+                  const absDiff = diff < 0 ? -diff : diff;
+                  if (absDiff >= MIN_DELTA && absDiff <= MAX_DELTA) {
+                    totalMatches++;
+                    if (hitIndices.length < MAX_CANDIDATES) {
+                      hitIndices.push(idx);
+                      hitBaselines.push(prev);
+                      hitCurrents.push(cur);
+                      hitDeltas.push(diff);
+                    }
+                  }
+                }
+                if (end < srcLen) {
+                  await __yieldFloatSlice(10);
+                }
+              }
+
+              // Graceful fallback: if refinement yielded 0 hits, re-compare against the full isolated baseline clone
+              if (totalMatches === 0) {
+                const ok = await scanFullIsolatedClone();
+                if (!ok) return;
+              }
+            } else {
+              const ok = await scanFullIsolatedClone();
+              if (!ok) return;
+            }
+
+            if (mySeq !== __fd.scanSeq) return;
+
+            // O(1) lookup table for moving indices so contiguous X/Y/Z triplet clustering is fast and exact
+            const hitByIndex = new Map();
+            for (let i = 0; i < hitIndices.length; i++) {
+              hitByIndex.set(hitIndices[i], {
+                heapIndex: hitIndices[i],
+                byteAddress: hitIndices[i] * 4,
+                baselineValue: Number(hitBaselines[i].toFixed(4)),
+                currentValue: Number(hitCurrents[i].toFixed(4)),
+                delta: Number(hitDeltas[i].toFixed(4))
+              });
+            }
+
+            // Evaluate contiguous 3-float Vec3 triplets (start, start+1, start+2)
+            const evaluatedStarts = new Set();
+            const scoredTriplets = [];
+            for (let i = 0; i < hitIndices.length; i++) {
+              const idx = hitIndices[i];
+              for (let off = -2; off <= 0; off++) {
+                const start = idx + off;
+                if (start < START_INDEX || start + 2 >= compareLen) continue;
+                if (evaluatedStarts.has(start)) continue;
+                evaluatedStarts.add(start);
+
+                const h0 = hitByIndex.get(start);
+                const h1 = hitByIndex.get(start + 1);
+                const h2 = hitByIndex.get(start + 2);
+                const movedCount = (h0 ? 1 : 0) + (h1 ? 1 : 0) + (h2 ? 1 : 0);
+                if (movedCount < 2) continue;
+
+                // Ensure all 3 slots in the triplet hold valid finite floats (handles flat Y elevation cleanly)
+                const v0 = hf32[start];
+                const v1 = hf32[start + 1];
+                const v2 = hf32[start + 2];
+                if (!Number.isFinite(v0) || !Number.isFinite(v1) || !Number.isFinite(v2)) continue;
+                if (Math.abs(v0) > MAX_ABS || Math.abs(v1) > MAX_ABS || Math.abs(v2) > MAX_ABS) continue;
+
+                let score = 0;
+                if (movedCount === 3) {
+                  score += 45; // Full 3D X/Y/Z movement
+                } else if (h0 && h2 && !h1) {
+                  score += 36; // Classic horizontal 3D movement (X & Z moved, Y elevation flat)
+                } else {
+                  score += 30; // 2D adjacent pair (X & Y or Y & Z moved)
+                }
+
+                // Bonus for realistic world-space magnitudes and walk-step deltas
+                const sampleHit = h0 || h1 || h2;
+                const absSample = Math.abs(sampleHit.currentValue);
+                if (absSample >= 0.1 && absSample <= 250000) score += 4;
+                const absStep = Math.abs(sampleHit.delta);
+                if (absStep >= 0.05 && absStep <= 150) score += 3;
+
+                scoredTriplets.push({
+                  start: start,
+                  movedCount: movedCount,
+                  score: score
+                });
+              }
+            }
+
+            scoredTriplets.sort(function(a, b) {
+              if (b.score !== a.score) return b.score - a.score;
+              return a.start - b.start;
+            });
+
+            // Build top watched list (up to 12 offsets), prioritizing contiguous X, Y, Z triplets first
+            const topWatched = [];
+            const addedSet = new Set();
+            const axisLabels = ['X', 'Y', 'Z'];
+
+            const appendTriplet = function(startIdx, clusterSz, assignAxisLabels) {
+              for (let k = 0; k < 3 && topWatched.length < 12; k++) {
+                const slotIdx = startIdx + k;
+                if (slotIdx < 0 || slotIdx >= compareLen || addedSet.has(slotIdx)) continue;
+                const hit = hitByIndex.get(slotIdx);
+                const fv = hf32[slotIdx];
+                const bv = baseClone[slotIdx];
+                if (!Number.isFinite(fv) || Math.abs(fv) > MAX_ABS) continue;
+                const baseNum = Number.isFinite(bv) ? Number(bv.toFixed(4)) : Number(fv.toFixed(4));
+                const curNum = Number(fv.toFixed(4));
+                topWatched.push({
+                  heapIndex: slotIdx,
+                  byteAddress: slotIdx * 4,
+                  baselineValue: hit ? hit.baselineValue : baseNum,
+                  currentValue: hit ? hit.currentValue : curNum,
+                  delta: hit ? hit.delta : Number((curNum - baseNum).toFixed(4)),
+                  clusterSize: clusterSz,
+                  axisHint: assignAxisLabels ? axisLabels[k] : ''
+                });
+                addedSet.add(slotIdx);
+              }
+            };
+
+            if (scoredTriplets.length > 0) {
+              // Primary best X/Y/Z triplet gets explicit X, Y, Z axis hints
+              appendTriplet(scoredTriplets[0].start, 3, true);
+              // Include up to 2 additional non-overlapping contiguous triplets
+              for (let t = 1; t < scoredTriplets.length && topWatched.length < 9; t++) {
+                const st = scoredTriplets[t].start;
+                if (addedSet.has(st) || addedSet.has(st + 1) || addedSet.has(st + 2)) continue;
+                appendTriplet(st, scoredTriplets[t].movedCount, false);
+              }
+            }
+
+            // Fill remaining slots (up to 12) with highest-scoring individual moving floats
+            if (topWatched.length < 12) {
+              const singles = [];
+              for (let i = 0; i < hitIndices.length; i++) {
+                const idx = hitIndices[i];
+                if (addedSet.has(idx)) continue;
+                let neighbors = 1;
+                if (hitByIndex.has(idx - 1)) neighbors++;
+                if (hitByIndex.has(idx + 1)) neighbors++;
+                if (hitByIndex.has(idx - 2)) neighbors++;
+                if (hitByIndex.has(idx + 2)) neighbors++;
+                const absCur = Math.abs(hitCurrents[i]);
+                const scaleBonus = (absCur >= 0.1 && absCur <= 250000) ? 2.0 : 0.2;
+                singles.push({
+                  heapIndex: idx,
+                  byteAddress: idx * 4,
+                  baselineValue: Number(hitBaselines[i].toFixed(4)),
+                  currentValue: Number(hitCurrents[i].toFixed(4)),
+                  delta: Number(hitDeltas[i].toFixed(4)),
+                  clusterSize: neighbors,
+                  score: (neighbors * 10) + scaleBonus
+                });
+              }
+              singles.sort(function(a, b) {
+                if (b.score !== a.score) return b.score - a.score;
+                return a.heapIndex - b.heapIndex;
+              });
+              for (let i = 0; i < singles.length && topWatched.length < 12; i++) {
+                const item = singles[i];
+                if (addedSet.has(item.heapIndex)) continue;
+                addedSet.add(item.heapIndex);
+                const fallbackAxis = (scoredTriplets.length === 0 && topWatched.length < 3)
+                  ? axisLabels[topWatched.length]
+                  : '';
+                topWatched.push({
+                  heapIndex: item.heapIndex,
+                  byteAddress: item.byteAddress,
+                  baselineValue: item.baselineValue,
+                  currentValue: item.currentValue,
+                  delta: item.delta,
+                  clusterSize: item.clusterSize,
+                  axisHint: fallbackAxis
+                });
+              }
+            }
+
+            // Persist isolated TypedArray snapshot of surviving candidates for iterative refinement
+            const nextCount = hitIndices.length;
+            const nextIdxArr = new Int32Array(nextCount);
+            const nextBaseArr = new Float32Array(nextCount);
+            for (let i = 0; i < nextCount; i++) {
+              nextIdxArr[i] = hitIndices[i];
+              nextBaseArr[i] = hitCurrents[i];
+            }
+
+            __fd.sourceLabel = resolved.label;
+            __fd.heapByteLength = resolved.byteLength;
+            __fd.candidateIndices = nextIdxArr;
+            __fd.candidateBaselines = nextBaseArr;
+            __fd.candidateCount = nextCount;
+            __fd.watchedItems = topWatched;
+            __fd.scanRound = (__fd.scanRound || 0) + 1;
+
+            if (topWatched.length > 0) {
+              __startFloatWatch();
+            } else {
+              __stopFloatWatch();
+            }
+
+            const durationMs = Number((performance.now() - startMs).toFixed(1));
+            __setFloatStatus(
+              totalMatches > 0 ? 'COMPLETED' : 'IDLE',
+              totalMatches > 0
+                ? ('Float Deltas #' + __fd.scanRound + ': ' + totalMatches + ' matches • Watching top ' + topWatched.length)
+                : ('Float Deltas #' + __fd.scanRound + ': 0 matches — walk & retry')
+            );
+            __emitFloat({
+              stage: 'WASM_FLOAT_DELTA_SCANNED',
+              durationMs: durationMs,
+              heapSourceLabel: resolved.label,
+              heapByteLength: resolved.byteLength,
+              scanRound: __fd.scanRound,
+              comparedCount: comparedCount,
+              totalMatches: totalMatches,
+              tripletCount: scoredTriplets.length,
+              minDelta: MIN_DELTA,
+              maxDelta: MAX_DELTA,
+              candidates: topWatched
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.updateScanStatus('ERROR', 'Float delta scan failed');
+                window.TelemetryBridge.logTelemetry('ERR', 'WASM Float Delta Scan error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+        """.trimIndent()
     }
 
-    fun buildCollectViewportMetricsScript(baseIndex: Int = VERIFIED_PLAYER_BASE_INDEX): String {
-        val safeBase = baseIndex.coerceAtLeast(0)
+    /**
+     * Synchronizes pinned `HEAPF32` indices into the live 200 ms watcher so pinned coordinates
+     * remain visible even across subsequent delta refinement rounds.
+     */
+    fun buildSyncPinnedFloatsScript(pinnedIndices: Collection<Int>): String {
+        val arrLiteral = pinnedIndices.distinct().filter { it >= 0 }.take(24).joinToString(",")
         return """
-(function() {
-  $HEAP_RESOLVER_JS
-  try {
-    var res = __wvResolveWasmHeap();
-    var heapSnapshot = null;
-    if (res && $safeBase + 2 < res.length) {
-      heapSnapshot = {
-        source: res.label,
-        byteLength: res.byteLength,
-        floatLength: res.length,
-        baseIndex: $safeBase,
-        byteAddressHex: '0x' + ($safeBase * 4).toString(16).toUpperCase(),
-        x: res.hf32[$safeBase],
-        y: res.hf32[$safeBase + 1],
-        z: res.hf32[$safeBase + 2]
-      };
+        (function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            __fd.pinnedIndices = [$arrLiteral];
+            if ((__fd.pinnedIndices.length > 0 || (__fd.watchedItems && __fd.watchedItems.length > 0)) && __fd.pollId === null) {
+              __startFloatWatch();
+            }
+          } catch (_) {}
+        })();
+        """.trimIndent()
     }
-    var payload = {
-      url: String(window.location && window.location.href || ''),
-      title: String(document.title || ''),
-      userAgent: String(navigator.userAgent || ''),
-      viewport: {
-        innerWidth: window.innerWidth || 0,
-        innerHeight: window.innerHeight || 0,
-        devicePixelRatio: window.devicePixelRatio || 1
-      },
-      heapSnapshot: heapSnapshot,
-      capturedAtIso: new Date().toISOString()
-    };
-    if (window.TelemetryBridge && window.TelemetryBridge.exportReport) {
-      window.TelemetryBridge.exportReport(JSON.stringify(payload));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge && window.TelemetryBridge.exportReport) {
-      window.TelemetryBridge.exportReport(JSON.stringify({ error: String(e) }));
-    }
-  }
-})();
-""".trimIndent()
-    }
+
+    /**
+     * Stops the 200 ms Live Float Watcher interval cleanly.
+     */
+    fun buildStopFloatWatchScript(): String = """
+        (function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            __stopFloatWatch();
+            __setFloatStatus('IDLE', 'Live Float Watcher stopped');
+          } catch (_) {}
+        })();
+    """.trimIndent()
+
+    /**
+     * Releases the isolated `HEAPF32` baseline clone and stops live watching.
+     */
+    fun buildResetFloatDeltaScript(): String = """
+        (function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            __fd.scanSeq++;
+            __stopFloatWatch();
+            __fd.baselineClone = null;
+            __fd.baselineLength = 0;
+            __fd.isIsolatedClone = false;
+            __fd.snapCount = 0;
+            __fd.candidateIndices = null;
+            __fd.candidateBaselines = null;
+            __fd.candidateCount = 0;
+            __fd.pinnedIndices = [];
+            __fd.watchedItems = [];
+            __fd.scanRound = 0;
+            __fd.pollTick = 0;
+            __setFloatStatus('IDLE', 'Float Heap Delta Scanner reset');
+          } catch (_) {}
+        })();
+    """.trimIndent()
 }

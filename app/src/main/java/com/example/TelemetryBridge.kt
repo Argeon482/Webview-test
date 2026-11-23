@@ -25,7 +25,8 @@ class TelemetryBridge(
     private val onScanStatusChanged: (status: AsyncScanStatus, detail: String) -> Unit = { _, _ -> },
     private val onPlayerCoordsUpdated: (path: String, x: Double, y: Double, z: Double) -> Unit = { _, _, _, _ -> },
     private val onBatchProgressChanged: (ScopeBatchProgress) -> Unit = { _ -> },
-    private val onWasmNeighborsUpdated: (jsonPayload: String) -> Unit = { _ -> }
+    private val onWasmNeighborsUpdated: (jsonPayload: String) -> Unit = { _ -> },
+    private val onWasmFloatCandidatesUpdated: (jsonPayload: String) -> Unit = { _ -> }
 ) {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val exportArmed = AtomicBoolean(false)
@@ -33,6 +34,7 @@ class TelemetryBridge(
     private val logsInCurrentWindow = AtomicLong(0L)
     private val lastCoordUpdateMs = AtomicLong(0L)
     private val lastWasmNeighborUpdateMs = AtomicLong(0L)
+    private val lastWasmFloatWatchUpdateMs = AtomicLong(0L)
 
     /**
      * Arms the bridge to accept the next structured report payload produced by a user-initiated
@@ -141,6 +143,25 @@ class TelemetryBridge(
 
         mainHandler.post {
             onWasmNeighborsUpdated(safePayload)
+        }
+    }
+
+    /**
+     * Streams live 200 ms decimal values for the top movement-filtered `window.HEAPF32`
+     * coordinate candidates into the bottom Live Float Watcher panel.
+     */
+    @JavascriptInterface
+    fun updateWasmFloatCandidates(jsonPayload: String) {
+        val now = System.currentTimeMillis()
+        val prev = lastWasmFloatWatchUpdateMs.get()
+        if (now - prev < MIN_COORD_INTERVAL_MS) return
+        if (!lastWasmFloatWatchUpdateMs.compareAndSet(prev, now)) return
+
+        val safePayload = sanitizePayload(jsonPayload, MAX_LOG_PAYLOAD_CHARS).trim()
+        if (safePayload.isEmpty()) return
+
+        mainHandler.post {
+            onWasmFloatCandidatesUpdated(safePayload)
         }
     }
 

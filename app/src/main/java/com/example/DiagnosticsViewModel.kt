@@ -83,6 +83,7 @@ class DiagnosticsViewModel : ViewModel() {
                         discoveredEntities = emptyList(),
                         lastEntityCount = 0,
                         wasmHeap = WasmHeapTrackerState(),
+                        wasmFloatDelta = WasmFloatDeltaState(),
                         interceptedAssets = emptyList(),
                         estimatedFps = null,
                         canvasCount = 0
@@ -103,7 +104,12 @@ class DiagnosticsViewModel : ViewModel() {
         _uiState.update {
             it.copy(
                 livePollActive = false,
-                wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false)
+                wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false),
+                wasmFloatDelta = it.wasmFloatDelta.copy(
+                    isLiveWatching = false,
+                    isSamplingBaseline = false,
+                    isScanningDeltas = false
+                )
             )
         }
         appendLog(LogCategory.SYSTEM, "Reloading $current", current)
@@ -135,7 +141,12 @@ class DiagnosticsViewModel : ViewModel() {
                 isLoading = true,
                 loadProgress = 10,
                 livePollActive = false,
-                wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false)
+                wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false),
+                wasmFloatDelta = it.wasmFloatDelta.copy(
+                    isLiveWatching = false,
+                    isSamplingBaseline = false,
+                    isScanningDeltas = false
+                )
             )
         }
     }
@@ -637,6 +648,263 @@ class DiagnosticsViewModel : ViewModel() {
         val export = _uiState.value.wasmHeap.lastMemoryMapExport
         if (export != null && export.success && export.contentUri != null) {
             _effects.tryEmit(DiagnosticsEffect.ShareReport(export.contentUri, export.fileName, export.mimeType))
+        }
+    }
+
+    // Step 2A / 2B (Float Mode) — WebAssembly Float Heap Delta Scanner targeting window.HEAPF32
+    fun onSelectStep2ScanMode(mode: Step2ScanMode) {
+        _uiState.update { it.copy(step2ScanMode = mode) }
+    }
+
+    fun runWasmFloatBaselineSnapshot() {
+        if (_uiState.value.wasmFloatDelta.isSamplingBaseline) return
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Step 2A (Float): Sampling window.HEAPF32 baseline…",
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    isSamplingBaseline = true,
+                    isScanningDeltas = false,
+                    baselineCaptured = false,
+                    totalDeltaMatches = 0,
+                    scanRound = 0,
+                    isLiveWatching = false,
+                    liveWatchTickCount = 0,
+                    statusMessage = "Sampling window.HEAPF32 in non-blocking 1 MB slices & pruning standing jitter…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "Step 2A (Float Mode): Capturing window.HEAPF32 standing baseline…",
+            "Skipping low guard/out-of-bounds slots and pruning ticking timers while standing still"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildFloatBaselineSnapshotScript()))
+    }
+
+    fun runWasmFloatDeltaScan() {
+        val fd = _uiState.value.wasmFloatDelta
+        if (fd.isSamplingBaseline || fd.isScanningDeltas) return
+        if (!fd.baselineCaptured) {
+            val msg = "Stand still and tap 2A. Capture Float Baseline first."
+            appendLog(LogCategory.WASM, msg, msg)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Step 2B (Float): Scanning HEAPF32 movement deltas…",
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    isScanningDeltas = true,
+                    statusMessage = "Comparing live window.HEAPF32 against baseline for positional deltas…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "Step 2B (Float Mode): Scanning HEAPF32 movement deltas (round #${fd.scanRound + 1})…",
+            "Isolating floats that changed by a positional delta range (0.05..250.0) and clustering X/Y/Z neighbors"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildFloatDeltaScanScript()))
+    }
+
+    fun onTogglePinWasmFloatCandidate(heapIndex: Int) {
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        var nowPinned = false
+        var updatedPinnedSet: Set<Int> = emptySet()
+
+        _uiState.update { state ->
+            val currentPinned = state.wasmFloatDelta.pinnedIndices
+            val nextPinned = if (currentPinned.contains(heapIndex)) {
+                nowPinned = false
+                currentPinned - heapIndex
+            } else {
+                nowPinned = true
+                currentPinned + heapIndex
+            }
+            updatedPinnedSet = nextPinned
+
+            val candidate = state.wasmFloatDelta.candidates.firstOrNull { it.heapIndex == heapIndex }
+            val updatedCandidates = state.wasmFloatDelta.candidates.map { item ->
+                if (item.heapIndex == heapIndex) item.copy(isPinned = nowPinned) else item
+            }
+
+            val path = "window.HEAPF32[$heapIndex]"
+            val hex = formatHexAddress(heapIndex.toLong() * 4L)
+            val detail = if (candidate != null) {
+                val hint = if (candidate.axisHint.isNotBlank()) "${candidate.axisHint} • " else ""
+                "${hint}$hex • val=${String.format(Locale.US, "%.4f", candidate.currentValue)} (Δ ${String.format(Locale.US, "%+.3f", candidate.delta)})"
+            } else {
+                "$hex • Pinned WASM float"
+            }
+
+            val mergedStaging = if (nowPinned) {
+                mergeIntoStagingBuffer(
+                    existing = state.stagingBuffer,
+                    incoming = listOf(path to detail),
+                    sourceStep = "Float Delta",
+                    scanNumber = state.scanCounter.coerceAtLeast(1),
+                    timestamp = nowTs,
+                    forcePin = true
+                )
+            } else {
+                state.stagingBuffer.map { item ->
+                    if (item.path == path) item.copy(isPinned = false) else item
+                }
+            }
+
+            state.copy(
+                stagingBuffer = sortStagingBuffer(mergedStaging),
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    pinnedIndices = nextPinned,
+                    candidates = updatedCandidates
+                )
+            )
+        }
+
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildSyncPinnedFloatsScript(updatedPinnedSet)))
+        val toastMsg = if (nowPinned) "Pinned HEAPF32[$heapIndex] to Live Watcher & Staging" else "Unpinned HEAPF32[$heapIndex]"
+        _effects.tryEmit(DiagnosticsEffect.ShowToast(toastMsg))
+    }
+
+    fun onPinTopWasmFloatTriplet() {
+        val topThree = _uiState.value.wasmFloatDelta.candidates.take(3)
+        if (topThree.isEmpty()) return
+        val nowTs = formatTimestamp(System.currentTimeMillis())
+        var updatedPinnedSet: Set<Int> = emptySet()
+
+        _uiState.update { state ->
+            val topIndices = topThree.map { it.heapIndex }.toSet()
+            val nextPinned = state.wasmFloatDelta.pinnedIndices + topIndices
+            updatedPinnedSet = nextPinned
+
+            val incoming = topThree.mapIndexed { idx, c ->
+                val axis = c.axisHint.ifBlank { listOf("X", "Y", "Z").getOrElse(idx) { "F" } }
+                val hex = formatHexAddress(c.byteAddress)
+                "window.HEAPF32[${c.heapIndex}]" to "[$axis] $hex • val=${String.format(Locale.US, "%.4f", c.currentValue)}"
+            }
+            val mergedStaging = mergeIntoStagingBuffer(
+                existing = state.stagingBuffer,
+                incoming = incoming,
+                sourceStep = "Float Delta",
+                scanNumber = state.scanCounter.coerceAtLeast(1),
+                timestamp = nowTs,
+                forcePin = true
+            )
+            val updatedCandidates = state.wasmFloatDelta.candidates.map { item ->
+                if (nextPinned.contains(item.heapIndex)) item.copy(isPinned = true) else item
+            }
+            state.copy(
+                stagingBuffer = mergedStaging,
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    pinnedIndices = nextPinned,
+                    candidates = updatedCandidates
+                )
+            )
+        }
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildSyncPinnedFloatsScript(updatedPinnedSet)))
+        _effects.tryEmit(DiagnosticsEffect.ShowToast("Pinned top ${topThree.size} X/Y/Z float offsets to Staging"))
+    }
+
+    fun onToggleFloatWatcherExpanded() {
+        _uiState.update { state ->
+            state.copy(
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    isWatcherExpanded = !state.wasmFloatDelta.isWatcherExpanded
+                )
+            )
+        }
+    }
+
+    fun onStopWasmFloatWatch() {
+        _uiState.update { state ->
+            state.copy(
+                wasmFloatDelta = state.wasmFloatDelta.copy(
+                    isLiveWatching = false,
+                    statusMessage = "Paused Live Float Watcher (pinned offsets preserved)."
+                )
+            )
+        }
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildStopFloatWatchScript()))
+    }
+
+    fun onResetWasmFloatDelta() {
+        _uiState.update { state ->
+            state.copy(wasmFloatDelta = WasmFloatDeltaState())
+        }
+        appendLog(LogCategory.WASM, "Reset WASM Float Heap Delta Scanner", "Released HEAPF32 baseline snapshot and stopped Live Float Watcher")
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildResetFloatDeltaScript()))
+    }
+
+    fun onInspectWasmFloatNeighbors(heapIndex: Int) {
+        _uiState.update { it.copy(activeConsoleTab = ConsoleTab.WASM_HEAP) }
+        onInspectWasmCandidate("HEAPF32", heapIndex)
+    }
+
+    fun onWasmFloatCandidatesUpdatedFromBridge(jsonPayload: String) {
+        val json = try {
+            JSONObject(jsonPayload)
+        } catch (_: Exception) {
+            return
+        }
+        if (json.optString("stage", "") != "WASM_FLOAT_WATCH_TICK") return
+
+        val tick = json.optInt("tick", 1)
+        val sourceLabel = json.optString("heapSourceLabel", "")
+        val byteLen = json.optLong("heapByteLength", 0L)
+        val arr = json.optJSONArray("candidates") ?: JSONArray()
+
+        _uiState.update { state ->
+            val prevState = state.wasmFloatDelta
+            val prevByIdx = prevState.candidates.associateBy { it.heapIndex }
+            val pinnedSet = prevState.pinnedIndices
+
+            val parsed = buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    val idx = obj.optInt("heapIndex", -1)
+                    if (idx < 0) continue
+                    val byteAddr = obj.optLong("byteAddress", idx.toLong() * 4L)
+                    val baseVal = obj.optDouble("baselineValue", 0.0)
+                    val curVal = obj.optDouble("currentValue", 0.0)
+                    val deltaVal = obj.optDouble("delta", curVal - baseVal)
+                    val cluster = obj.optInt("clusterSize", 1)
+                    val axis = obj.optString("axisHint", "")
+                    val isPinned = pinnedSet.contains(idx) || obj.optBoolean("isPinned", false)
+                    val prev = prevByIdx[idx]
+                    val changed = prev != null && kotlin.math.abs(curVal - prev.currentValue) > 0.0005
+                    val nextCount = when {
+                        prev == null -> 0
+                        changed -> prev.changeCount + 1
+                        else -> prev.changeCount
+                    }
+                    add(
+                        WasmFloatDeltaCandidate(
+                            heapIndex = idx,
+                            byteAddress = byteAddr,
+                            baselineValue = baseVal,
+                            currentValue = curVal,
+                            delta = deltaVal,
+                            clusterSize = cluster,
+                            axisHint = axis,
+                            isPinned = isPinned,
+                            changedFromPrev = changed,
+                            changeCount = nextCount
+                        )
+                    )
+                }
+            }
+
+            state.copy(
+                wasmFloatDelta = prevState.copy(
+                    heapSourceLabel = sourceLabel.ifBlank { prevState.heapSourceLabel },
+                    heapByteLength = if (byteLen > 0L) byteLen else prevState.heapByteLength,
+                    isLiveWatching = parsed.isNotEmpty(),
+                    liveWatchTickCount = tick,
+                    candidates = parsed
+                )
+            )
         }
     }
 
@@ -1510,7 +1778,142 @@ class DiagnosticsViewModel : ViewModel() {
                 "WASM Tracker: $msg"
             }
 
+            "WASM_FLOAT_BASELINE_CAPTURED" -> {
+                val sampledCount = json.optInt("sampledCount", 0)
+                val prunedJitter = json.optInt("prunedJitterCount", 0)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val sourceLabel = json.optString("heapSourceLabel", "window.HEAPF32")
+                val byteLen = json.optLong("heapByteLength", 0L)
+
+                val msg = "Captured $sampledCount stable floats in ${durationMs}ms (pruned $prunedJitter ticking timers). Walk 5 steps forward, then tap 'Scan Float Heap Deltas'."
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Float Baseline: $sampledCount stable floats (${durationMs}ms)",
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            isSamplingBaseline = false,
+                            baselineCaptured = sampledCount > 0,
+                            baselineSampleCount = sampledCount,
+                            baselinePrunedJitterCount = prunedJitter,
+                            heapSourceLabel = sourceLabel,
+                            heapByteLength = byteLen,
+                            statusMessage = msg
+                        )
+                    )
+                }
+                "Step 2A (Float Mode, ${durationMs}ms): Sampled $sampledCount stable floats in $sourceLabel (pruned $prunedJitter jitter slots)"
+            }
+
+            "WASM_FLOAT_DELTA_SCANNED" -> {
+                val totalMatches = json.optInt("totalMatches", 0)
+                val scanRound = json.optInt("scanRound", 1)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val sourceLabel = json.optString("heapSourceLabel", "window.HEAPF32")
+                val byteLen = json.optLong("heapByteLength", 0L)
+                val parsedCandidates = parseWasmFloatDeltaCandidates(
+                    array = json.optJSONArray("candidates"),
+                    pinnedIndices = _uiState.value.wasmFloatDelta.pinnedIndices
+                )
+
+                val stagingPairs = parsedCandidates.take(6).map { c ->
+                    val axisTag = if (c.axisHint.isNotBlank()) "[${c.axisHint}] " else ""
+                    val hex = formatHexAddress(c.byteAddress)
+                    "window.HEAPF32[${c.heapIndex}]" to "${axisTag}$hex • cur=${String.format(Locale.US, "%.3f", c.currentValue)} (Δ ${String.format(Locale.US, "%+.3f", c.delta)})"
+                }
+
+                val statusMsg = if (totalMatches > 0) {
+                    "Round #$scanRound: Found $totalMatches moving floats (${durationMs}ms). Streaming top ${parsedCandidates.size} live below — walk again & re-tap to refine!"
+                } else {
+                    "Round #$scanRound: 0 floats moved in positional range (0.05..250). Walk further or recapture Baseline."
+                }
+
+                _uiState.update { state ->
+                    val nextScan = state.scanCounter + 1
+                    val mergedStaging = if (stagingPairs.isNotEmpty()) {
+                        mergeIntoStagingBuffer(
+                            existing = state.stagingBuffer,
+                            incoming = stagingPairs,
+                            sourceStep = "Float Delta #$scanRound",
+                            scanNumber = nextScan,
+                            timestamp = nowTs
+                        )
+                    } else state.stagingBuffer
+
+                    state.copy(
+                        scanCounter = nextScan,
+                        stagingBuffer = mergedStaging,
+                        scanStatus = if (totalMatches > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = if (totalMatches > 0) {
+                            "Float Deltas #$scanRound: $totalMatches matches • Live 200ms"
+                        } else {
+                            "Float Deltas #$scanRound: 0 matches"
+                        },
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            isScanningDeltas = false,
+                            heapSourceLabel = sourceLabel.ifBlank { state.wasmFloatDelta.heapSourceLabel },
+                            heapByteLength = if (byteLen > 0L) byteLen else state.wasmFloatDelta.heapByteLength,
+                            totalDeltaMatches = totalMatches,
+                            scanRound = scanRound,
+                            isLiveWatching = parsedCandidates.isNotEmpty(),
+                            candidates = parsedCandidates,
+                            isWatcherExpanded = true,
+                            statusMessage = statusMsg
+                        )
+                    )
+                }
+                "Step 2B (Float Mode #$scanRound, ${durationMs}ms): Isolated $totalMatches moving floats in $sourceLabel • Watching top ${parsedCandidates.size}"
+            }
+
+            "WASM_FLOAT_ERROR" -> {
+                val msg = json.optString("message", "WASM Float Heap scan failed.")
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.ERROR,
+                        scanStatusDetail = msg.take(60),
+                        wasmFloatDelta = state.wasmFloatDelta.copy(
+                            isSamplingBaseline = false,
+                            isScanningDeltas = false,
+                            statusMessage = msg
+                        )
+                    )
+                }
+                _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+                "WASM Float Delta: $msg"
+            }
+
             else -> payload.take(110)
+        }
+    }
+
+    private fun parseWasmFloatDeltaCandidates(
+        array: JSONArray?,
+        pinnedIndices: Set<Int>
+    ): List<WasmFloatDeltaCandidate> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val idx = obj.optInt("heapIndex", -1)
+                if (idx < 0) continue
+                val byteAddr = obj.optLong("byteAddress", idx.toLong() * 4L)
+                val baseVal = obj.optDouble("baselineValue", 0.0)
+                val curVal = obj.optDouble("currentValue", 0.0)
+                val deltaVal = obj.optDouble("delta", curVal - baseVal)
+                val cluster = obj.optInt("clusterSize", 1)
+                val axis = obj.optString("axisHint", "")
+                add(
+                    WasmFloatDeltaCandidate(
+                        heapIndex = idx,
+                        byteAddress = byteAddr,
+                        baselineValue = baseVal,
+                        currentValue = curVal,
+                        delta = deltaVal,
+                        clusterSize = cluster,
+                        axisHint = axis,
+                        isPinned = pinnedIndices.contains(idx)
+                    )
+                )
+            }
         }
     }
 
@@ -1720,8 +2123,8 @@ class DiagnosticsViewModel : ViewModel() {
                 .put("assets", assetsArray)
         )
 
-        // 6. WASM Heap Value-Tracker Memory Map (if active/isolated)
-        if (state.wasmHeap.isolatedIndex != null || state.wasmHeap.totalMatches > 0) {
+        // 6. WASM Heap Value-Tracker & Float Delta Memory Map (if active/isolated)
+        if (state.wasmHeap.isolatedIndex != null || state.wasmHeap.totalMatches > 0 || state.wasmFloatDelta.candidates.isNotEmpty()) {
             root.put("wasmHeapMemoryMap", JSONObject(buildWasmMemoryMapJson(state)))
         }
 
@@ -1929,6 +2332,23 @@ class DiagnosticsViewModel : ViewModel() {
                     appendLine()
                 }
 
+                if (state.wasmFloatDelta.candidates.isNotEmpty()) {
+                    appendLine("--- [5B] WASM FLOAT HEAP DELTA CANDIDATES (window.HEAPF32) ---")
+                    appendLine("Heap Source    : ${state.wasmFloatDelta.heapSourceLabel.ifBlank { "window.HEAPF32" }}")
+                    appendLine("Baseline / Hit : ${state.wasmFloatDelta.baselineSampleCount} stable -> ${state.wasmFloatDelta.totalDeltaMatches} moving (round #${state.wasmFloatDelta.scanRound})")
+                    state.wasmFloatDelta.candidates.forEach { c ->
+                        val pinTag = if (c.isPinned) "[PINNED] " else ""
+                        val axisTag = if (c.axisHint.isNotBlank()) "[${c.axisHint}] " else ""
+                        appendLine(
+                            "  $pinTag${axisTag}HEAPF32[${c.heapIndex}] (${formatHexAddress(c.byteAddress)}) | " +
+                                "cur=${String.format(Locale.US, "%.4f", c.currentValue)} | " +
+                                "base=${String.format(Locale.US, "%.4f", c.baselineValue)} | " +
+                                "Δ=${String.format(Locale.US, "%+.4f", c.delta)} | ticksChanged=${c.changeCount}"
+                        )
+                    }
+                    appendLine()
+                }
+
                 appendLine("--- [6] COMPLETE ROLLING LOG HISTORY (${state.logs.size} entries) ---")
                 if (state.logs.isEmpty()) {
                     appendLine("  (no log entries)")
@@ -2016,6 +2436,33 @@ class DiagnosticsViewModel : ViewModel() {
                 )
             }
             root.put("survivingCandidates", candidatesArr)
+
+            val floatDelta = state.wasmFloatDelta
+            val floatDeltaArr = JSONArray()
+            floatDelta.candidates.forEach { c ->
+                floatDeltaArr.put(
+                    JSONObject()
+                        .put("heapIndex", c.heapIndex)
+                        .put("byteAddress", c.byteAddress)
+                        .put("hexByteAddress", formatHexAddress(c.byteAddress))
+                        .put("axisHint", c.axisHint)
+                        .put("baselineValue", c.baselineValue)
+                        .put("currentValue", c.currentValue)
+                        .put("delta", c.delta)
+                        .put("clusterSize", c.clusterSize)
+                        .put("isPinned", c.isPinned)
+                        .put("changeCount", c.changeCount)
+                )
+            }
+            root.put(
+                "wasmFloatDeltaScanner",
+                JSONObject()
+                    .put("heapSource", floatDelta.heapSourceLabel.ifBlank { "window.HEAPF32" })
+                    .put("baselineSampleCount", floatDelta.baselineSampleCount)
+                    .put("scanRound", floatDelta.scanRound)
+                    .put("totalDeltaMatches", floatDelta.totalDeltaMatches)
+                    .put("candidates", floatDeltaArr)
+            )
 
             return root.toString(2)
         }

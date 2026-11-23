@@ -78,6 +78,7 @@ import com.example.DiagnosticsUiState
 import com.example.LogCategory
 import com.example.PlayerCoordinates
 import com.example.R
+import com.example.Step2ScanMode
 import com.example.WizardStepBadge
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
@@ -131,6 +132,15 @@ fun TelemetryConsolePanel(
     onResetWasmTracker: () -> Unit,
     onExportWasmMemoryMap: () -> Unit,
     onShareWasmMemoryMap: () -> Unit,
+    onSelectStep2ScanMode: (Step2ScanMode) -> Unit,
+    onRunFloatBaseline: () -> Unit,
+    onRunFloatDeltaScan: () -> Unit,
+    onResetFloatDelta: () -> Unit,
+    onToggleFloatWatcherExpanded: () -> Unit,
+    onTogglePinFloatCandidate: (Int) -> Unit,
+    onPinTopFloatTriplet: () -> Unit,
+    onInspectFloatNeighbors: (Int) -> Unit,
+    onStopFloatWatch: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     if (state.isJsDrawerOpen) {
@@ -176,6 +186,10 @@ fun TelemetryConsolePanel(
                         onQueryManualPath = onQueryManualPath,
                         onRunStep2A = onRunStep2A,
                         onRunStep2B = onRunStep2B,
+                        onSelectStep2ScanMode = onSelectStep2ScanMode,
+                        onRunFloatBaseline = onRunFloatBaseline,
+                        onRunFloatDeltaScan = onRunFloatDeltaScan,
+                        onResetFloatDelta = onResetFloatDelta,
                         onRunStep3 = onRunStep3,
                         onExportReport = onExportReport,
                         onShareReport = onShareReport,
@@ -260,6 +274,19 @@ fun TelemetryConsolePanel(
                             .fillMaxWidth()
                     )
                 }
+            }
+
+            // Docked bottom Live Float Watcher & Pinning panel (streams top HEAPF32 X/Y/Z candidates)
+            if (state.wasmFloatDelta.candidates.isNotEmpty()) {
+                LiveFloatWatcherBottomBar(
+                    floatState = state.wasmFloatDelta,
+                    onToggleExpanded = onToggleFloatWatcherExpanded,
+                    onTogglePinCandidate = onTogglePinFloatCandidate,
+                    onPinTopTriplet = onPinTopFloatTriplet,
+                    onInspectNeighbors = onInspectFloatNeighbors,
+                    onStopWatch = onStopFloatWatch,
+                    onCopyText = onCopyPayload
+                )
             }
         }
     }
@@ -453,6 +480,22 @@ private fun ConsoleHeaderBar(
                     )
                 }
             }
+            if (state.wasmFloatDelta.isLiveWatching) {
+                Surface(
+                    color = SignalEmerald.copy(alpha = 0.16f),
+                    shape = RoundedCornerShape(4.dp),
+                    border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.55f))
+                ) {
+                    Text(
+                        text = "FLOAT 200ms",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = SignalEmerald,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                    )
+                }
+            }
             if (state.pinnedCandidateCount > 0) {
                 Surface(
                     color = AssetAmber.copy(alpha = 0.16f),
@@ -521,6 +564,10 @@ private fun GuidedFourStepWizard(
     onQueryManualPath: (String?) -> Unit,
     onRunStep2A: () -> Unit,
     onRunStep2B: () -> Unit,
+    onSelectStep2ScanMode: (Step2ScanMode) -> Unit,
+    onRunFloatBaseline: () -> Unit,
+    onRunFloatDeltaScan: () -> Unit,
+    onResetFloatDelta: () -> Unit,
     onRunStep3: () -> Unit,
     onExportReport: () -> Unit,
     onShareReport: () -> Unit,
@@ -599,51 +646,65 @@ private fun GuidedFourStepWizard(
                 }
             }
 
-            // STEP 2 — Lock On to Live Player Coordinates (200ms direct ref polling)
+            // STEP 2 — Lock On to Live Player Coordinates (WASM Float Heap Mode & JS Objects Mode)
             WizardStepCard(
                 title = stringResource(R.string.wizard_step_2_title),
                 badge = state.step2Badge,
                 accent = SignalEmerald
             ) {
-                StepActionButton(
-                    label = stringResource(R.string.step_2a_capture_baseline),
-                    icon = Icons.Default.TrackChanges,
-                    accent = SignalEmerald,
-                    enabled = true,
-                    filled = state.baselineCaptured,
-                    testTag = "step_2a_baseline_button",
-                    onClick = onRunStep2A
-                )
-                Text(
-                    text = stringResource(R.string.wizard_step_2a_instruction),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                Step2ModeSelectorRow(
+                    selectedMode = state.step2ScanMode,
+                    onSelectMode = onSelectStep2ScanMode
                 )
 
-                Spacer(Modifier.height(2.dp))
-
-                StepActionButton(
-                    label = stringResource(R.string.step_2b_compute_delta),
-                    icon = Icons.Default.Timeline,
-                    accent = SignalEmerald,
-                    enabled = true,
-                    filled = state.livePlayerCoords != null,
-                    testTag = "step_2b_delta_button",
-                    onClick = onRunStep2B
-                )
-                Text(
-                    text = stringResource(R.string.wizard_step_2b_instruction),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                state.livePlayerCoords?.let { coords ->
-                    LivePlayerCoordsReadout(
-                        coords = coords,
-                        propertyKeys = state.playerPropertyKeys,
-                        tickCount = state.livePollTickCount,
-                        isLive = state.livePollActive
+                if (state.step2ScanMode == Step2ScanMode.WASM_FLOAT_HEAP) {
+                    Step2FloatModeControls(
+                        floatState = state.wasmFloatDelta,
+                        onCaptureFloatBaseline = onRunFloatBaseline,
+                        onScanFloatDeltas = onRunFloatDeltaScan,
+                        onResetFloatDelta = onResetFloatDelta
                     )
+                } else {
+                    StepActionButton(
+                        label = stringResource(R.string.step_2a_capture_baseline),
+                        icon = Icons.Default.TrackChanges,
+                        accent = SignalEmerald,
+                        enabled = true,
+                        filled = state.baselineCaptured,
+                        testTag = "step_2a_baseline_button",
+                        onClick = onRunStep2A
+                    )
+                    Text(
+                        text = stringResource(R.string.wizard_step_2a_instruction),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Spacer(Modifier.height(2.dp))
+
+                    StepActionButton(
+                        label = stringResource(R.string.step_2b_compute_delta),
+                        icon = Icons.Default.Timeline,
+                        accent = SignalEmerald,
+                        enabled = true,
+                        filled = state.livePlayerCoords != null,
+                        testTag = "step_2b_delta_button",
+                        onClick = onRunStep2B
+                    )
+                    Text(
+                        text = stringResource(R.string.wizard_step_2b_instruction),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    state.livePlayerCoords?.let { coords ->
+                        LivePlayerCoordsReadout(
+                            coords = coords,
+                            propertyKeys = state.playerPropertyKeys,
+                            tickCount = state.livePollTickCount,
+                            isLive = state.livePollActive
+                        )
+                    }
                 }
             }
 

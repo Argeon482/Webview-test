@@ -64,6 +64,11 @@ enum class ConsoleTab {
     LOGS
 }
 
+enum class Step2ScanMode {
+    WASM_FLOAT_HEAP,
+    JS_OBJECTS
+}
+
 enum class AssetCaptureStatus(val label: String) {
     OBSERVED("Observed"),
     CACHING("Syncing"),
@@ -223,6 +228,39 @@ data class WasmHeapTrackerState(
 )
 
 @Immutable
+data class WasmFloatDeltaCandidate(
+    val heapIndex: Int,
+    val byteAddress: Long,
+    val baselineValue: Double,
+    val currentValue: Double,
+    val delta: Double,
+    val clusterSize: Int = 1,
+    val axisHint: String = "",
+    val isPinned: Boolean = false,
+    val changedFromPrev: Boolean = false,
+    val changeCount: Int = 0
+)
+
+@Immutable
+data class WasmFloatDeltaState(
+    val isSamplingBaseline: Boolean = false,
+    val isScanningDeltas: Boolean = false,
+    val baselineCaptured: Boolean = false,
+    val baselineSampleCount: Int = 0,
+    val baselinePrunedJitterCount: Int = 0,
+    val heapSourceLabel: String = "",
+    val heapByteLength: Long = 0L,
+    val totalDeltaMatches: Int = 0,
+    val scanRound: Int = 0,
+    val isLiveWatching: Boolean = false,
+    val liveWatchTickCount: Int = 0,
+    val candidates: List<WasmFloatDeltaCandidate> = emptyList(),
+    val pinnedIndices: Set<Int> = emptySet(),
+    val isWatcherExpanded: Boolean = true,
+    val statusMessage: String = ""
+)
+
+@Immutable
 data class DiagnosticsUiState(
     val urlInput: String = "",
     val activeUrl: String = "about:blank",
@@ -246,7 +284,8 @@ data class DiagnosticsUiState(
     val scopeBatchProgress: ScopeBatchProgress = ScopeBatchProgress(),
     val manualPropertyPathInput: String = "",
     val lastManualQuerySummary: String = "",
-    // Step 2 state + Live 200ms Reference Polling
+    // Step 2 state + Live 200ms Reference Polling (JS Objects & WASM Float Heap Mode)
+    val step2ScanMode: Step2ScanMode = Step2ScanMode.WASM_FLOAT_HEAP,
     val baselineCaptured: Boolean = false,
     val baselineMetricCount: Int = 0,
     val isolatedPaths: List<IsolatedCoordinatePath> = emptyList(),
@@ -255,6 +294,7 @@ data class DiagnosticsUiState(
     val livePlayerCoords: PlayerCoordinates? = null,
     val livePollActive: Boolean = false,
     val livePollTickCount: Int = 0,
+    val wasmFloatDelta: WasmFloatDeltaState = WasmFloatDeltaState(),
     // Step 3 state (Visual Entity Inspection Console)
     val discoveredEntityArrayPath: String? = null,
     val entityProjectionMode: String = "",
@@ -295,8 +335,11 @@ data class DiagnosticsUiState(
 
     val step2Badge: WizardStepBadge
         get() = when {
-            !discoveredPlayerPath.isNullOrBlank() && livePlayerCoords != null -> WizardStepBadge.CAPTURED
-            step1Completed || baselineCaptured -> WizardStepBadge.READY
+            (!discoveredPlayerPath.isNullOrBlank() && livePlayerCoords != null) ||
+                (wasmFloatDelta.candidates.isNotEmpty() && (wasmFloatDelta.isLiveWatching || wasmFloatDelta.pinnedIndices.isNotEmpty())) ->
+                WizardStepBadge.CAPTURED
+            step1Completed || baselineCaptured || wasmFloatDelta.baselineCaptured ->
+                WizardStepBadge.READY
             else -> WizardStepBadge.PENDING
         }
 

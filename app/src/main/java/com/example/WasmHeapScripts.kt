@@ -525,4 +525,636 @@ object WasmHeapScripts {
           } catch (_) {}
         })();
     """.trimIndent()
+
+    // ============================================================================================
+    // WebAssembly Float Heap Delta Scanner (Step 2A / 2B — Float Mode targeting window.HEAPF32)
+    // ============================================================================================
+
+    private const val FLOAT_DELTA_RUNTIME = """
+        const __fBridge = window.TelemetryBridge;
+        const __fd = (window.__wvWasmFloatDelta = window.__wvWasmFloatDelta || {
+          scanSeq: 0,
+          sourceLabel: '',
+          heapByteLength: 0,
+          snapIndices: null,
+          snapValues: null,
+          snapCount: 0,
+          candidateIndices: null,
+          candidateBaselines: null,
+          candidateClusters: null,
+          candidateCount: 0,
+          pinnedIndices: [],
+          watchedItems: [],
+          scanRound: 0,
+          pollId: null,
+          pollTick: 0
+        });
+
+        const __emitFloat = function(obj) {
+          try {
+            if (__fBridge && typeof __fBridge.logTelemetry === 'function') {
+              __fBridge.logTelemetry('WASM', JSON.stringify(obj));
+            }
+          } catch (_) {}
+        };
+
+        const __setFloatStatus = function(status, detail) {
+          try {
+            if (__fBridge && typeof __fBridge.updateScanStatus === 'function') {
+              __fBridge.updateScanStatus(String(status || 'IDLE'), String(detail || ''));
+            }
+          } catch (_) {}
+        };
+
+        const __yieldFloatSlice = function(ms) {
+          return new Promise(function(resolve) {
+            setTimeout(resolve, ms || 12);
+          });
+        };
+
+        const __resolveFloatHeap = function() {
+          const tryObj = function(obj, prefix) {
+            if (!obj || typeof obj !== 'object') return null;
+            try {
+              if (obj.HEAPF32 instanceof Float32Array && obj.HEAPF32.buffer && obj.HEAPF32.buffer.byteLength >= 4) {
+                return {
+                  heapF32: obj.HEAPF32,
+                  label: prefix + 'HEAPF32',
+                  byteLength: obj.HEAPF32.buffer.byteLength
+                };
+              }
+              const h32 = obj.HEAP32 || obj.HEAPU8 || obj.HEAP8;
+              if (h32 && ArrayBuffer.isView(h32) && h32.buffer && h32.buffer.byteLength >= 4) {
+                return {
+                  heapF32: new Float32Array(h32.buffer),
+                  label: prefix + 'HEAPF32 (buffer view)',
+                  byteLength: h32.buffer.byteLength
+                };
+              }
+              const mem = obj.wasmMemory || (obj.asm && obj.asm.memory) || (obj.wasmExports && obj.wasmExports.memory);
+              if (typeof WebAssembly !== 'undefined' && mem instanceof WebAssembly.Memory && mem.buffer && mem.buffer.byteLength >= 4) {
+                return {
+                  heapF32: new Float32Array(mem.buffer),
+                  label: prefix + 'wasmMemory Float32Array',
+                  byteLength: mem.buffer.byteLength
+                };
+              }
+            } catch (_) {}
+            return null;
+          };
+
+          const direct = tryObj(window, 'window.');
+          if (direct) return direct;
+          const mod = tryObj(window.Module, 'window.Module.');
+          if (mod) return mod;
+          const roots = ['unityInstance', 'game', 'app', 'engine', 'Game', 'App', 'Engine'];
+          for (let i = 0; i < roots.length; i++) {
+            try {
+              const r = window[roots[i]];
+              if (!r || typeof r !== 'object') continue;
+              const hit = tryObj(r, 'window.' + roots[i] + '.') || (r.Module ? tryObj(r.Module, 'window.' + roots[i] + '.Module.') : null);
+              if (hit) return hit;
+            } catch (_) {}
+          }
+          return null;
+        };
+
+        const __stopFloatWatch = function() {
+          try {
+            if (__fd.pollId !== null) {
+              clearInterval(__fd.pollId);
+              __fd.pollId = null;
+            }
+          } catch (_) {}
+        };
+
+        const __startFloatWatch = function() {
+          __stopFloatWatch();
+          __fd.pollTick = 0;
+
+          const pushWatchTick = function() {
+            try {
+              const resolved = __resolveFloatHeap();
+              if (!resolved) return;
+              const hf32 = resolved.heapF32;
+              const len = hf32.length;
+
+              const mergedMap = new Map();
+              const pinned = Array.isArray(__fd.pinnedIndices) ? __fd.pinnedIndices : [];
+              for (let i = 0; i < pinned.length; i++) {
+                const idx = pinned[i] | 0;
+                if (idx >= 0 && idx < len) {
+                  mergedMap.set(idx, {
+                    heapIndex: idx,
+                    baselineValue: hf32[idx],
+                    clusterSize: 1,
+                    axisHint: 'PIN',
+                    isPinned: true
+                  });
+                }
+              }
+
+              const watched = Array.isArray(__fd.watchedItems) ? __fd.watchedItems : [];
+              for (let i = 0; i < watched.length; i++) {
+                const item = watched[i];
+                const idx = item.heapIndex | 0;
+                if (idx < 0 || idx >= len) continue;
+                const existing = mergedMap.get(idx);
+                mergedMap.set(idx, {
+                  heapIndex: idx,
+                  baselineValue: item.baselineValue,
+                  clusterSize: item.clusterSize || 1,
+                  axisHint: item.axisHint || (existing ? existing.axisHint : ''),
+                  isPinned: existing ? true : false
+                });
+              }
+
+              if (mergedMap.size === 0) return;
+
+              __fd.pollTick++;
+              const out = [];
+              mergedMap.forEach(function(meta, idx) {
+                const rawVal = hf32[idx];
+                const cur = Number.isFinite(rawVal) ? Number(rawVal.toFixed(4)) : 0;
+                const base = Number.isFinite(meta.baselineValue) ? Number(meta.baselineValue.toFixed(4)) : cur;
+                const d = Number((cur - base).toFixed(4));
+                out.push({
+                  heapIndex: idx,
+                  byteAddress: idx * 4,
+                  baselineValue: base,
+                  currentValue: cur,
+                  delta: d,
+                  clusterSize: meta.clusterSize,
+                  axisHint: meta.axisHint,
+                  isPinned: meta.isPinned
+                });
+              });
+
+              const payload = {
+                stage: 'WASM_FLOAT_WATCH_TICK',
+                heapSourceLabel: resolved.label,
+                heapByteLength: resolved.byteLength,
+                tick: __fd.pollTick,
+                candidates: out
+              };
+              if (__fBridge && typeof __fBridge.updateWasmFloatCandidates === 'function') {
+                __fBridge.updateWasmFloatCandidates(JSON.stringify(payload));
+              }
+            } catch (_) {}
+          };
+
+          pushWatchTick();
+          __fd.pollId = setInterval(pushWatchTick, 200);
+        };
+    """
+
+    /**
+     * Step 2A (Float Mode): Non-blocking, memory-safe baseline snapshot of `window.HEAPF32`.
+     * Skips out-of-bounds and low immutable/guard regions, stores plausible coordinate-range
+     * floats in compact TypedArrays (`Int32Array` + `Float32Array`), and runs a short standing-still
+     * stability prune to automatically strip constantly ticking timers and frame clocks.
+     */
+    fun buildFloatBaselineSnapshotScript(): String = """
+        (async function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            const resolved = __resolveFloatHeap();
+            if (!resolved) {
+              __setFloatStatus('ERROR', 'window.HEAPF32 not found');
+              __emitFloat({
+                stage: 'WASM_FLOAT_ERROR',
+                message: 'Could not locate window.HEAPF32 (or Module.HEAPF32) on this page. Switch Step 2 to JS Objects mode if this page does not use WebAssembly.'
+              });
+              return;
+            }
+
+            __stopFloatWatch();
+            const mySeq = ++__fd.scanSeq;
+            const startMs = performance.now();
+            const hf32 = resolved.heapF32;
+            const len = hf32.length;
+
+            // Skip low guard / immutable static data region while staying safe for small test heaps
+            const START_INDEX = len > 4096 ? 256 : 0;
+            const CHUNK_FLOATS = 262144; // 1 MB per async yield slice
+            const MAX_SNAPSHOT = 1500000; // ~12 MB cap (Int32Array + Float32Array) for memory safety
+            const MIN_ABS = 0.0001;
+            const MAX_ABS = 500000.0;
+
+            const idxChunks = [];
+            const valChunks = [];
+            const chunkLengths = [];
+            let totalCaptured = 0;
+
+            __setFloatStatus('RUNNING', 'Float Baseline: sampling ' + resolved.label + ' (0%)…');
+
+            let lastPct = -1;
+            for (let base = START_INDEX; base < len && totalCaptured < MAX_SNAPSHOT; base += CHUNK_FLOATS) {
+              if (mySeq !== __fd.scanSeq) return;
+              const end = Math.min(base + CHUNK_FLOATS, len);
+              const remainingCap = MAX_SNAPSHOT - totalCaptured;
+              const tempIdx = new Int32Array(Math.min(end - base, remainingCap));
+              const tempVal = new Float32Array(tempIdx.length);
+              let count = 0;
+
+              for (let i = base; i < end && count < tempIdx.length; i++) {
+                const v = hf32[i];
+                if (v === v && v !== 0) {
+                  const av = v < 0 ? -v : v;
+                  if (av >= MIN_ABS && av <= MAX_ABS) {
+                    tempIdx[count] = i;
+                    tempVal[count] = v;
+                    count++;
+                  }
+                }
+              }
+
+              if (count > 0) {
+                idxChunks.push(tempIdx.subarray(0, count));
+                valChunks.push(tempVal.subarray(0, count));
+                chunkLengths.push(count);
+                totalCaptured += count;
+              }
+
+              const pct = Math.min(85, Math.floor(((end - START_INDEX) / Math.max(1, len - START_INDEX)) * 85));
+              if (pct >= lastPct + 15) {
+                lastPct = pct;
+                __setFloatStatus('RUNNING', 'Float Baseline ' + pct + '% (' + totalCaptured + ' floats)…');
+              }
+
+              if (end < len && totalCaptured < MAX_SNAPSHOT) {
+                await __yieldFloatSlice(12);
+              }
+            }
+
+            if (mySeq !== __fd.scanSeq) return;
+
+            // Standing-still stability pass (120 ms): prune continuously ticking timers/clocks
+            __setFloatStatus('RUNNING', 'Float Baseline: pruning standing jitter…');
+            await __yieldFloatSlice(120);
+            if (mySeq !== __fd.scanSeq) return;
+
+            const refreshed = __resolveFloatHeap();
+            const liveHf32 = refreshed ? refreshed.heapF32 : hf32;
+            const liveLen = liveHf32.length;
+
+            const stableIndices = new Int32Array(totalCaptured);
+            const stableValues = new Float32Array(totalCaptured);
+            let stableCount = 0;
+            let prunedJitter = 0;
+
+            for (let c = 0; c < idxChunks.length; c++) {
+              if (mySeq !== __fd.scanSeq) return;
+              const cIdx = idxChunks[c];
+              const cVal = valChunks[c];
+              const cLen = chunkLengths[c];
+              for (let j = 0; j < cLen; j++) {
+                const heapIdx = cIdx[j];
+                const baseV = cVal[j];
+                if (heapIdx >= 0 && heapIdx < liveLen) {
+                  const nowV = liveHf32[heapIdx];
+                  if (nowV === baseV || (Number.isFinite(nowV) && Math.abs(nowV - baseV) < 0.0005)) {
+                    stableIndices[stableCount] = heapIdx;
+                    stableValues[stableCount] = baseV;
+                    stableCount++;
+                  } else {
+                    prunedJitter++;
+                  }
+                }
+              }
+              if (c % 2 === 1 && c + 1 < idxChunks.length) {
+                await __yieldFloatSlice(8);
+              }
+            }
+
+            if (mySeq !== __fd.scanSeq) return;
+
+            __fd.sourceLabel = (refreshed ? refreshed.label : resolved.label);
+            __fd.heapByteLength = (refreshed ? refreshed.byteLength : resolved.byteLength);
+            __fd.snapIndices = stableIndices.subarray(0, stableCount);
+            __fd.snapValues = stableValues.subarray(0, stableCount);
+            __fd.snapCount = stableCount;
+            __fd.candidateIndices = null;
+            __fd.candidateBaselines = null;
+            __fd.candidateClusters = null;
+            __fd.candidateCount = 0;
+            __fd.watchedItems = [];
+            __fd.scanRound = 0;
+
+            const durationMs = Number((performance.now() - startMs).toFixed(1));
+            __setFloatStatus('COMPLETED', 'Float Baseline: ' + stableCount + ' stable floats (' + durationMs + 'ms)');
+            __emitFloat({
+              stage: 'WASM_FLOAT_BASELINE_CAPTURED',
+              durationMs: durationMs,
+              heapSourceLabel: __fd.sourceLabel,
+              heapByteLength: __fd.heapByteLength,
+              totalHeapFloats: len,
+              sampledCount: stableCount,
+              prunedJitterCount: prunedJitter,
+              capped: totalCaptured >= MAX_SNAPSHOT
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.updateScanStatus('ERROR', 'Float baseline failed');
+                window.TelemetryBridge.logTelemetry('ERR', 'WASM Float Baseline error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+    """.trimIndent()
+
+    /**
+     * Step 2B (Float Mode): Non-blocking movement delta scanner comparing live `window.HEAPF32`
+     * against the stored standing baseline snapshot to isolate positional coordinate floats
+     * (`minDelta <= |delta| <= maxDelta`) and automatically stream top X/Y/Z candidates at 200 ms.
+     */
+    fun buildFloatDeltaScanScript(
+        minDelta: Double = 0.05,
+        maxDelta: Double = 250.0
+    ): String {
+        val minLit = if (minDelta.isFinite() && minDelta > 0.0) minDelta.toString() else "0.05"
+        val maxLit = if (maxDelta.isFinite() && maxDelta > minDelta) maxDelta.toString() else "250.0"
+        return """
+        (async function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            if (!__fd.snapIndices || !__fd.snapValues || __fd.snapCount <= 0) {
+              __setFloatStatus('IDLE', 'Capture Float Baseline first');
+              __emitFloat({
+                stage: 'WASM_FLOAT_ERROR',
+                message: 'Stand still and tap 2A. Capture Float Baseline before scanning for movement deltas.'
+              });
+              return;
+            }
+
+            const resolved = __resolveFloatHeap();
+            if (!resolved) {
+              __setFloatStatus('ERROR', 'window.HEAPF32 unavailable');
+              __emitFloat({
+                stage: 'WASM_FLOAT_ERROR',
+                message: 'window.HEAPF32 is no longer accessible on this page.'
+              });
+              return;
+            }
+
+            const mySeq = ++__fd.scanSeq;
+            const startMs = performance.now();
+            const hf32 = resolved.heapF32;
+            const len = hf32.length;
+            const MIN_DELTA = Number($minLit);
+            const MAX_DELTA = Number($maxLit);
+            const MAX_ABS = 500000.0;
+            const CHUNK_CHECK = 262144;
+            const MAX_CANDIDATES = 60000;
+
+            // On round 1 scan the full baseline; on subsequent rounds refine the surviving candidate set
+            const useRefinement = (__fd.scanRound > 0 && __fd.candidateIndices && __fd.candidateCount > 0 && __fd.candidateCount < __fd.snapCount);
+            const srcIndices = useRefinement ? __fd.candidateIndices : __fd.snapIndices;
+            const srcBaselines = useRefinement ? __fd.candidateBaselines : __fd.snapValues;
+            const srcLen = useRefinement ? __fd.candidateCount : __fd.snapCount;
+
+            const hitIndices = [];
+            const hitBaselines = [];
+            const hitCurrents = [];
+            const hitDeltas = [];
+            let totalMatches = 0;
+
+            __setFloatStatus('RUNNING', 'Scanning HEAPF32 movement deltas…');
+
+            for (let base = 0; base < srcLen; base += CHUNK_CHECK) {
+              if (mySeq !== __fd.scanSeq) return;
+              const end = Math.min(base + CHUNK_CHECK, srcLen);
+              for (let j = base; j < end; j++) {
+                const idx = srcIndices[j];
+                if (idx < 0 || idx >= len) continue;
+                const cur = hf32[idx];
+                if (!Number.isFinite(cur)) continue;
+                const absCur = cur < 0 ? -cur : cur;
+                if (absCur > MAX_ABS) continue;
+                const prev = srcBaselines[j];
+                const diff = cur - prev;
+                const absDiff = diff < 0 ? -diff : diff;
+                if (absDiff >= MIN_DELTA && absDiff <= MAX_DELTA) {
+                  totalMatches++;
+                  if (hitIndices.length < MAX_CANDIDATES) {
+                    hitIndices.push(idx);
+                    hitBaselines.push(prev);
+                    hitCurrents.push(cur);
+                    hitDeltas.push(diff);
+                  }
+                }
+              }
+              if (end < srcLen) {
+                await __yieldFloatSlice(10);
+              }
+            }
+
+            if (mySeq !== __fd.scanSeq) return;
+
+            // Positional cluster scoring: coordinates usually sit at consecutive ±1..±2 float slots (X, Y, Z)
+            const hitIndexSet = new Set();
+            for (let i = 0; i < hitIndices.length; i++) {
+              hitIndexSet.add(hitIndices[i]);
+            }
+
+            const ranked = [];
+            for (let i = 0; i < hitIndices.length; i++) {
+              const idx = hitIndices[i];
+              let neighborsMoving = 1;
+              if (hitIndexSet.has(idx - 1)) neighborsMoving++;
+              if (hitIndexSet.has(idx + 1)) neighborsMoving++;
+              if (hitIndexSet.has(idx - 2)) neighborsMoving++;
+              if (hitIndexSet.has(idx + 2)) neighborsMoving++;
+
+              // Favor contiguous 2D/3D coordinate triplets and moderate world-scale values
+              const absCur = Math.abs(hitCurrents[i]);
+              const scaleBonus = (absCur >= 0.5 && absCur <= 50000) ? 1.5 : 0.2;
+              const score = (neighborsMoving * 10) + scaleBonus;
+              ranked.push({
+                heapIndex: idx,
+                byteAddress: idx * 4,
+                baselineValue: Number(hitBaselines[i].toFixed(4)),
+                currentValue: Number(hitCurrents[i].toFixed(4)),
+                delta: Number(hitDeltas[i].toFixed(4)),
+                clusterSize: neighborsMoving,
+                score: score,
+                axisHint: ''
+              });
+            }
+
+            ranked.sort(function(a, b) {
+              if (b.score !== a.score) return b.score - a.score;
+              return a.heapIndex - b.heapIndex;
+            });
+
+            // Build top watched list (up to 12 offsets), auto-expanding a best Vec3 cluster (X, Y, Z)
+            const topWatched = [];
+            const addedSet = new Set();
+            if (ranked.length > 0) {
+              const anchor = ranked[0];
+              // Check if anchor sits in a contiguous Vec3 cluster (e.g. X, Y, Z where Y may be flat elevation)
+              const startIdx = hitIndexSet.has(anchor.heapIndex - 2)
+                ? anchor.heapIndex - 2
+                : (hitIndexSet.has(anchor.heapIndex - 1) ? anchor.heapIndex - 1 : anchor.heapIndex);
+              const axisLabels = ['X', 'Y', 'Z'];
+              for (let k = 0; k < 3; k++) {
+                const slotIdx = startIdx + k;
+                if (slotIdx < 0 || slotIdx >= len) continue;
+                const fv = hf32[slotIdx];
+                if (!Number.isFinite(fv) || Math.abs(fv) > MAX_ABS) continue;
+                let existingHit = null;
+                for (let r = 0; r < Math.min(ranked.length, 400); r++) {
+                  if (ranked[r].heapIndex === slotIdx) {
+                    existingHit = ranked[r];
+                    break;
+                  }
+                }
+                const slotEntry = existingHit ? {
+                  heapIndex: existingHit.heapIndex,
+                  byteAddress: existingHit.byteAddress,
+                  baselineValue: existingHit.baselineValue,
+                  currentValue: existingHit.currentValue,
+                  delta: existingHit.delta,
+                  clusterSize: existingHit.clusterSize,
+                  axisHint: axisLabels[k]
+                } : {
+                  heapIndex: slotIdx,
+                  byteAddress: slotIdx * 4,
+                  baselineValue: Number(fv.toFixed(4)),
+                  currentValue: Number(fv.toFixed(4)),
+                  delta: 0,
+                  clusterSize: anchor.clusterSize,
+                  axisHint: axisLabels[k]
+                };
+                topWatched.push(slotEntry);
+                addedSet.add(slotIdx);
+              }
+            }
+
+            for (let i = 0; i < ranked.length && topWatched.length < 12; i++) {
+              const item = ranked[i];
+              if (addedSet.has(item.heapIndex)) continue;
+              addedSet.add(item.heapIndex);
+              topWatched.push({
+                heapIndex: item.heapIndex,
+                byteAddress: item.byteAddress,
+                baselineValue: item.baselineValue,
+                currentValue: item.currentValue,
+                delta: item.delta,
+                clusterSize: item.clusterSize,
+                axisHint: ''
+              });
+            }
+
+            // Persist narrowed TypedArrays with updated baselines for iterative multi-step refinement
+            const nextCount = hitIndices.length;
+            const nextIdxArr = new Int32Array(nextCount);
+            const nextBaseArr = new Float32Array(nextCount);
+            for (let i = 0; i < nextCount; i++) {
+              nextIdxArr[i] = hitIndices[i];
+              nextBaseArr[i] = hitCurrents[i];
+            }
+
+            __fd.sourceLabel = resolved.label;
+            __fd.heapByteLength = resolved.byteLength;
+            __fd.candidateIndices = nextIdxArr;
+            __fd.candidateBaselines = nextBaseArr;
+            __fd.candidateCount = nextCount;
+            __fd.watchedItems = topWatched;
+            __fd.scanRound = (__fd.scanRound || 0) + 1;
+
+            if (topWatched.length > 0) {
+              __startFloatWatch();
+            } else {
+              __stopFloatWatch();
+            }
+
+            const durationMs = Number((performance.now() - startMs).toFixed(1));
+            __setFloatStatus(
+              totalMatches > 0 ? 'COMPLETED' : 'IDLE',
+              totalMatches > 0
+                ? ('Float Deltas #' + __fd.scanRound + ': ' + totalMatches + ' matches • Watching top ' + topWatched.length)
+                : ('Float Deltas #' + __fd.scanRound + ': 0 matches — walk & retry')
+            );
+            __emitFloat({
+              stage: 'WASM_FLOAT_DELTA_SCANNED',
+              durationMs: durationMs,
+              heapSourceLabel: resolved.label,
+              heapByteLength: resolved.byteLength,
+              scanRound: __fd.scanRound,
+              comparedCount: srcLen,
+              totalMatches: totalMatches,
+              minDelta: MIN_DELTA,
+              maxDelta: MAX_DELTA,
+              candidates: topWatched
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.updateScanStatus('ERROR', 'Float delta scan failed');
+                window.TelemetryBridge.logTelemetry('ERR', 'WASM Float Delta Scan error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+        """.trimIndent()
+    }
+
+    /**
+     * Synchronizes pinned `HEAPF32` indices into the live 200 ms watcher so pinned coordinates
+     * remain visible even across subsequent delta refinement rounds.
+     */
+    fun buildSyncPinnedFloatsScript(pinnedIndices: Collection<Int>): String {
+        val arrLiteral = pinnedIndices.distinct().filter { it >= 0 }.take(24).joinToString(",")
+        return """
+        (function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            __fd.pinnedIndices = [$arrLiteral];
+            if ((__fd.pinnedIndices.length > 0 || (__fd.watchedItems && __fd.watchedItems.length > 0)) && __fd.pollId === null) {
+              __startFloatWatch();
+            }
+          } catch (_) {}
+        })();
+        """.trimIndent()
+    }
+
+    /**
+     * Stops the 200 ms Live Float Watcher interval cleanly.
+     */
+    fun buildStopFloatWatchScript(): String = """
+        (function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            __stopFloatWatch();
+            __setFloatStatus('IDLE', 'Live Float Watcher stopped');
+          } catch (_) {}
+        })();
+    """.trimIndent()
+
+    /**
+     * Releases the stored `HEAPF32` TypedArray baseline snapshot and stops live watching.
+     */
+    fun buildResetFloatDeltaScript(): String = """
+        (function() {
+          try {
+            $FLOAT_DELTA_RUNTIME
+            __fd.scanSeq++;
+            __stopFloatWatch();
+            __fd.snapIndices = null;
+            __fd.snapValues = null;
+            __fd.snapCount = 0;
+            __fd.candidateIndices = null;
+            __fd.candidateBaselines = null;
+            __fd.candidateClusters = null;
+            __fd.candidateCount = 0;
+            __fd.pinnedIndices = [];
+            __fd.watchedItems = [];
+            __fd.scanRound = 0;
+            __fd.pollTick = 0;
+            __setFloatStatus('IDLE', 'Float Heap Delta Scanner reset');
+          } catch (_) {}
+        })();
+    """.trimIndent()
 }

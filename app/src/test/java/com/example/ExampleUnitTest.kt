@@ -82,4 +82,42 @@ class ExampleUnitTest {
     vm.onWasmTargetValueChanged("HP: 4338.5abc")
     assertEquals("4338.5", vm.uiState.value.wasmHeap.targetValueInput)
   }
+
+  @Test
+  fun wasmFloatHeapDeltaScriptsAreNonBlockingMemorySafeAndReadOnly() {
+    val baselineScript = WasmHeapScripts.buildFloatBaselineSnapshotScript()
+    val deltaScript = WasmHeapScripts.buildFloatDeltaScanScript(minDelta = 0.05, maxDelta = 250.0)
+    val pinScript = WasmHeapScripts.buildSyncPinnedFloatsScript(listOf(4096, 4097, 4098))
+    val stopScript = WasmHeapScripts.buildStopFloatWatchScript()
+    val resetScript = WasmHeapScripts.buildResetFloatDeltaScript()
+
+    // Step 2A: non-blocking HEAPF32 baseline snapshot using bounded TypedArrays & standing jitter prune
+    assertTrue(baselineScript.contains("(async function()"))
+    assertTrue(baselineScript.contains("obj.HEAPF32"))
+    assertTrue(baselineScript.contains("new Int32Array("))
+    assertTrue(baselineScript.contains("new Float32Array("))
+    assertTrue(baselineScript.contains("const START_INDEX = len > 4096 ? 256 : 0;"))
+    assertTrue(baselineScript.contains("const MAX_SNAPSHOT = 1500000;"))
+    assertTrue(baselineScript.contains("await __yieldFloatSlice(12)"))
+    assertTrue(baselineScript.contains("WASM_FLOAT_BASELINE_CAPTURED"))
+
+    // Step 2B: movement delta range, positional Vec3 clustering, and 200ms Live Float Watcher
+    assertTrue(deltaScript.contains("(async function()"))
+    assertTrue(deltaScript.contains("absDiff >= MIN_DELTA && absDiff <= MAX_DELTA"))
+    assertTrue(deltaScript.contains("WASM_FLOAT_DELTA_SCANNED"))
+    assertTrue(deltaScript.contains("updateWasmFloatCandidates"))
+    assertTrue(deltaScript.contains("setInterval(pushWatchTick, 200)"))
+    assertTrue(deltaScript.contains("['X', 'Y', 'Z']"))
+
+    // Pin sync, stop, and reset
+    assertTrue(pinScript.contains("__fd.pinnedIndices = [4096,4097,4098]"))
+    assertTrue(stopScript.contains("__stopFloatWatch()"))
+    assertTrue(resetScript.contains("__fd.snapIndices = null"))
+
+    // Strictly read-only on HEAPF32
+    val floatHeapWriteRegex = Regex("""(hf32|liveHf32|HEAPF32)\[[^\]]+]\s*=(?!=)""")
+    assertFalse(floatHeapWriteRegex.containsMatchIn(baselineScript))
+    assertFalse(floatHeapWriteRegex.containsMatchIn(deltaScript))
+    assertFalse(floatHeapWriteRegex.containsMatchIn(pinScript))
+  }
 }

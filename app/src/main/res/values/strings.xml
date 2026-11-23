@@ -92,4 +92,16 @@
     <string name="wasm_neighbors_title">Neighboring Memory Inspector (±4 to ±16 Bytes)</string>
     <string name="wasm_neighbors_hint">Walk or move in-game — adjacent floats that highlight in green reveal live player coordinates.</string>
     <string name="cd_export_wasm_map">Export isolated WASM memory map as JSON</string>
+
+    <!-- WASM Float Heap Delta Scanner (Step 2A/2B Float Mode) -->
+    <string name="step2_mode_wasm_float">WASM Float Heap</string>
+    <string name="step2_mode_js">JS Objects</string>
+    <string name="step_2a_float_baseline">2A. Capture Float Baseline</string>
+    <string name="step_2b_scan_float_deltas">Scan Float Heap Deltas</string>
+    <string name="wizard_step_2_float_instruction">Stand still, tap Baseline, walk 5 steps forward in-game, then tap Scan Float Deltas.</string>
+    <string name="wasm_float_watcher_title">Live Float Watcher (HEAPF32)</string>
+    <string name="wasm_float_pin_top">Pin X/Y/Z</string>
+    <string name="wasm_float_stop_watch">Stop</string>
+    <string name="cd_pin_float_candidate">Pin float offset to Staging</string>
+    <string name="cd_inspect_float_neighbors">Inspect ±16B neighbors around this float</string>
 </resources>

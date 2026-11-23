@@ -128,6 +128,9 @@ fun DiagnosticsScreen(
             },
             onWasmNeighborsUpdated = { jsonPayload ->
                 viewModel.onWasmNeighborsUpdatedFromBridge(jsonPayload)
+            },
+            onWasmFloatCandidatesUpdated = { jsonPayload ->
+                viewModel.onWasmFloatCandidatesUpdatedFromBridge(jsonPayload)
             }
         )
     }
@@ -291,6 +294,15 @@ fun DiagnosticsScreen(
                         onResetWasmTracker = viewModel::onResetWasmHeapTracker,
                         onExportWasmMemoryMap = { viewModel.exportWasmMemoryMapJson(context) },
                         onShareWasmMemoryMap = viewModel::onShareLastWasmMemoryMap,
+                        onSelectStep2ScanMode = viewModel::onSelectStep2ScanMode,
+                        onRunFloatBaseline = viewModel::runWasmFloatBaselineSnapshot,
+                        onRunFloatDeltaScan = viewModel::runWasmFloatDeltaScan,
+                        onResetFloatDelta = viewModel::onResetWasmFloatDelta,
+                        onToggleFloatWatcherExpanded = viewModel::onToggleFloatWatcherExpanded,
+                        onTogglePinFloatCandidate = viewModel::onTogglePinWasmFloatCandidate,
+                        onPinTopFloatTriplet = viewModel::onPinTopWasmFloatTriplet,
+                        onInspectFloatNeighbors = viewModel::onInspectWasmFloatNeighbors,
+                        onStopFloatWatch = viewModel::onStopWasmFloatWatch,
                         modifier = Modifier
                             .weight(if (state.isConsoleExpanded) 0.58f else 0.40f)
                             .fillMaxHeight()
@@ -372,6 +384,15 @@ fun DiagnosticsScreen(
                         onResetWasmTracker = viewModel::onResetWasmHeapTracker,
                         onExportWasmMemoryMap = { viewModel.exportWasmMemoryMapJson(context) },
                         onShareWasmMemoryMap = viewModel::onShareLastWasmMemoryMap,
+                        onSelectStep2ScanMode = viewModel::onSelectStep2ScanMode,
+                        onRunFloatBaseline = viewModel::runWasmFloatBaselineSnapshot,
+                        onRunFloatDeltaScan = viewModel::runWasmFloatDeltaScan,
+                        onResetFloatDelta = viewModel::onResetWasmFloatDelta,
+                        onToggleFloatWatcherExpanded = viewModel::onToggleFloatWatcherExpanded,
+                        onTogglePinFloatCandidate = viewModel::onTogglePinWasmFloatCandidate,
+                        onPinTopFloatTriplet = viewModel::onPinTopWasmFloatTriplet,
+                        onInspectFloatNeighbors = viewModel::onInspectWasmFloatNeighbors,
+                        onStopFloatWatch = viewModel::onStopWasmFloatWatch,
                         modifier = Modifier
                             .weight(if (state.isConsoleExpanded) 0.66f else 0.42f)
                             .fillMaxWidth()

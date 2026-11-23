@@ -398,4 +398,53 @@ class ExampleRobolectricTest {
         assertTrue(mapJson.contains("\"isDynamicCoordinateCandidate\": true"))
         assertTrue(mapJson.contains("256.25"))
     }
+
+    @Test
+    fun `telemetry bridge and viewmodel track wasm float heap baseline movement deltas live watch and pinning`() {
+        val ticks = mutableListOf<String>()
+        val bridge = TelemetryBridge(
+            onTelemetryReceived = { _, _ -> },
+            onReportPayloadReceived = {},
+            onWasmFloatCandidatesUpdated = { ticks.add(it) }
+        )
+
+        bridge.updateWasmFloatCandidates("""{"stage":"WASM_FLOAT_WATCH_TICK","tick":1,"candidates":[]}""")
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(1, ticks.size)
+
+        val vm = DiagnosticsViewModel()
+        assertEquals(Step2ScanMode.WASM_FLOAT_HEAP, vm.uiState.value.step2ScanMode)
+
+        // 1. Baseline captured
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_FLOAT_BASELINE_CAPTURED","durationMs":18.5,"heapSourceLabel":"window.HEAPF32","heapByteLength":67108864,"sampledCount":24000,"prunedJitterCount":115}"""
+        )
+        assertTrue(vm.uiState.value.wasmFloatDelta.baselineCaptured)
+        assertEquals(24000, vm.uiState.value.wasmFloatDelta.baselineSampleCount)
+        assertEquals(WizardStepBadge.READY, vm.uiState.value.step2Badge)
+
+        // 2. Movement delta scan isolates X/Y/Z cluster
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_FLOAT_DELTA_SCANNED","durationMs":3.2,"heapSourceLabel":"window.HEAPF32","heapByteLength":67108864,"scanRound":1,"totalMatches":9,"candidates":[{"heapIndex":5000,"byteAddress":20000,"baselineValue":100.0,"currentValue":105.5,"delta":5.5,"clusterSize":3,"axisHint":"X"},{"heapIndex":5001,"byteAddress":20004,"baselineValue":10.0,"currentValue":10.0,"delta":0.0,"clusterSize":3,"axisHint":"Y"},{"heapIndex":5002,"byteAddress":20008,"baselineValue":-20.0,"currentValue":-16.25,"delta":3.75,"clusterSize":3,"axisHint":"Z"}]}"""
+        )
+        assertTrue(vm.uiState.value.wasmFloatDelta.isLiveWatching)
+        assertEquals(3, vm.uiState.value.wasmFloatDelta.candidates.size)
+        assertEquals(WizardStepBadge.CAPTURED, vm.uiState.value.step2Badge)
+
+        // 3. Live watch tick updates X coordinate and increments changeCount
+        vm.onWasmFloatCandidatesUpdatedFromBridge(
+            """{"stage":"WASM_FLOAT_WATCH_TICK","heapSourceLabel":"window.HEAPF32","heapByteLength":67108864,"tick":2,"candidates":[{"heapIndex":5000,"byteAddress":20000,"baselineValue":100.0,"currentValue":108.25,"delta":8.25,"clusterSize":3,"axisHint":"X","isPinned":false}]}"""
+        )
+        val xCand = vm.uiState.value.wasmFloatDelta.candidates.first { it.heapIndex == 5000 }
+        assertTrue(xCand.changedFromPrev)
+        assertEquals(1, xCand.changeCount)
+        assertEquals(108.25, xCand.currentValue, 0.001)
+
+        // 4. Pinning X candidate adds it to pinnedIndices and pins in Staging buffer
+        vm.onTogglePinWasmFloatCandidate(5000)
+        assertTrue(vm.uiState.value.wasmFloatDelta.pinnedIndices.contains(5000))
+        assertTrue(vm.uiState.value.stagingBuffer.any { it.path == "window.HEAPF32[5000]" && it.isPinned })
+    }
 }

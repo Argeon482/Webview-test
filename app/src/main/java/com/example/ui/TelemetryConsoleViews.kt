@@ -9,28 +9,41 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.BookmarkBorder
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
-import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.MyLocation
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Radar
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Terminal
-import androidx.compose.material.icons.outlined.PushPin
+import androidx.compose.material.icons.filled.ViewInAr
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -48,10 +61,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.CandidateStagingItem
 import com.example.DiagnosticsUiState
+import com.example.DiagnosticsViewModel
+import com.example.DiscoveredEntitySample
 import com.example.LogCategory
-import com.example.NearbyEntityStruct
 import com.example.R
+import com.example.ScopeBatchProgress
 import com.example.TelemetryLogEntry
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.AssetAmber
@@ -66,40 +82,461 @@ import com.example.ui.theme.TelemetryViolet
 import java.util.Locale
 
 /**
- * Entities Tab: displays repeating `(X, Y, Z)` float triplets discovered within ±50,000 indices
- * of the player's `window.HEAPF32` base index.
+ * Live progress banner for Step 1's non-blocking 100-item batched global variable scan,
+ * with inline Pause / Resume controls.
  */
 @Composable
-fun NearbyEntitiesTabView(
+fun BatchScanProgressBanner(
+    progress: ScopeBatchProgress,
+    onPause: () -> Unit,
+    onResume: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val accent = if (progress.isPaused) AssetAmber else ElectricCyan
+    Surface(
+        color = accent.copy(alpha = 0.12f),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.55f)),
+        modifier = modifier.testTag("batch_scan_progress_banner")
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text(
+                    text = progress.statusText.ifBlank { "Scanning batch ${progress.currentBatch}/${progress.totalBatches}…" },
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontWeight = FontWeight.Bold,
+                    color = accent,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+
+                Surface(
+                    onClick = if (progress.isPaused) onResume else onPause,
+                    shape = RoundedCornerShape(6.dp),
+                    color = ObsidianBg,
+                    border = BorderStroke(1.dp, accent.copy(alpha = 0.7f)),
+                    modifier = Modifier
+                        .heightIn(min = 36.dp)
+                        .testTag(if (progress.isPaused) "resume_batch_scan_button" else "pause_batch_scan_button")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (progress.isPaused) Icons.Default.PlayArrow else Icons.Default.Pause,
+                            contentDescription = null,
+                            tint = accent,
+                            modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = stringResource(
+                                if (progress.isPaused) R.string.action_resume_scan else R.string.action_pause_scan
+                            ),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = accent
+                        )
+                    }
+                }
+            }
+
+            LinearProgressIndicator(
+                progress = { progress.fraction },
+                color = accent,
+                trackColor = ObsidianBg,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(4.dp)
+                    .clip(RoundedCornerShape(2.dp))
+            )
+        }
+    }
+}
+
+/**
+ * Staging Tab: persistent multi-scan candidate accumulation drawer with keyword search,
+ * Pinned-Only filter, one-tap bookmarking, live 200ms tracking lock, and tap-to-copy.
+ */
+@Composable
+fun StagingBufferView(
     state: DiagnosticsUiState,
-    onTogglePinEntity: (Int) -> Unit,
-    onCopyEntity: (String) -> Unit,
+    onTogglePin: (String) -> Unit,
+    onTogglePinnedOnly: () -> Unit,
+    onSearchQueryChanged: (String) -> Unit,
+    onClearUnpinned: () -> Unit,
+    onTrackLive: (String) -> Unit,
+    onPauseBatchScan: () -> Unit,
+    onResumeBatchScan: () -> Unit,
+    onCopyPath: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val filteredItems = remember(state.stagingBuffer, state.showPinnedOnly, state.stagingSearchQuery) {
+        DiagnosticsViewModel.filterStagingBuffer(
+            items = state.stagingBuffer,
+            showPinnedOnly = state.showPinnedOnly,
+            rawQuery = state.stagingSearchQuery
+        )
+    }
+
+    Column(modifier = modifier.background(ObsidianBg)) {
+        // Search & Filter Toolbar
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(ObsidianSurface)
+                .padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            if (state.scopeBatchProgress.isActive || state.scopeBatchProgress.isPaused) {
+                BatchScanProgressBanner(
+                    progress = state.scopeBatchProgress,
+                    onPause = onPauseBatchScan,
+                    onResume = onResumeBatchScan,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+
+            OutlinedTextField(
+                value = state.stagingSearchQuery,
+                onValueChange = onSearchQueryChanged,
+                singleLine = true,
+                placeholder = {
+                    Text(
+                        text = stringResource(R.string.staging_search_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                },
+                leadingIcon = {
+                    Icon(
+                        imageVector = Icons.Default.Search,
+                        contentDescription = null,
+                        tint = AssetAmber,
+                        modifier = Modifier.size(16.dp)
+                    )
+                },
+                trailingIcon = {
+                    if (state.stagingSearchQuery.isNotEmpty()) {
+                        IconButton(
+                            onClick = { onSearchQueryChanged("") },
+                            modifier = Modifier.testTag("clear_staging_search_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Close,
+                                contentDescription = stringResource(R.string.cd_clear_search),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                },
+                textStyle = MaterialTheme.typography.bodySmall.copy(
+                    fontFamily = JetBrainsMonoFontFamily,
+                    color = MaterialTheme.colorScheme.onSurface
+                ),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = AssetAmber,
+                    unfocusedBorderColor = ObsidianBorder,
+                    focusedContainerColor = ObsidianBg,
+                    unfocusedContainerColor = ObsidianBg
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("staging_search_input")
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Text(
+                    text = "${filteredItems.size}/${state.stagingBuffer.size} staged • ${state.pinnedCandidateCount} pinned",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+
+                Surface(
+                    onClick = onTogglePinnedOnly,
+                    shape = RoundedCornerShape(6.dp),
+                    color = if (state.showPinnedOnly) AssetAmber.copy(alpha = 0.22f) else ObsidianBg,
+                    border = BorderStroke(1.dp, if (state.showPinnedOnly) AssetAmber else ObsidianBorder),
+                    modifier = Modifier.testTag("staging_pinned_only_toggle")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Bookmark,
+                            contentDescription = null,
+                            tint = if (state.showPinnedOnly) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(13.dp)
+                        )
+                        Text(
+                            text = "Pinned Only",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = if (state.showPinnedOnly) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                if (state.stagingBuffer.any { !it.isPinned }) {
+                    Surface(
+                        onClick = onClearUnpinned,
+                        shape = RoundedCornerShape(6.dp),
+                        color = ObsidianBg,
+                        border = BorderStroke(1.dp, ObsidianBorder),
+                        modifier = Modifier.testTag("staging_clear_unpinned_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.DeleteSweep,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Text(
+                                text = "Prune",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
+
+        if (filteredItems.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(20.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Radar,
+                        contentDescription = null,
+                        tint = AssetAmber.copy(alpha = 0.75f),
+                        modifier = Modifier.size(28.dp)
+                    )
+                    Text(
+                        text = stringResource(R.string.staging_empty_title),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = stringResource(R.string.staging_empty_subtitle),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .testTag("staging_buffer_list"),
+                contentPadding = PaddingValues(10.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                items(filteredItems, key = { it.path }) { item ->
+                    StagingCandidateCard(
+                        item = item,
+                        onTogglePin = { onTogglePin(item.path) },
+                        onTrackLive = { onTrackLive(item.path) },
+                        onCopy = { onCopyPath("${item.path} | ${item.detail}") }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StagingCandidateCard(
+    item: CandidateStagingItem,
+    onTogglePin: () -> Unit,
+    onTrackLive: () -> Unit,
+    onCopy: () -> Unit
+) {
+    val isJsTrackable = !item.path.startsWith("WASM_PTR:") && !item.path.startsWith("window.HEAP")
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = if (item.isPinned) AssetAmber.copy(alpha = 0.08f) else ObsidianSurface,
+        border = BorderStroke(1.dp, if (item.isPinned) AssetAmber.copy(alpha = 0.7f) else ObsidianBorder),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onCopy)
+            .testTag("staging_item_${item.path}")
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 9.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    Surface(
+                        color = ElectricCyan.copy(alpha = 0.16f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = item.sourceStep,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = ElectricCyan,
+                            fontSize = 9.sp,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                        )
+                    }
+                    Text(
+                        text = "Scan #${item.scanNumber} • ×${item.seenCount} • ${item.lastSeenTimestamp}",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 9.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Text(
+                    text = item.path,
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (item.detail.isNotBlank()) {
+                    Text(
+                        text = item.detail,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 10.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+
+            if (isJsTrackable) {
+                IconButton(
+                    onClick = onTrackLive,
+                    modifier = Modifier
+                        .size(40.dp)
+                        .testTag("track_live_candidate_${item.path}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.MyLocation,
+                        contentDescription = stringResource(R.string.cd_track_candidate),
+                        tint = SignalEmerald,
+                        modifier = Modifier.size(17.dp)
+                    )
+                }
+            }
+
+            IconButton(
+                onClick = onTogglePin,
+                modifier = Modifier
+                    .size(40.dp)
+                    .testTag("pin_candidate_${item.path}")
+            ) {
+                Icon(
+                    imageVector = if (item.isPinned) Icons.Default.Bookmark else Icons.Default.BookmarkBorder,
+                    contentDescription = stringResource(R.string.cd_pin_candidate),
+                    tint = if (item.isPinned) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Entities Tab: visual inspection console for Step 3 discovered entities with world coordinates,
+ * player distance, projected 2D screen coordinates, viewport visibility badge, and one-tap pinning.
+ */
+@Composable
+fun EntityInspectionConsoleView(
+    state: DiagnosticsUiState,
+    onRescanEntities: () -> Unit,
+    onPinPath: (path: String, detail: String) -> Unit,
+    onCopyPayload: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier.background(ObsidianBg)) {
-        // Summary strip
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(ObsidianSurface)
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 10.dp, vertical = 7.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
                 Text(
-                    text = "Nearby Structs: ${state.discoveredEntities.size} (±${state.entityScanRadius} window)",
+                    text = state.discoveredEntityArrayPath ?: "Entity Collection (Not Scanned)",
                     style = MaterialTheme.typography.labelMedium,
+                    fontFamily = JetBrainsMonoFontFamily,
                     fontWeight = FontWeight.Bold,
-                    color = TelemetryViolet
+                    color = TelemetryViolet,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-                val metaLine = buildString {
-                    append("Origin: HEAPF32[${state.heapFeed.baseIndex}]")
-                    state.entityDetectedStride?.let { append(" • Stride: $it floats (${it * 4}B)") }
-                    state.entityScanDurationMs?.let { append(" • ${String.format(Locale.US, "%.0f", it)}ms") }
+                val meta = buildString {
+                    append("${state.discoveredEntities.size} detected")
+                    if (state.entityProjectionMode.isNotBlank()) append(" • ${state.entityProjectionMode}")
+                    if (state.entityViewportWidth > 0 && state.entityViewportHeight > 0) {
+                        append(" • ${state.entityViewportWidth}×${state.entityViewportHeight}")
+                    }
                 }
                 Text(
-                    text = metaLine,
+                    text = meta,
                     style = MaterialTheme.typography.labelSmall,
                     fontFamily = JetBrainsMonoFontFamily,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -107,16 +544,37 @@ fun NearbyEntitiesTabView(
                 )
             }
 
-            if (state.isScanningEntities) {
-                CircularProgressIndicator(
-                    modifier = Modifier.size(18.dp),
-                    strokeWidth = 2.dp,
-                    color = TelemetryViolet
-                )
+            Surface(
+                onClick = onRescanEntities,
+                shape = RoundedCornerShape(7.dp),
+                color = TelemetryViolet.copy(alpha = 0.18f),
+                border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.65f)),
+                modifier = Modifier
+                    .heightIn(min = 40.dp)
+                    .testTag("rescan_entities_button")
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = null,
+                        tint = TelemetryViolet,
+                        modifier = Modifier.size(15.dp)
+                    )
+                    Text(
+                        text = "Rescan",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = TelemetryViolet
+                    )
+                }
             }
         }
 
-        HorizontalDivider(color = ObsidianBorder.copy(alpha = 0.8f), thickness = 1.dp)
+        HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
         if (state.discoveredEntities.isEmpty()) {
             Box(
@@ -128,13 +586,13 @@ fun NearbyEntitiesTabView(
             ) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Radar,
+                        imageVector = Icons.Default.ViewInAr,
                         contentDescription = null,
                         tint = TelemetryViolet.copy(alpha = 0.8f),
-                        modifier = Modifier.size(30.dp)
+                        modifier = Modifier.size(28.dp)
                     )
                     Text(
                         text = stringResource(R.string.entities_empty_title),
@@ -153,22 +611,24 @@ fun NearbyEntitiesTabView(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
-                    .testTag("nearby_entities_list"),
+                    .testTag("discovered_entities_list"),
                 contentPadding = PaddingValues(10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(state.discoveredEntities, key = { it.baseIndex }) { entity ->
-                    NearbyEntityCard(
+                items(state.discoveredEntities, key = { "${it.path}_${it.id}" }) { entity ->
+                    EntitySampleCard(
                         entity = entity,
-                        onTogglePin = { onTogglePinEntity(entity.baseIndex) },
+                        onPin = {
+                            onPinPath(
+                                entity.path,
+                                "${entity.name} world(${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)})"
+                            )
+                        },
                         onCopy = {
-                            val hexAddr = "0x${entity.byteAddress.toString(16).uppercase(Locale.US)}"
-                            val copyText = "window.HEAPF32[${entity.baseIndex}..${entity.baseIndex + 2}] ($hexAddr, Δ${entity.offsetFromPlayer}) " +
-                                "X=${String.format(Locale.US, "%.3f", entity.x)} " +
-                                "Y=${String.format(Locale.US, "%.3f", entity.y)} " +
-                                "Z=${String.format(Locale.US, "%.3f", entity.z)} " +
-                                "dist=${String.format(Locale.US, "%.2f", entity.distanceToPlayer)}"
-                            onCopyEntity(copyText)
+                            onCopyPayload(
+                                "${entity.name} (${entity.path}) world=(${fmt2(entity.worldX)}, ${fmt2(entity.worldY)}, ${fmt2(entity.worldZ)}) " +
+                                    "dist=${fmt2(entity.distanceToPlayer)} screen=(${fmt2(entity.screenX)}, ${fmt2(entity.screenY)})"
+                            )
                         }
                     )
                 }
@@ -178,155 +638,130 @@ fun NearbyEntitiesTabView(
 }
 
 @Composable
-private fun NearbyEntityCard(
-    entity: NearbyEntityStruct,
-    onTogglePin: () -> Unit,
+private fun EntitySampleCard(
+    entity: DiscoveredEntitySample,
+    onPin: () -> Unit,
     onCopy: () -> Unit
 ) {
-    val hexAddr = remember(entity.byteAddress) {
-        "0x${entity.byteAddress.toString(16).uppercase(Locale.US)}"
-    }
-    val offsetLabel = remember(entity.offsetFromPlayer) {
-        if (entity.offsetFromPlayer >= 0) "+${entity.offsetFromPlayer}" else "${entity.offsetFromPlayer}"
-    }
-    val borderColor = if (entity.isPinned) AssetAmber.copy(alpha = 0.85f) else ObsidianBorder
-
     Surface(
-        shape = RoundedCornerShape(10.dp),
+        shape = RoundedCornerShape(8.dp),
         color = ObsidianSurface,
-        border = BorderStroke(1.dp, borderColor),
+        border = BorderStroke(
+            1.dp,
+            if (entity.inViewport) TelemetryViolet.copy(alpha = 0.6f) else ObsidianBorder
+        ),
         modifier = Modifier
             .fillMaxWidth()
-            .testTag("entity_card_${entity.baseIndex}")
+            .clickable(onClick = onCopy)
+            .testTag("entity_sample_${entity.path}")
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Surface(
-                    shape = RoundedCornerShape(6.dp),
-                    color = TelemetryViolet.copy(alpha = 0.2f),
-                    border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.55f))
-                ) {
-                    Text(
-                        text = "[${entity.baseIndex}]",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        fontWeight = FontWeight.Bold,
-                        color = TelemetryViolet,
-                        modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
-                    )
-                }
-
                 Text(
-                    text = "$hexAddr • Δ$offsetLabel",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = JetBrainsMonoFontFamily,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    text = entity.name + if (entity.id.isNotBlank()) " #${entity.id}" else "",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
-
-                if (entity.strideGroup > 0) {
-                    Surface(
-                        shape = RoundedCornerShape(5.dp),
-                        color = ElectricCyan.copy(alpha = 0.16f)
-                    ) {
-                        Text(
-                            text = "stride ${entity.strideGroup}",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            fontWeight = FontWeight.SemiBold,
-                            color = ElectricCyan,
-                            fontSize = 9.sp,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
-                    }
-                }
-
                 Surface(
-                    shape = RoundedCornerShape(5.dp),
-                    color = SignalEmerald.copy(alpha = 0.16f)
+                    color = (if (entity.inViewport) SignalEmerald else ObsidianSurfaceElevated).copy(alpha = 0.2f),
+                    shape = RoundedCornerShape(4.dp)
                 ) {
                     Text(
-                        text = "${String.format(Locale.US, "%.1f", entity.distanceToPlayer)}m",
+                        text = if (entity.inViewport) "IN VIEW" else "OFFSCREEN",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = if (entity.inViewport) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                    )
+                }
+                Surface(
+                    color = ElectricCyan.copy(alpha = 0.16f),
+                    shape = RoundedCornerShape(4.dp)
+                ) {
+                    Text(
+                        text = "${fmt2(entity.distanceToPlayer)}u",
                         style = MaterialTheme.typography.labelSmall,
                         fontFamily = JetBrainsMonoFontFamily,
                         fontWeight = FontWeight.Bold,
-                        color = SignalEmerald,
-                        fontSize = 10.sp,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        color = ElectricCyan,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
                     )
                 }
             }
+
+            Text(
+                text = entity.path,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = JetBrainsMonoFontFamily,
+                color = TelemetryViolet,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Row(
+                Column(
                     modifier = Modifier
                         .weight(1f)
-                        .clip(RoundedCornerShape(7.dp))
+                        .clip(RoundedCornerShape(6.dp))
                         .background(ObsidianBg)
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    horizontalArrangement = Arrangement.SpaceBetween
+                        .padding(horizontal = 8.dp, vertical = 5.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
                     Text(
-                        text = "X ${String.format(Locale.US, "%.2f", entity.x)}",
-                        style = MaterialTheme.typography.bodySmall,
+                        text = "World: X=${fmt2(entity.worldX)}  Y=${fmt2(entity.worldY)}  Z=${fmt2(entity.worldZ)}",
+                        style = MaterialTheme.typography.labelSmall,
                         fontFamily = JetBrainsMonoFontFamily,
-                        fontWeight = FontWeight.SemiBold,
-                        color = SignalEmerald
+                        color = SignalEmerald,
+                        fontSize = 10.sp
                     )
                     Text(
-                        text = "Y ${String.format(Locale.US, "%.2f", entity.y)}",
-                        style = MaterialTheme.typography.bodySmall,
+                        text = "Screen: (${fmt2(entity.screenX)}px, ${fmt2(entity.screenY)}px)",
+                        style = MaterialTheme.typography.labelSmall,
                         fontFamily = JetBrainsMonoFontFamily,
-                        fontWeight = FontWeight.SemiBold,
-                        color = ElectricCyan
-                    )
-                    Text(
-                        text = "Z ${String.format(Locale.US, "%.2f", entity.z)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        fontWeight = FontWeight.SemiBold,
-                        color = TelemetryViolet
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 10.sp
                     )
                 }
 
                 IconButton(
-                    onClick = onTogglePin,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .testTag("pin_entity_${entity.baseIndex}")
+                    onClick = onPin,
+                    modifier = Modifier.size(38.dp)
                 ) {
                     Icon(
-                        imageVector = if (entity.isPinned) Icons.Filled.PushPin else Icons.Outlined.PushPin,
-                        contentDescription = stringResource(R.string.cd_pin_entity),
-                        tint = if (entity.isPinned) AssetAmber else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp)
+                        imageVector = Icons.Default.BookmarkBorder,
+                        contentDescription = stringResource(R.string.cd_pin_candidate),
+                        tint = AssetAmber,
+                        modifier = Modifier.size(17.dp)
                     )
                 }
 
                 IconButton(
                     onClick = onCopy,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .testTag("copy_entity_${entity.baseIndex}")
+                    modifier = Modifier.size(38.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.ContentCopy,
                         contentDescription = stringResource(R.string.cd_copy_log),
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
@@ -341,17 +776,24 @@ private fun NearbyEntityCard(
 @Composable
 fun LiveLogConsoleView(
     state: DiagnosticsUiState,
-    filteredLogs: List<TelemetryLogEntry>,
     onSelectFilter: (LogCategory) -> Unit,
-    onClearLogs: () -> Unit,
     onExportLogDumpTxt: () -> Unit,
     onExportLogDumpJson: () -> Unit,
-    onShareLastLogDump: () -> Unit,
-    onCopyLog: (String) -> Unit,
+    onShareLogDump: () -> Unit,
+    onCopyPayload: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val filteredLogs = remember(state.logs, state.selectedFilter) {
+        val base = if (state.selectedFilter == LogCategory.ALL) {
+            state.logs
+        } else {
+            state.logs.filter { it.category == state.selectedFilter }
+        }
+        base.asReversed()
+    }
+
     Column(modifier = modifier.background(ObsidianBg)) {
-        // Export & Clear Toolbar
+        // Export Toolbar
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -390,8 +832,9 @@ fun LiveLogConsoleView(
                             modifier = Modifier.size(16.dp)
                         )
                     }
+                    Spacer(Modifier.width(5.dp))
                     Text(
-                        text = " " + stringResource(R.string.action_export_log_dump_txt),
+                        text = stringResource(R.string.action_export_log_dump_txt),
                         style = MaterialTheme.typography.labelMedium,
                         fontWeight = FontWeight.Bold,
                         color = SignalEmerald,
@@ -425,9 +868,9 @@ fun LiveLogConsoleView(
                 }
             }
 
-            if (state.lastLogDumpExport?.success == true) {
+            if (state.lastLogDumpExport?.success == true && state.lastLogDumpExport.contentUri != null) {
                 IconButton(
-                    onClick = onShareLastLogDump,
+                    onClick = onShareLogDump,
                     modifier = Modifier
                         .size(48.dp)
                         .testTag("share_log_dump_button")
@@ -439,20 +882,6 @@ fun LiveLogConsoleView(
                         modifier = Modifier.size(18.dp)
                     )
                 }
-            }
-
-            IconButton(
-                onClick = onClearLogs,
-                modifier = Modifier
-                    .size(48.dp)
-                    .testTag("clear_logs_button")
-            ) {
-                Icon(
-                    imageVector = Icons.Default.DeleteOutline,
-                    contentDescription = stringResource(R.string.cd_clear_logs),
-                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.size(19.dp)
-                )
             }
         }
 
@@ -531,7 +960,9 @@ fun LiveLogConsoleView(
                 items(filteredLogs, key = { it.id }) { entry ->
                     LogEntryCard(
                         entry = entry,
-                        onCopy = { onCopyLog("[${entry.timestamp}] [${entry.category.tag}] ${entry.summary}\n${entry.payload}") }
+                        onCopy = {
+                            onCopyPayload("[${entry.timestamp}] [${entry.category.tag}] ${entry.summary}\n${entry.payload}")
+                        }
                     )
                 }
             }
@@ -629,13 +1060,14 @@ private fun LogEntryCard(
 
 fun categoryAccentColor(category: LogCategory): Color = when (category) {
     LogCategory.ALL -> ElectricCyan
-    LogCategory.FEED -> SignalEmerald
-    LogCategory.SCAN -> ElectricCyan
-    LogCategory.PTR -> TelemetryViolet
-    LogCategory.RELOCK -> ElectricCyan
+    LogCategory.SCOPE -> ElectricCyan
+    LogCategory.DELTA -> SignalEmerald
     LogCategory.ENTITY -> TelemetryViolet
+    LogCategory.WASM -> SignalEmerald
     LogCategory.ASSET -> AssetAmber
     LogCategory.JS -> ElectricCyan
     LogCategory.SYSTEM -> Color(0xFF94A3B8)
     LogCategory.ERROR -> AlertCoral
 }
+
+private fun fmt2(value: Double): String = if (value.isFinite()) String.format(Locale.US, "%.2f", value) else "NaN"

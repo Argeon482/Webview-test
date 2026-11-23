@@ -1,10 +1,11 @@
 package com.example
 
 /**
- * Pure read-only JavaScript inspection routines for WebAssembly `window.HEAPF32` telemetry.
+ * Pure read-only JavaScript inspection routines for WebAssembly `window.HEAPF32` & `window.HEAPU32`
+ * scanning, pointer/AOB signature analysis, and persistent coordinate relocking.
  *
  * Strictly observational:
- * - Zero memory writes to `HEAPF32` / `HEAP32` / `HEAPU8`
+ * - Zero memory writes to `HEAPF32` / `HEAP32` / `HEAPU32` / `HEAPU8`
  * - Zero touch, keyboard, mouse, or navigation dispatching
  * - Zero `org.json` dependencies so script generation stays 100% testable on pure JVM
  */
@@ -13,10 +14,6 @@ object WasmHeapScripts {
     const val DEFAULT_POLL_INTERVAL_MS = 200
     const val DEFAULT_ENTITY_SCAN_RADIUS = 50_000
 
-    /**
-     * Escapes arbitrary Kotlin text into a double-quoted JS string literal using pure Kotlin
-     * (avoids Android's stub `org.json.JSONObject` in pure JVM unit tests).
-     */
     internal fun quoteJsString(value: String): String {
         val sb = StringBuilder(value.length + 16)
         sb.append('"')
@@ -46,29 +43,12 @@ object WasmHeapScripts {
     }
 
     /**
-     * Shared read-only helper resolving `window.HEAPF32` (primary target) with clean fallbacks
-     * to `window.Module.HEAPF32`, `HEAP32`, `HEAPU8`, or `wasmMemory.buffer`.
+     * Shared read-only helper resolving synchronized `Float32Array` (`hf32`), `Int32Array` (`h32`),
+     * and `Uint32Array` (`hu32`) views over the active WebAssembly linear memory buffer.
      */
     private const val HEAP_RESOLVER_JS = """
-function __wvResolveFloatHeap() {
+function __wvResolveWasmHeap() {
   try {
-    var makePair = function(f32, label) {
-      if (!f32 || !(f32 instanceof Float32Array) || f32.length < 16) return null;
-      var i32 = null;
-      try {
-        if ((f32.byteOffset % 4) === 0) {
-          i32 = new Int32Array(f32.buffer, f32.byteOffset, f32.length);
-        }
-      } catch (_e) {}
-      return {
-        hf32: f32,
-        h32: i32,
-        length: f32.length,
-        byteLength: f32.byteLength,
-        label: label
-      };
-    };
-
     var fromBuffer = function(buf, byteOffset, byteLength, label) {
       if (!buf || byteLength < 64) return null;
       var alignedOffset = (byteOffset || 0);
@@ -77,23 +57,47 @@ function __wvResolveFloatHeap() {
       return {
         hf32: new Float32Array(buf, alignedOffset, alignedCount),
         h32: new Int32Array(buf, alignedOffset, alignedCount),
+        hu32: new Uint32Array(buf, alignedOffset, alignedCount),
         length: alignedCount,
         byteLength: alignedCount * 4,
         label: label
       };
     };
 
-    // 1. Primary verified target: window.HEAPF32
+    var makeFromF32 = function(f32, label) {
+      if (!f32 || !(f32 instanceof Float32Array) || f32.length < 16) return null;
+      var i32 = null;
+      var u32 = null;
+      try {
+        if ((f32.byteOffset % 4) === 0) {
+          i32 = new Int32Array(f32.buffer, f32.byteOffset, f32.length);
+          u32 = new Uint32Array(f32.buffer, f32.byteOffset, f32.length);
+        }
+      } catch (_e) {}
+      return {
+        hf32: f32,
+        h32: i32,
+        hu32: u32,
+        length: f32.length,
+        byteLength: f32.byteLength,
+        label: label
+      };
+    };
+
     if (window.HEAPF32 instanceof Float32Array && window.HEAPF32.length >= 16) {
-      return makePair(window.HEAPF32, 'window.HEAPF32');
+      return makeFromF32(window.HEAPF32, 'window.HEAPF32');
     }
-    // 2. Emscripten Module.HEAPF32
     if (window.Module && window.Module.HEAPF32 instanceof Float32Array && window.Module.HEAPF32.length >= 16) {
-      return makePair(window.Module.HEAPF32, 'window.Module.HEAPF32');
+      return makeFromF32(window.Module.HEAPF32, 'window.Module.HEAPF32');
     }
-    // 3. Companion HEAP32 / HEAPU8 views on window or Module
+    if (window.HEAPU32 instanceof Uint32Array && window.HEAPU32.length >= 16) {
+      return fromBuffer(window.HEAPU32.buffer, window.HEAPU32.byteOffset, window.HEAPU32.byteLength, 'window.HEAPU32->Float32');
+    }
     if (window.HEAP32 instanceof Int32Array && window.HEAP32.length >= 16) {
       return fromBuffer(window.HEAP32.buffer, window.HEAP32.byteOffset, window.HEAP32.byteLength, 'window.HEAP32->Float32');
+    }
+    if (window.Module && window.Module.HEAPU32 instanceof Uint32Array && window.Module.HEAPU32.length >= 16) {
+      return fromBuffer(window.Module.HEAPU32.buffer, window.Module.HEAPU32.byteOffset, window.Module.HEAPU32.byteLength, 'window.Module.HEAPU32->Float32');
     }
     if (window.Module && window.Module.HEAP32 instanceof Int32Array && window.Module.HEAP32.length >= 16) {
       return fromBuffer(window.Module.HEAP32.buffer, window.Module.HEAP32.byteOffset, window.Module.HEAP32.byteLength, 'window.Module.HEAP32->Float32');
@@ -104,24 +108,22 @@ function __wvResolveFloatHeap() {
     if (window.Module && window.Module.HEAPU8 instanceof Uint8Array && window.Module.HEAPU8.byteLength >= 64) {
       return fromBuffer(window.Module.HEAPU8.buffer, window.Module.HEAPU8.byteOffset, window.Module.HEAPU8.byteLength, 'window.Module.HEAPU8->Float32');
     }
-    // 4. WebAssembly.Memory fallback
     if (window.wasmMemory && window.wasmMemory.buffer) {
       return fromBuffer(window.wasmMemory.buffer, 0, window.wasmMemory.buffer.byteLength, 'window.wasmMemory');
     }
     if (window.Module && window.Module.wasmMemory && window.Module.wasmMemory.buffer) {
       return fromBuffer(window.Module.wasmMemory.buffer, 0, window.Module.wasmMemory.buffer.byteLength, 'window.Module.wasmMemory');
     }
-    // 5. Common engine roots
     var roots = ['game', 'app', 'engine', 'unityInstance', 'Unity', 'instance'];
     for (var r = 0; r < roots.length; r++) {
       var rootName = roots[r];
       var obj = window[rootName];
       if (!obj || typeof obj !== 'object') continue;
       if (obj.HEAPF32 instanceof Float32Array && obj.HEAPF32.length >= 16) {
-        return makePair(obj.HEAPF32, 'window.' + rootName + '.HEAPF32');
+        return makeFromF32(obj.HEAPF32, 'window.' + rootName + '.HEAPF32');
       }
       if (obj.Module && obj.Module.HEAPF32 instanceof Float32Array && obj.Module.HEAPF32.length >= 16) {
-        return makePair(obj.Module.HEAPF32, 'window.' + rootName + '.Module.HEAPF32');
+        return makeFromF32(obj.Module.HEAPF32, 'window.' + rootName + '.Module.HEAPF32');
       }
     }
   } catch (_err) {}
@@ -136,38 +138,77 @@ function __wvIsPlausibleCoord(v) {
   return true;
 }
 
-function __wvBuildSignature(res, baseIndex) {
+function __wvHexU32(u) {
+  var h = ((u >>> 0).toString(16)).toUpperCase();
+  while (h.length < 8) h = '0' + h;
+  return h;
+}
+
+function __wvEnsureState(defaultBase) {
+  return window.__wvDiagState || (window.__wvDiagState = {
+    feedTimerId: null,
+    deltaPreviewTimerId: null,
+    baseIndex: defaultBase,
+    signature: null,
+    parentPointers: [],
+    relockToken: 0,
+    entityScanToken: 0,
+    floatScanToken: 0,
+    analyzeToken: 0,
+    notifiedMissing: false,
+    snapIndices: null,
+    snapValues: null,
+    snapCount: 0,
+    deltaCandidates: [],
+    scanRound: 0
+  });
+}
+
+function __wvExtractStructSignature(res, baseIndex, radius) {
   var hf32 = res.hf32;
-  var h32 = res.h32;
+  var hu32 = res.hu32;
   var len = res.length;
+  var rad = radius || 16;
   if (baseIndex < 0 || baseIndex + 2 >= len) return null;
 
   var anchors = [];
   var zeroOffsets = [];
-  var minOff = -24;
-  var maxOff = 24;
+  var slots = [];
 
-  for (var off = minOff; off <= maxOff; off++) {
-    if (off === 0 || off === 1 || off === 2) continue;
+  for (var off = -rad; off <= rad; off++) {
     var idx = baseIndex + off;
     if (idx < 0 || idx >= len) continue;
-    var iVal = h32 ? h32[idx] : 0;
+    var uVal = hu32 ? (hu32[idx] >>> 0) : 0;
     var fVal = hf32[idx];
-    if (iVal === 0) {
+    var isCoord = (off === 0 || off === 1 || off === 2);
+    slots.push({
+      offset: off,
+      heapIndex: idx,
+      byteAddress: idx * 4,
+      floatValue: Number.isFinite(fVal) ? (Math.round(fVal * 10000) / 10000) : 0,
+      uint32Hex: '0x' + __wvHexU32(uVal),
+      isCoordAxis: isCoord,
+      isAnchor: false
+    });
+
+    if (isCoord) continue;
+    if (uVal === 0) {
       if (zeroOffsets.length < 10) zeroOffsets.push(off);
       continue;
     }
-    var priority = 1;
-    // Prioritize clean float constants (e.g., 1.0, -1.0, scale/bounds) and small integer struct tags
+
     var isCleanFloat = Number.isFinite(fVal) && Math.abs(fVal) >= 1e-3 && Math.abs(fVal) <= 10000;
-    var isSmallInt = Math.abs(iVal) > 0 && Math.abs(iVal) <= 65535;
-    if (isSmallInt) priority = 3;
-    else if (isCleanFloat) priority = 2;
+    var isHeaderWord = (uVal > 0 && uVal <= 0x00FFFFFF) || ((uVal & 0xFFFF) === 0 && uVal > 0);
+    var pri = 1;
+    if (isHeaderWord) pri = 3;
+    else if (isCleanFloat) pri = 2;
+
     anchors.push({
       off: off,
-      bits: iVal,
-      fval: isCleanFloat ? Math.round(fVal * 10000) / 10000 : null,
-      pri: priority
+      u32: uVal,
+      hex: __wvHexU32(uVal),
+      fval: isCleanFloat ? (Math.round(fVal * 10000) / 10000) : null,
+      pri: pri
     });
   }
 
@@ -176,21 +217,48 @@ function __wvBuildSignature(res, baseIndex) {
     return Math.abs(a.off) - Math.abs(b.off);
   });
   var selected = anchors.slice(0, 14);
-  return {
-    v: 1,
+  var anchorOffsetMap = Object.create(null);
+  for (var s = 0; s < selected.length; s++) {
+    anchorOffsetMap[selected[s].off] = true;
+  }
+  for (var k = 0; k < slots.length; k++) {
+    if (anchorOffsetMap[slots[k].offset]) slots[k].isAnchor = true;
+  }
+
+  // Build readable AOB pattern string & float pattern summary sorted by memory offset
+  var ordered = selected.slice().sort(function(a, b) { return a.off - b.off; });
+  var aobParts = [];
+  var floatParts = [];
+  for (var p = 0; p < ordered.length; p++) {
+    var item = ordered[p];
+    var sign = item.off >= 0 ? ('+' + item.off) : String(item.off);
+    aobParts.push('[' + sign + ']:' + item.hex);
+    if (item.fval !== null && floatParts.length < 6) {
+      floatParts.push('[' + sign + ']=' + item.fval);
+    }
+  }
+
+  var sigObj = {
+    v: 2,
     capturedAtIndex: baseIndex,
     capturedCoords: [hf32[baseIndex], hf32[baseIndex + 1], hf32[baseIndex + 2]],
     anchors: selected,
     zeroOffsets: zeroOffsets.slice(0, 6)
   };
+
+  return {
+    signature: sigObj,
+    aobPatternHex: aobParts.join(' '),
+    floatPatternSummary: floatParts.length > 0 ? floatParts.join(', ') : 'Uint32 header anchors only',
+    slots: slots
+  };
 }
 """
 
-    /**
-     * Starts a high-performance 200ms direct polling loop reading `window.HEAPF32[baseIndex]` (X),
-     * `window.HEAPF32[baseIndex + 1]` (Y), and `window.HEAPF32[baseIndex + 2]` (Z).
-     * Automatically captures an auto-relock signature once valid coordinates are detected.
-     */
+    // =========================================================================
+    // Permanent 200ms Direct Coordinate Feed
+    // =========================================================================
+
     fun buildStartDirectFeedScript(
         baseIndex: Int = VERIFIED_PLAYER_BASE_INDEX,
         savedSignatureJson: String? = null
@@ -201,20 +269,11 @@ function __wvBuildSignature(res, baseIndex) {
 (function() {
   $HEAP_RESOLVER_JS
   try {
-    var st = window.__wvDiagFeed || (window.__wvDiagFeed = {
-      timerId: null,
-      baseIndex: $safeBase,
-      signature: null,
-      relockToken: 0,
-      entityScanToken: 0,
-      notifiedMissing: false
-    });
-
-    if (st.timerId !== null) {
-      clearInterval(st.timerId);
-      st.timerId = null;
+    var st = __wvEnsureState($safeBase);
+    if (st.feedTimerId !== null) {
+      clearInterval(st.feedTimerId);
+      st.feedTimerId = null;
     }
-
     st.baseIndex = $safeBase;
     st.notifiedMissing = false;
 
@@ -229,7 +288,7 @@ function __wvBuildSignature(res, baseIndex) {
     }
 
     var pollTick = function() {
-      var res = __wvResolveFloatHeap();
+      var res = __wvResolveWasmHeap();
       var idx = st.baseIndex;
       if (!res || idx < 0 || idx + 2 >= res.length) {
         if (!st.notifiedMissing) {
@@ -253,42 +312,22 @@ function __wvBuildSignature(res, baseIndex) {
       var x = res.hf32[idx];
       var y = res.hf32[idx + 1];
       var z = res.hf32[idx + 2];
-
       if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
 
       if (window.TelemetryBridge && window.TelemetryBridge.updateDirectHeapCoords) {
         window.TelemetryBridge.updateDirectHeapCoords(idx, x, y, z, res.byteLength, res.label);
       }
-
-      // Auto-capture surrounding signature once non-zero finite coordinates appear
-      if (!st.signature && (__wvIsPlausibleCoord(x) && __wvIsPlausibleCoord(y) && __wvIsPlausibleCoord(z)) &&
-          (Math.abs(x) + Math.abs(y) + Math.abs(z) > 0.01)) {
-        var autoSig = __wvBuildSignature(res, idx);
-        if (autoSig && autoSig.anchors.length >= 2) {
-          st.signature = autoSig;
-          if (window.TelemetryBridge) {
-            window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-              type: 'SIGNATURE_CAPTURED',
-              auto: true,
-              baseIndex: idx,
-              anchorCount: autoSig.anchors.length,
-              zeroCount: autoSig.zeroOffsets.length,
-              signatureJson: JSON.stringify(autoSig)
-            }));
-          }
-        }
-      }
     };
 
     pollTick();
-    st.timerId = setInterval(pollTick, $DEFAULT_POLL_INTERVAL_MS);
+    st.feedTimerId = setInterval(pollTick, $DEFAULT_POLL_INTERVAL_MS);
 
     if (window.TelemetryBridge) {
       window.TelemetryBridge.updateScanStatus('COMPLETED', 'LIVE 200ms @ HEAPF32[' + $safeBase + '..' + ($safeBase + 2) + ']');
       window.TelemetryBridge.logTelemetry('FEED', JSON.stringify({
         type: 'FEED_STATUS',
         active: true,
-        heapReady: !!__wvResolveFloatHeap(),
+        heapReady: !!__wvResolveWasmHeap(),
         baseIndex: $safeBase,
         message: 'Direct 200ms polling active on window.HEAPF32[' + $safeBase + ', ' + ($safeBase + 1) + ', ' + ($safeBase + 2) + ']'
       }));
@@ -302,16 +341,13 @@ function __wvBuildSignature(res, baseIndex) {
 """.trimIndent()
     }
 
-    /**
-     * Pauses the 200ms direct `window.HEAPF32` polling loop cleanly.
-     */
     fun buildStopDirectFeedScript(): String = """
 (function() {
   try {
-    var st = window.__wvDiagFeed;
-    if (st && st.timerId !== null) {
-      clearInterval(st.timerId);
-      st.timerId = null;
+    var st = window.__wvDiagState;
+    if (st && st.feedTimerId !== null) {
+      clearInterval(st.feedTimerId);
+      st.feedTimerId = null;
     }
     if (window.TelemetryBridge) {
       window.TelemetryBridge.updateScanStatus('IDLE', 'Direct feed paused');
@@ -331,19 +367,547 @@ function __wvBuildSignature(res, baseIndex) {
 })();
 """.trimIndent()
 
+    // =========================================================================
+    // Step 1: Movement Float Delta Scanner (window.HEAPF32)
+    // =========================================================================
+
     /**
-     * Captures the surrounding static Float32/Int32 signature around `baseIndex` for Auto-Relock
-     * across page reloads or zone transitions.
+     * Button A: Captures a non-blocking chunked standing baseline of static finite floats in
+     * `window.HEAPF32` (ignoring out-of-bounds/zero/subnormal noise and pruning ticking timers).
      */
-    fun buildCaptureSignatureScript(baseIndex: Int = VERIFIED_PLAYER_BASE_INDEX): String {
-        val safeBase = baseIndex.coerceAtLeast(0)
-        return """
-(function() {
+    fun buildCaptureStandingBaselineScript(): String = """
+(async function() {
   $HEAP_RESOLVER_JS
   try {
-    var res = __wvResolveFloatHeap();
+    var st = __wvEnsureState($VERIFIED_PLAYER_BASE_INDEX);
+    var token = ++st.floatScanToken;
+    if (st.deltaPreviewTimerId !== null) {
+      clearInterval(st.deltaPreviewTimerId);
+      st.deltaPreviewTimerId = null;
+    }
+
+    var res = __wvResolveWasmHeap();
     if (!res) {
       if (window.TelemetryBridge) {
+        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not found');
+        window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
+          type: 'FLOAT_BASELINE_ERROR',
+          reason: 'window.HEAPF32 is not initialized on this page yet.'
+        }));
+      }
+      return;
+    }
+
+    var hf32 = res.hf32;
+    var len = res.length;
+    var startIndex = len > 4096 ? 256 : 0;
+    var maxSnapshot = 1500000;
+    var chunkSize = 262144;
+    var totalChunks = Math.max(1, Math.ceil((len - startIndex) / chunkSize));
+    var startTime = performance.now();
+
+    var idxBuf = new Int32Array(Math.min(maxSnapshot, len));
+    var valBuf = new Float32Array(Math.min(maxSnapshot, len));
+    var count = 0;
+
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('RUNNING', 'Snapshotting standing baseline...');
+    }
+
+    var chunkNo = 0;
+    for (var s = startIndex; s < len && count < maxSnapshot; s += chunkSize) {
+      if (st.floatScanToken !== token) return;
+      chunkNo++;
+      var e = Math.min(len, s + chunkSize);
+      for (var i = s; i < e; i++) {
+        var v = hf32[i];
+        if (!Number.isFinite(v)) continue;
+        var av = Math.abs(v);
+        if (av < 0.0001 || av > 100000) continue;
+        idxBuf[count] = i;
+        valBuf[count] = v;
+        count++;
+        if (count >= maxSnapshot) break;
+      }
+      if (window.TelemetryBridge && (chunkNo % 4 === 0 || chunkNo === totalChunks)) {
+        window.TelemetryBridge.updateScanStatus('RUNNING', 'Baseline slice ' + chunkNo + '/' + totalChunks + '...');
+      }
+      await new Promise(function(resolve) { setTimeout(resolve, 12); });
+    }
+
+    if (st.floatScanToken !== token) return;
+
+    // Wait 120ms while standing still and prune continuously changing timers/particles
+    await new Promise(function(resolve) { setTimeout(resolve, 120); });
+    if (st.floatScanToken !== token) return;
+
+    var liveRes = __wvResolveWasmHeap();
+    var liveF32 = liveRes ? liveRes.hf32 : hf32;
+    var writePos = 0;
+    var pruned = 0;
+    for (var k = 0; k < count; k++) {
+      var hIdx = idxBuf[k];
+      if (hIdx < liveF32.length && Math.abs(liveF32[hIdx] - valBuf[k]) <= 0.0005) {
+        idxBuf[writePos] = hIdx;
+        valBuf[writePos] = valBuf[k];
+        writePos++;
+      } else {
+        pruned++;
+      }
+    }
+
+    st.snapIndices = idxBuf.subarray(0, writePos);
+    st.snapValues = valBuf.subarray(0, writePos);
+    st.snapCount = writePos;
+    st.deltaCandidates = [];
+    st.scanRound = 0;
+
+    var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Baseline: ' + writePos + ' static floats');
+      window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
+        type: 'FLOAT_BASELINE_CAPTURED',
+        sampledCount: writePos,
+        prunedJitterCount: pruned,
+        durationMs: durationMs,
+        heapByteLength: res.byteLength,
+        heapSource: res.label
+      }));
+    }
+  } catch (e) {
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('ERROR', 'Baseline error');
+      window.TelemetryBridge.logTelemetry('ERR', 'Float baseline error: ' + String(e));
+    }
+  }
+})();
+""".trimIndent()
+
+    /**
+     * Button B: Filters `window.HEAPF32` against the standing baseline for floats that shifted
+     * during movement and stopped when standing still, then starts a 200ms live preview ticker.
+     */
+    fun buildScanMovementDeltasScript(
+        minDelta: Double = 0.05,
+        maxDelta: Double = 500.0
+    ): String = """
+(async function() {
+  $HEAP_RESOLVER_JS
+  try {
+    var st = __wvEnsureState($VERIFIED_PLAYER_BASE_INDEX);
+    var token = ++st.floatScanToken;
+
+    if (!st.snapIndices || !st.snapValues || st.snapCount === 0) {
+      if (window.TelemetryBridge) {
+        window.TelemetryBridge.updateScanStatus('ERROR', 'Capture baseline first');
+        window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
+          type: 'FLOAT_DELTA_ERROR',
+          reason: 'Tap "1. Capture Standing Baseline" while standing still first.'
+        }));
+      }
+      return;
+    }
+
+    var res = __wvResolveWasmHeap();
+    if (!res) {
+      if (window.TelemetryBridge) {
+        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not found');
+        window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
+          type: 'FLOAT_DELTA_ERROR',
+          reason: 'window.HEAPF32 is not available.'
+        }));
+      }
+      return;
+    }
+
+    var hf32 = res.hf32;
+    var len = res.length;
+    var startTime = performance.now();
+    var minD = $minDelta;
+    var maxD = $maxDelta;
+    var chunkSize = 262144;
+
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('RUNNING', 'Scanning movement float deltas...');
+    }
+
+    var hits = [];
+    var snapIdx = st.snapIndices;
+    var snapVal = st.snapValues;
+    var total = st.snapCount;
+
+    for (var s = 0; s < total; s += chunkSize) {
+      if (st.floatScanToken !== token) return;
+      var e = Math.min(total, s + chunkSize);
+      for (var k = s; k < e; k++) {
+        var idx = snapIdx[k];
+        if (idx >= len) continue;
+        var cur = hf32[idx];
+        if (!Number.isFinite(cur) || Math.abs(cur) > 100000) continue;
+        var base = snapVal[k];
+        var diff = cur - base;
+        var absDiff = Math.abs(diff);
+        if (absDiff >= minD && absDiff <= maxD) {
+          hits.push({
+            idx: idx,
+            base: base,
+            cur: cur,
+            delta: diff
+          });
+          if (hits.length >= 20000) break;
+        }
+      }
+      if (hits.length >= 20000) break;
+      await new Promise(function(resolve) { setTimeout(resolve, 10); });
+    }
+
+    if (st.floatScanToken !== token) return;
+
+    // 120ms stillness verification pass: floats that moved AND then stopped when standing still
+    await new Promise(function(resolve) { setTimeout(resolve, 120); });
+    if (st.floatScanToken !== token) return;
+
+    var liveRes = __wvResolveWasmHeap();
+    var liveF32 = liveRes ? liveRes.hf32 : hf32;
+    var stillHits = [];
+    var allMovedSet = Object.create(null);
+
+    for (var m = 0; m < hits.length; m++) {
+      var h = hits[m];
+      var nowVal = h.idx < liveF32.length ? liveF32[h.idx] : h.cur;
+      var isStill = Number.isFinite(nowVal) && Math.abs(nowVal - h.cur) <= 0.002;
+      h.isStillNow = isStill;
+      h.cur = nowVal;
+      h.delta = nowVal - h.base;
+      allMovedSet[h.idx] = true;
+      if (isStill) stillHits.push(h);
+    }
+
+    // Prefer stopped floats; fall back to all moved hits if character was still walking
+    var working = stillHits.length > 0 ? stillHits : hits;
+
+    // Detect contiguous Vec2/Vec3 coordinate clusters (adjacent indices also changed)
+    var enriched = [];
+    for (var j = 0; j < working.length; j++) {
+      var item = working[j];
+      var i = item.idx;
+      var hasPrev = !!allMovedSet[i - 1];
+      var hasNext = !!allMovedSet[i + 1];
+      var hasNext2 = !!allMovedSet[i + 2];
+      var cluster = 1 + (hasPrev ? 1 : 0) + (hasNext ? 1 : 0) + (hasNext2 ? 1 : 0);
+      var axis = !hasPrev ? 'X' : (hasNext ? 'Y' : 'Z');
+      var py = (i + 1 < liveF32.length && Number.isFinite(liveF32[i + 1])) ? liveF32[i + 1] : 0;
+      var pz = (i + 2 < liveF32.length && Number.isFinite(liveF32[i + 2])) ? liveF32[i + 2] : 0;
+      enriched.push({
+        heapIndex: i,
+        byteAddress: i * 4,
+        baselineValue: Math.round(item.base * 1000) / 1000,
+        currentValue: Math.round(item.cur * 1000) / 1000,
+        delta: Math.round(item.delta * 1000) / 1000,
+        previewY: Math.round(py * 1000) / 1000,
+        previewZ: Math.round(pz * 1000) / 1000,
+        isStillNow: item.isStillNow,
+        clusterSize: cluster,
+        axisHint: axis
+      });
+    }
+
+    // Sort: stopped Vec3 X-heads first, then cluster size, then realistic walking delta magnitude
+    enriched.sort(function(a, b) {
+      if (a.isStillNow !== b.isStillNow) return a.isStillNow ? -1 : 1;
+      var aHead = (a.clusterSize >= 2 && a.axisHint === 'X') ? 1 : 0;
+      var bHead = (b.clusterSize >= 2 && b.axisHint === 'X') ? 1 : 0;
+      if (bHead !== aHead) return bHead - aHead;
+      if (b.clusterSize !== a.clusterSize) return b.clusterSize - a.clusterSize;
+      return Math.abs(a.delta) - Math.abs(b.delta);
+    });
+
+    var topCandidates = enriched.slice(0, 60);
+    st.deltaCandidates = topCandidates;
+    st.scanRound = (st.scanRound || 0) + 1;
+
+    // Narrow baseline to surviving hits for fast subsequent refinements if user scans again
+    if (working.length > 0 && working.length < st.snapCount) {
+      var nextIdx = new Int32Array(working.length);
+      var nextVal = new Float32Array(working.length);
+      for (var w = 0; w < working.length; w++) {
+        nextIdx[w] = working[w].idx;
+        nextVal[w] = working[w].cur;
+      }
+      st.snapIndices = nextIdx;
+      st.snapValues = nextVal;
+      st.snapCount = working.length;
+    }
+
+    // Start 200ms live preview loop for displayed candidates
+    if (st.deltaPreviewTimerId !== null) {
+      clearInterval(st.deltaPreviewTimerId);
+      st.deltaPreviewTimerId = null;
+    }
+    if (topCandidates.length > 0) {
+      st.deltaPreviewTimerId = setInterval(function() {
+        var rNow = __wvResolveWasmHeap();
+        if (!rNow || !st.deltaCandidates || st.deltaCandidates.length === 0) return;
+        var fNow = rNow.hf32;
+        var updates = [];
+        for (var u = 0; u < st.deltaCandidates.length; u++) {
+          var c = st.deltaCandidates[u];
+          if (c.heapIndex + 2 >= fNow.length) continue;
+          var vx = fNow[c.heapIndex];
+          var vy = fNow[c.heapIndex + 1];
+          var vz = fNow[c.heapIndex + 2];
+          if (!Number.isFinite(vx)) continue;
+          updates.push({
+            heapIndex: c.heapIndex,
+            currentValue: Math.round(vx * 1000) / 1000,
+            previewY: Number.isFinite(vy) ? (Math.round(vy * 1000) / 1000) : 0,
+            previewZ: Number.isFinite(vz) ? (Math.round(vz * 1000) / 1000) : 0
+          });
+        }
+        if (window.TelemetryBridge && window.TelemetryBridge.updateFloatDeltaPreview) {
+          window.TelemetryBridge.updateFloatDeltaPreview(JSON.stringify({ updates: updates }));
+        }
+      }, $DEFAULT_POLL_INTERVAL_MS);
+    }
+
+    var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Isolated ' + working.length + ' movement deltas');
+      window.TelemetryBridge.logTelemetry('SCAN', JSON.stringify({
+        type: 'FLOAT_DELTAS_SCANNED',
+        scanRound: st.scanRound,
+        totalMatches: working.length,
+        stillCount: stillHits.length,
+        durationMs: durationMs,
+        candidates: topCandidates
+      }));
+    }
+  } catch (e) {
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('ERROR', 'Delta scan error');
+      window.TelemetryBridge.logTelemetry('ERR', 'Float delta scan error: ' + String(e));
+    }
+  }
+})();
+""".trimIndent()
+
+    fun buildResetFloatScanScript(): String = """
+(function() {
+  try {
+    var st = window.__wvDiagState;
+    if (st) {
+      st.floatScanToken++;
+      if (st.deltaPreviewTimerId !== null) {
+        clearInterval(st.deltaPreviewTimerId);
+        st.deltaPreviewTimerId = null;
+      }
+      st.snapIndices = null;
+      st.snapValues = null;
+      st.snapCount = 0;
+      st.deltaCandidates = [];
+      st.scanRound = 0;
+    }
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('IDLE', 'Float delta scan reset');
+    }
+  } catch (_e) {}
+})();
+""".trimIndent()
+
+    // =========================================================================
+    // Step 2: Pointer & Memory Signature Analyzer (±16 block + HEAPU32 reverse pointer scan)
+    // =========================================================================
+
+    fun buildAnalyzePointerAndSignatureScript(baseIndex: Int): String {
+        val safeBase = baseIndex.coerceAtLeast(0)
+        return """
+(async function() {
+  $HEAP_RESOLVER_JS
+  try {
+    var st = __wvEnsureState($safeBase);
+    var token = ++st.analyzeToken;
+    var res = __wvResolveWasmHeap();
+    if (!res) {
+      if (window.TelemetryBridge) {
+        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not found');
+        window.TelemetryBridge.logTelemetry('PTR', JSON.stringify({
+          type: 'POINTER_SIGNATURE_ERROR',
+          reason: 'window.HEAPF32 / window.HEAPU32 is not initialized on this page.'
+        }));
+      }
+      return;
+    }
+
+    if ($safeBase + 2 >= res.length) {
+      if (window.TelemetryBridge) {
+        window.TelemetryBridge.updateScanStatus('ERROR', 'Base index out of bounds');
+        window.TelemetryBridge.logTelemetry('PTR', JSON.stringify({
+          type: 'POINTER_SIGNATURE_ERROR',
+          reason: 'Index ' + $safeBase + ' exceeds heap length (' + res.length + ').'
+        }));
+      }
+      return;
+    }
+
+    var startTime = performance.now();
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('RUNNING', 'Analyzing ±16 block & scanning HEAPU32 pointers...');
+    }
+
+    // 1. Extract ±16 surrounding HEAPF32 / HEAPU32 memory block & AOB/Float signature
+    var extracted = __wvExtractStructSignature(res, $safeBase, 16);
+    if (!extracted) {
+      if (window.TelemetryBridge) {
+        window.TelemetryBridge.logTelemetry('PTR', JSON.stringify({
+          type: 'POINTER_SIGNATURE_ERROR',
+          reason: 'Unable to extract ±16 memory signature around index ' + $safeBase
+        }));
+      }
+      return;
+    }
+
+    // 2. Non-blocking chunked Reverse Pointer Lookup across window.HEAPU32
+    var hu32 = res.hu32;
+    var targetByteAddr = ($safeBase * 4) >>> 0;
+    var minStructBase = targetByteAddr >= 64 ? (targetByteAddr - 64) : 0;
+    var exactPointers = [];
+    var structBasePointers = [];
+
+    if (hu32 && targetByteAddr > 0) {
+      var len = hu32.length;
+      var chunkSize = 262144;
+      var totalChunks = Math.max(1, Math.ceil(len / chunkSize));
+      var chunkNo = 0;
+
+      for (var s = 0; s < len; s += chunkSize) {
+        if (st.analyzeToken !== token) return;
+        chunkNo++;
+        var e = Math.min(len, s + chunkSize);
+        for (var p = s; p < e; p++) {
+          var val = hu32[p];
+          if (val === targetByteAddr) {
+            if (exactPointers.length < 16) {
+              exactPointers.push({
+                pointerHeapIndex: p,
+                pointerByteAddress: p * 4,
+                targetByteAddress: val,
+                fieldOffsetBytes: 0,
+                isExactMatch: true
+              });
+            }
+          } else if (val >= minStructBase && val < targetByteAddr && ((targetByteAddr - val) % 4) === 0) {
+            if (structBasePointers.length < 16) {
+              structBasePointers.push({
+                pointerHeapIndex: p,
+                pointerByteAddress: p * 4,
+                targetByteAddress: val,
+                fieldOffsetBytes: targetByteAddr - val,
+                isExactMatch: false
+              });
+            }
+          }
+        }
+        if (window.TelemetryBridge && (chunkNo % 4 === 0 || chunkNo === totalChunks)) {
+          window.TelemetryBridge.updateScanStatus(
+            'RUNNING',
+            'Reverse HEAPU32 pointer scan ' + chunkNo + '/' + totalChunks + '...'
+          );
+        }
+        await new Promise(function(resolve) { setTimeout(resolve, 12); });
+      }
+    }
+
+    if (st.analyzeToken !== token) return;
+
+    structBasePointers.sort(function(a, b) { return a.fieldOffsetBytes - b.fieldOffsetBytes; });
+    var parentPointers = exactPointers.concat(structBasePointers).slice(0, 24);
+
+    // Update live state immediately so the user sees LOCKED coords right away
+    st.baseIndex = $safeBase;
+    st.signature = extracted.signature;
+    st.parentPointers = parentPointers;
+
+    var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
+    var cx = res.hf32[$safeBase];
+    var cy = res.hf32[$safeBase + 1];
+    var cz = res.hf32[$safeBase + 2];
+
+    if (window.TelemetryBridge) {
+      if (window.TelemetryBridge.updateDirectHeapCoords && Number.isFinite(cx) && Number.isFinite(cy) && Number.isFinite(cz)) {
+        window.TelemetryBridge.updateDirectHeapCoords($safeBase, cx, cy, cz, res.byteLength, res.label);
+      }
+      window.TelemetryBridge.updateScanStatus(
+        'COMPLETED',
+        'Analyzed ' + extracted.signature.anchors.length + ' anchors, ' + parentPointers.length + ' ptrs'
+      );
+      window.TelemetryBridge.logTelemetry('PTR', JSON.stringify({
+        type: 'POINTER_SIGNATURE_ANALYZED',
+        baseIndex: $safeBase,
+        byteAddress: targetByteAddr,
+        aobPatternHex: extracted.aobPatternHex,
+        floatPatternSummary: extracted.floatPatternSummary,
+        anchorCount: extracted.signature.anchors.length,
+        signatureJson: JSON.stringify(extracted.signature),
+        parentPointers: parentPointers,
+        surroundingSlots: extracted.slots,
+        durationMs: durationMs,
+        heapByteLength: res.byteLength,
+        heapSource: res.label
+      }));
+    }
+  } catch (e) {
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('ERROR', 'Pointer analysis error');
+      window.TelemetryBridge.logTelemetry('ERR', 'Pointer/Signature error: ' + String(e));
+    }
+  }
+})();
+""".trimIndent()
+    }
+
+    // =========================================================================
+    // Step 3: One-Tap & Automatic Relock Across Reloads (Pointer Deref -> AOB/Float Scan)
+    // =========================================================================
+
+    fun buildAutoRelockScript(
+        currentBaseIndex: Int = VERIFIED_PLAYER_BASE_INDEX,
+        savedSignatureJson: String? = null,
+        savedPointersJson: String? = null
+    ): String {
+        val safeBase = currentBaseIndex.coerceAtLeast(0)
+        val sigLiteral = if (savedSignatureJson.isNullOrBlank()) "null" else quoteJsString(savedSignatureJson)
+        val ptrLiteral = if (savedPointersJson.isNullOrBlank()) "null" else quoteJsString(savedPointersJson)
+        return """
+(async function() {
+  $HEAP_RESOLVER_JS
+  try {
+    var st = __wvEnsureState($safeBase);
+    var token = ++st.relockToken;
+
+    var persistedSigStr = $sigLiteral;
+    if (persistedSigStr) {
+      try {
+        var parsedSig = JSON.parse(persistedSigStr);
+        if (parsedSig && Array.isArray(parsedSig.anchors) && parsedSig.anchors.length > 0) {
+          st.signature = parsedSig;
+        }
+      } catch (_pe) {}
+    }
+
+    var persistedPtrsStr = $ptrLiteral;
+    if (persistedPtrsStr) {
+      try {
+        var parsedPtrs = JSON.parse(persistedPtrsStr);
+        if (Array.isArray(parsedPtrs)) {
+          st.parentPointers = parsedPtrs;
+        }
+      } catch (_pp) {}
+    }
+
+    var res = __wvResolveWasmHeap();
+    if (!res) {
+      if (window.TelemetryBridge) {
+        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not found');
         window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
           type: 'RELOCK_FAILED',
           reason: 'window.HEAPF32 is not initialized on this page yet.'
@@ -351,131 +915,42 @@ function __wvBuildSignature(res, baseIndex) {
       }
       return;
     }
-    if ($safeBase + 2 >= res.length) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-          type: 'RELOCK_FAILED',
-          reason: 'Base index ' + $safeBase + ' exceeds heap length (' + res.length + ').'
-        }));
-      }
-      return;
-    }
-    var sig = __wvBuildSignature(res, $safeBase);
-    if (!sig || sig.anchors.length === 0) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-          type: 'RELOCK_FAILED',
-          reason: 'No non-zero surrounding signature words found around index ' + $safeBase + '.'
-        }));
-      }
-      return;
-    }
-    var st = window.__wvDiagFeed || (window.__wvDiagFeed = {
-      timerId: null, baseIndex: $safeBase, signature: null, relockToken: 0, entityScanToken: 0
-    });
-    st.signature = sig;
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-        type: 'SIGNATURE_CAPTURED',
-        auto: false,
-        baseIndex: $safeBase,
-        anchorCount: sig.anchors.length,
-        zeroCount: sig.zeroOffsets.length,
-        signatureJson: JSON.stringify(sig)
-      }));
-    }
-  } catch (e) {
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.logTelemetry('ERR', 'Capture signature error: ' + String(e));
-    }
-  }
-})();
-""".trimIndent()
-    }
 
-    /**
-     * Non-blocking async chunked Auto-Relock scanner.
-     * Uses the captured surrounding float/int32 signature to relocate the player's base index
-     * across `window.HEAPF32` after a page reload or zone transition, then resumes 200ms polling.
-     */
-    fun buildAutoRelockScript(
-        currentBaseIndex: Int = VERIFIED_PLAYER_BASE_INDEX,
-        savedSignatureJson: String? = null
-    ): String {
-        val safeBase = currentBaseIndex.coerceAtLeast(0)
-        val sigLiteral = if (savedSignatureJson.isNullOrBlank()) "null" else quoteJsString(savedSignatureJson)
-        return """
-(async function() {
-  $HEAP_RESOLVER_JS
-  try {
-    var st = window.__wvDiagFeed || (window.__wvDiagFeed = {
-      timerId: null, baseIndex: $safeBase, signature: null, relockToken: 0, entityScanToken: 0
-    });
-    var token = ++st.relockToken;
-
-    var persistedSigStr = $sigLiteral;
-    if (persistedSigStr) {
-      try {
-        var parsed = JSON.parse(persistedSigStr);
-        if (parsed && Array.isArray(parsed.anchors) && parsed.anchors.length > 0) {
-          st.signature = parsed;
-        }
-      } catch (_pe) {}
-    }
-
-    var res = __wvResolveFloatHeap();
-    if (!res) {
-      if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not found');
-        window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-          type: 'RELOCK_FAILED',
-          reason: 'window.HEAPF32 is not available on this page.'
-        }));
-      }
-      return;
-    }
-
-    // If no signature exists yet, capture immediately from the current/verified base index
+    // If no signature exists yet, capture from current base index immediately
     if (!st.signature || !Array.isArray(st.signature.anchors) || st.signature.anchors.length === 0) {
       if ($safeBase + 2 < res.length) {
-        var freshSig = __wvBuildSignature(res, $safeBase);
-        if (freshSig && freshSig.anchors.length > 0) {
-          st.signature = freshSig;
-          var cx = res.hf32[$safeBase], cy = res.hf32[$safeBase + 1], cz = res.hf32[$safeBase + 2];
+        var fresh = __wvExtractStructSignature(res, $safeBase, 16);
+        if (fresh && fresh.signature.anchors.length > 0) {
+          st.signature = fresh.signature;
+          var fx = res.hf32[$safeBase], fy = res.hf32[$safeBase + 1], fz = res.hf32[$safeBase + 2];
           if (window.TelemetryBridge) {
-            window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
-              type: 'SIGNATURE_CAPTURED',
-              auto: false,
-              baseIndex: $safeBase,
-              anchorCount: freshSig.anchors.length,
-              zeroCount: freshSig.zeroOffsets.length,
-              signatureJson: JSON.stringify(freshSig)
-            }));
             window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
               type: 'RELOCK_COMPLETE',
               oldBaseIndex: $safeBase,
               newBaseIndex: $safeBase,
               confidencePercent: 100,
-              matchedAnchors: freshSig.anchors.length,
-              totalAnchors: freshSig.anchors.length,
-              x: Number.isFinite(cx) ? cx : 0,
-              y: Number.isFinite(cy) ? cy : 0,
-              z: Number.isFinite(cz) ? cz : 0,
+              matchedAnchors: fresh.signature.anchors.length,
+              totalAnchors: fresh.signature.anchors.length,
+              method: 'Baseline Signature Lock',
+              x: Number.isFinite(fx) ? fx : 0,
+              y: Number.isFinite(fy) ? fy : 0,
+              z: Number.isFinite(fz) ? fz : 0,
               durationMs: 1,
               heapByteLength: res.byteLength,
               heapSource: res.label,
-              note: 'Captured baseline signature and locked onto index ' + $safeBase
+              signatureJson: JSON.stringify(fresh.signature),
+              aobPatternHex: fresh.aobPatternHex,
+              note: 'Captured signature and locked onto HEAPF32[' + $safeBase + ']'
             }));
-            window.TelemetryBridge.updateScanStatus('COMPLETED', 'Signature locked @ ' + $safeBase);
           }
           return;
         }
       }
       if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'No relock signature');
+        window.TelemetryBridge.updateScanStatus('ERROR', 'No saved profile');
         window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
           type: 'RELOCK_FAILED',
-          reason: 'No signature captured yet. Load the scene with valid coordinates first.'
+          reason: 'No saved signature profile. Use Step 1 & Step 2 to inspect and lock a coordinate first.'
         }));
       }
       return;
@@ -485,27 +960,13 @@ function __wvBuildSignature(res, baseIndex) {
     var anchors = sig.anchors;
     var zeroOffsets = sig.zeroOffsets || [];
     var totalWeight = anchors.length * 2 + zeroOffsets.length;
-    var primary = anchors[0];
     var hf32 = res.hf32;
-    var h32 = res.h32;
+    var hu32 = res.hu32;
     var len = res.length;
-
     var startTime = performance.now();
-    var chunkSize = 262144; // 1 MB per non-blocking slice
-    var minIdx = 26;
-    var maxIdx = len - 28;
-    var totalChunks = Math.max(1, Math.ceil((maxIdx - minIdx) / chunkSize));
 
-    var bestIdx = -1;
-    var bestScore = -1;
-    var bestMatched = 0;
-
-    if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus('RUNNING', 'Relocking HEAPF32 signature...');
-    }
-
-    // First fast-check the current base index so stationary relocks prefer exact continuity
     var scoreCandidate = function(idx) {
+      if (idx < 16 || idx + 18 >= len) return null;
       var x = hf32[idx], y = hf32[idx + 1], z = hf32[idx + 2];
       if (!__wvIsPlausibleCoord(x) || !__wvIsPlausibleCoord(y) || !__wvIsPlausibleCoord(z)) return null;
       var score = 0;
@@ -514,10 +975,11 @@ function __wvBuildSignature(res, baseIndex) {
         var an = anchors[a];
         var pos = idx + an.off;
         if (pos < 0 || pos >= len) continue;
-        if (h32 && h32[pos] === an.bits) {
+        var expectedU32 = (an.u32 !== undefined ? an.u32 : an.bits) >>> 0;
+        if (hu32 && (hu32[pos] >>> 0) === expectedU32) {
           score += 2;
           matched++;
-        } else if (an.fval !== null) {
+        } else if (an.fval !== null && an.fval !== undefined) {
           var fv = hf32[pos];
           if (Number.isFinite(fv) && Math.abs(fv - an.fval) <= 0.005) {
             score += 1;
@@ -527,63 +989,119 @@ function __wvBuildSignature(res, baseIndex) {
       }
       for (var zIdx = 0; zIdx < zeroOffsets.length; zIdx++) {
         var zPos = idx + zeroOffsets[zIdx];
-        if (zPos >= 0 && zPos < len && h32 && h32[zPos] === 0) {
+        if (zPos >= 0 && zPos < len && hu32 && hu32[zPos] === 0) {
           score += 1;
         }
       }
-      return { score: score, matched: matched };
+      var conf = totalWeight > 0 ? Math.min(100, Math.round((score * 100) / totalWeight)) : 0;
+      return { score: score, matched: matched, confidence: conf };
     };
 
-    if ($safeBase >= minIdx && $safeBase < maxIdx) {
-      var curEval = scoreCandidate($safeBase);
-      if (curEval && curEval.matched >= Math.max(2, Math.ceil(anchors.length * 0.5))) {
-        bestIdx = $safeBase;
-        bestScore = curEval.score;
-        bestMatched = curEval.matched;
+    // Tier 1: O(1) Reverse Parent Pointer Dereference check
+    var savedPtrs = st.parentPointers || [];
+    if (hu32 && savedPtrs.length > 0) {
+      for (var pi = 0; pi < savedPtrs.length; pi++) {
+        var ptr = savedPtrs[pi];
+        var pIdx = ptr.pointerHeapIndex;
+        if (pIdx >= 0 && pIdx < len) {
+          var pointedBaseAddr = hu32[pIdx] >>> 0;
+          var fieldOff = ptr.fieldOffsetBytes || 0;
+          var resolvedByteAddr = pointedBaseAddr + fieldOff;
+          if (resolvedByteAddr > 0 && (resolvedByteAddr % 4) === 0) {
+            var candidateIdx = resolvedByteAddr >>> 2;
+            var ptrEval = scoreCandidate(candidateIdx);
+            if (ptrEval && ptrEval.confidence >= 60) {
+              st.baseIndex = candidateIdx;
+              var px = hf32[candidateIdx], py = hf32[candidateIdx + 1], pz = hf32[candidateIdx + 2];
+              var ptrDur = Math.round((performance.now() - startTime) * 10) / 10;
+              if (window.TelemetryBridge) {
+                if (window.TelemetryBridge.updateDirectHeapCoords) {
+                  window.TelemetryBridge.updateDirectHeapCoords(candidateIdx, px, py, pz, res.byteLength, res.label);
+                }
+                window.TelemetryBridge.updateScanStatus('COMPLETED', 'Pointer Relock @ ' + candidateIdx + ' (' + ptrEval.confidence + '%)');
+                window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
+                  type: 'RELOCK_COMPLETE',
+                  oldBaseIndex: $safeBase,
+                  newBaseIndex: candidateIdx,
+                  confidencePercent: ptrEval.confidence,
+                  matchedAnchors: ptrEval.matched,
+                  totalAnchors: anchors.length,
+                  method: 'Parent Pointer Dereference (HEAPU32[' + pIdx + ']+0x' + fieldOff.toString(16).toUpperCase() + ')',
+                  x: px,
+                  y: py,
+                  z: pz,
+                  durationMs: ptrDur,
+                  heapByteLength: res.byteLength,
+                  heapSource: res.label,
+                  note: 'Instant pointer relock -> HEAPF32[' + candidateIdx + '] (' + ptrEval.confidence + '% match)'
+                }));
+              }
+              return;
+            }
+          }
+        }
       }
     }
 
-    var chunkIdx = 0;
+    // Tier 2: Full non-blocking chunked AOB / Float Signature Scan across window.HEAPU32 / HEAPF32
+    var primary = anchors[0];
+    var primaryU32 = (primary.u32 !== undefined ? primary.u32 : primary.bits) >>> 0;
+    var chunkSize = 262144;
+    var minIdx = 18;
+    var maxIdx = len - 20;
+    var totalChunks = Math.max(1, Math.ceil((maxIdx - minIdx) / chunkSize));
+
+    var bestIdx = -1;
+    var bestScore = -1;
+    var bestMatched = 0;
+    var bestConf = 0;
+
+    if (window.TelemetryBridge) {
+      window.TelemetryBridge.updateScanStatus('RUNNING', 'Auto-Relock scanning AOB/Float signature...');
+    }
+
+    var curEval = scoreCandidate($safeBase);
+    if (curEval && curEval.confidence >= 55) {
+      bestIdx = $safeBase;
+      bestScore = curEval.score;
+      bestMatched = curEval.matched;
+      bestConf = curEval.confidence;
+    }
+
+    var chunkNo = 0;
     for (var start = minIdx; start < maxIdx; start += chunkSize) {
       if (st.relockToken !== token) return;
-      chunkIdx++;
+      chunkNo++;
       var end = Math.min(maxIdx, start + chunkSize);
 
       for (var i = start; i < end; i++) {
-        // Fast pre-filter using primary anchor bit word
-        if (h32) {
-          var pPos = i + primary.off;
-          if (h32[pPos] !== primary.bits) continue;
-        }
+        if (hu32 && (hu32[i + primary.off] >>> 0) !== primaryU32) continue;
         var ev = scoreCandidate(i);
         if (!ev) continue;
         if (ev.score > bestScore ||
             (ev.score === bestScore && bestIdx !== -1 && Math.abs(i - $safeBase) < Math.abs(bestIdx - $safeBase))) {
           bestScore = ev.score;
           bestMatched = ev.matched;
+          bestConf = ev.confidence;
           bestIdx = i;
         }
       }
 
-      if (window.TelemetryBridge && (chunkIdx % 4 === 0 || chunkIdx === totalChunks)) {
-        window.TelemetryBridge.updateScanStatus(
-          'RUNNING',
-          'Relocking slice ' + chunkIdx + '/' + totalChunks + '...'
-        );
+      if (window.TelemetryBridge && (chunkNo % 4 === 0 || chunkNo === totalChunks)) {
+        window.TelemetryBridge.updateScanStatus('RUNNING', 'Auto-Relock slice ' + chunkNo + '/' + totalChunks + '...');
       }
       await new Promise(function(resolve) { setTimeout(resolve, 12); });
     }
 
     if (st.relockToken !== token) return;
     var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
-    var confidence = totalWeight > 0 ? Math.min(100, Math.round((bestScore * 100) / totalWeight)) : 0;
 
-    if (bestIdx === -1 || confidence < 35) {
+    if (bestIdx === -1 || bestConf < 35) {
       if (window.TelemetryBridge) {
-        window.TelemetryBridge.updateScanStatus('ERROR', 'Relock match not found');
+        window.TelemetryBridge.updateScanStatus('ERROR', 'Auto-Relock match not found');
         window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
           type: 'RELOCK_FAILED',
-          reason: 'No heap region matched signature above 35% confidence (best ' + confidence + '%, ' + durationMs + 'ms).'
+          reason: 'Signature not matched above 35% confidence (best ' + bestConf + '%, ' + durationMs + 'ms).'
         }));
       }
       return;
@@ -595,14 +1113,15 @@ function __wvBuildSignature(res, baseIndex) {
       if (window.TelemetryBridge.updateDirectHeapCoords) {
         window.TelemetryBridge.updateDirectHeapCoords(bestIdx, nx, ny, nz, res.byteLength, res.label);
       }
-      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Relocked @ HEAPF32[' + bestIdx + '] (' + confidence + '%)');
+      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Relocked @ HEAPF32[' + bestIdx + '] (' + bestConf + '%)');
       window.TelemetryBridge.logTelemetry('RELOCK', JSON.stringify({
         type: 'RELOCK_COMPLETE',
         oldBaseIndex: $safeBase,
         newBaseIndex: bestIdx,
-        confidencePercent: confidence,
+        confidencePercent: bestConf,
         matchedAnchors: bestMatched,
         totalAnchors: anchors.length,
+        method: 'AOB / Float Signature Scan',
         x: nx,
         y: ny,
         z: nz,
@@ -610,8 +1129,8 @@ function __wvBuildSignature(res, baseIndex) {
         heapByteLength: res.byteLength,
         heapSource: res.label,
         note: bestIdx === $safeBase
-          ? ('Verified base index ' + bestIdx + ' intact (' + confidence + '% signature match)')
-          : ('Relocated player base ' + $safeBase + ' -> ' + bestIdx + ' (' + confidence + '% match)')
+          ? ('Verified HEAPF32[' + bestIdx + '] intact (' + bestConf + '% match)')
+          : ('Relocated ' + $safeBase + ' -> ' + bestIdx + ' (' + bestConf + '% signature match)')
       }));
     }
   } catch (e) {
@@ -624,11 +1143,10 @@ function __wvBuildSignature(res, baseIndex) {
 """.trimIndent()
     }
 
-    /**
-     * Non-blocking async Nearby Entity Struct Scanner.
-     * Searches `window.HEAPF32` within `±searchRadius` (default ±50,000 indices) of the player's
-     * base index for repeating `(X, Y, Z)` float triplets matching valid world coordinate bounds.
-     */
+    // =========================================================================
+    // Nearby Entity Struct Scanner (±50,000), Manual JS & Viewport Metrics
+    // =========================================================================
+
     fun buildScanNearbyEntitiesScript(
         playerBaseIndex: Int = VERIFIED_PLAYER_BASE_INDEX,
         searchRadius: Int = DEFAULT_ENTITY_SCAN_RADIUS
@@ -639,12 +1157,10 @@ function __wvBuildSignature(res, baseIndex) {
 (async function() {
   $HEAP_RESOLVER_JS
   try {
-    var st = window.__wvDiagFeed || (window.__wvDiagFeed = {
-      timerId: null, baseIndex: $safeBase, signature: null, relockToken: 0, entityScanToken: 0
-    });
+    var st = __wvEnsureState($safeBase);
     var token = ++st.entityScanToken;
 
-    var res = __wvResolveFloatHeap();
+    var res = __wvResolveWasmHeap();
     if (!res) {
       if (window.TelemetryBridge) {
         window.TelemetryBridge.updateScanStatus('ERROR', 'window.HEAPF32 not ready');
@@ -672,9 +1188,7 @@ function __wvBuildSignature(res, baseIndex) {
       return;
     }
 
-    var px = hf32[pIdx];
-    var py = hf32[pIdx + 1];
-    var pz = hf32[pIdx + 2];
+    var px = hf32[pIdx], py = hf32[pIdx + 1], pz = hf32[pIdx + 2];
     var hasPlayerOrigin = __wvIsPlausibleCoord(px) && __wvIsPlausibleCoord(py) && __wvIsPlausibleCoord(pz) &&
       (Math.abs(px) + Math.abs(py) + Math.abs(pz) > 0.05);
 
@@ -705,9 +1219,7 @@ function __wvBuildSignature(res, baseIndex) {
       var e = Math.min(endIdx, s + chunkSize);
 
       for (var i = s; i < e; i++) {
-        // Exclude the player's own triplet window
         if (Math.abs(i - pIdx) < 4) continue;
-
         var ex = hf32[i];
         if (!isCleanWorldFloat(ex)) continue;
         var ey = hf32[i + 1];
@@ -715,7 +1227,6 @@ function __wvBuildSignature(res, baseIndex) {
         var ez = hf32[i + 2];
         if (!isCleanWorldFloat(ez)) continue;
 
-        // Skip zeroed buffers or unit vectors like (1, 1, 1) / (0, 1, 0)
         var mag = Math.abs(ex) + Math.abs(ey) + Math.abs(ez);
         if (mag < 0.25) continue;
         if (ex === ey && ey === ez) continue;
@@ -723,9 +1234,7 @@ function __wvBuildSignature(res, baseIndex) {
 
         var dist = 0;
         if (hasPlayerOrigin) {
-          var dx = ex - px;
-          var dy = ey - py;
-          var dz = ez - pz;
+          var dx = ex - px, dy = ey - py, dz = ez - pz;
           if (Math.abs(dy) > 150) continue;
           if (Math.abs(dx) > 1500 || Math.abs(dz) > 1500) continue;
           dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
@@ -743,25 +1252,19 @@ function __wvBuildSignature(res, baseIndex) {
           z: Math.round(ez * 1000) / 1000,
           dist: Math.round(dist * 100) / 100
         });
-
-        // Advance past this triplet to prevent shifted overlap [i+1, i+2, i+3]
         i += 2;
         if (rawMatches.length >= 4000) break;
       }
 
       if (rawMatches.length >= 4000) break;
       if (window.TelemetryBridge && (chunkCount % 2 === 0 || chunkCount === totalChunks)) {
-        window.TelemetryBridge.updateScanStatus(
-          'RUNNING',
-          'Entity scan slice ' + chunkCount + '/' + totalChunks + ' (' + rawMatches.length + ' hits)'
-        );
+        window.TelemetryBridge.updateScanStatus('RUNNING', 'Entity scan ' + chunkCount + '/' + totalChunks + ' (' + rawMatches.length + ' hits)');
       }
       await new Promise(function(resolve) { setTimeout(resolve, 10); });
     }
 
     if (st.entityScanToken !== token) return;
 
-    // Detect repeating struct stride via delta histogram across adjacent candidates
     var strideCounts = Object.create(null);
     for (var m = 1; m < rawMatches.length; m++) {
       var delta = rawMatches[m].idx - rawMatches[m - 1].idx;
@@ -770,20 +1273,17 @@ function __wvBuildSignature(res, baseIndex) {
       }
     }
 
-    var dominantStride = 0;
-    var dominantCount = 0;
+    var dominantStride = 0, dominantCount = 0;
     var strideKeys = Object.keys(strideCounts);
     for (var k = 0; k < strideKeys.length; k++) {
       var sk = parseInt(strideKeys[k], 10);
-      var sc = strideCounts[sk];
-      if (sc > dominantCount) {
-        dominantCount = sc;
+      if (strideCounts[sk] > dominantCount) {
+        dominantCount = strideCounts[sk];
         dominantStride = sk;
       }
     }
     if (dominantCount < 2) dominantStride = 0;
 
-    // Score each entity candidate: repeating stride alignment + proximity to player
     var scored = [];
     for (var j = 0; j < rawMatches.length; j++) {
       var item = rawMatches[j];
@@ -825,10 +1325,7 @@ function __wvBuildSignature(res, baseIndex) {
     var durationMs = Math.round((performance.now() - startTime) * 10) / 10;
 
     if (window.TelemetryBridge) {
-      window.TelemetryBridge.updateScanStatus(
-        'COMPLETED',
-        'Found ' + topEntities.length + ' entities (' + durationMs + 'ms)'
-      );
+      window.TelemetryBridge.updateScanStatus('COMPLETED', 'Found ' + topEntities.length + ' entities (' + durationMs + 'ms)');
       window.TelemetryBridge.logTelemetry('ENTITY', JSON.stringify({
         type: 'ENTITIES_SCANNED',
         playerBaseIndex: pIdx,
@@ -849,10 +1346,6 @@ function __wvBuildSignature(res, baseIndex) {
 """.trimIndent()
     }
 
-    /**
-     * Evaluates a user-entered read-only JavaScript inspection expression and streams the result
-     * back through [TelemetryBridge.logTelemetry].
-     */
     fun buildManualEvalScript(userCode: String): String {
         val quoted = quoteJsString(userCode)
         return """
@@ -901,17 +1394,13 @@ function __wvBuildSignature(res, baseIndex) {
 """.trimIndent()
     }
 
-    /**
-     * Collects read-only viewport, memory, and current `window.HEAPF32` snapshot metrics for
-     * user-initiated report export via [TelemetryBridge.exportReport].
-     */
     fun buildCollectViewportMetricsScript(baseIndex: Int = VERIFIED_PLAYER_BASE_INDEX): String {
         val safeBase = baseIndex.coerceAtLeast(0)
         return """
 (function() {
   $HEAP_RESOLVER_JS
   try {
-    var res = __wvResolveFloatHeap();
+    var res = __wvResolveWasmHeap();
     var heapSnapshot = null;
     if (res && $safeBase + 2 < res.length) {
       heapSnapshot = {

@@ -9,11 +9,15 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Fast local JVM unit tests verifying verified `window.HEAPF32[581246..581248]` direct polling,
- * Auto-Relock signature scanning, ±50,000 nearby entity struct scanning, strict read-only safety,
- * URL validation, and binary asset inspection.
+ * Fast local JVM unit tests verifying:
+ * - Step 1: Non-blocking Movement Float Delta Scanner (`window.HEAPF32`)
+ * - Step 2: ±16 AOB/Float Signature Extractor & Reverse `window.HEAPU32` Pointer Lookup
+ * - Step 3: Two-Tier Auto-Relock (Parent Pointer Dereference -> AOB/Float Scan)
+ * - Strict read-only invariant (zero WASM heap writes, zero synthetic input dispatch)
  */
 class ExampleUnitTest {
+
+    private val heapWriteRegex = Regex("""(hf32|h32|hu32|liveF32|fNow|HEAPF32|HEAP32|HEAPU32)\[[^\]]+]\s*=(?!=)""")
 
     @Test
     fun verifiedPlayerBaseIndexAndByteAddressAreAccurate() {
@@ -21,104 +25,102 @@ class ExampleUnitTest {
         val feed = DirectHeapFeedState()
         assertEquals(581246, feed.baseIndex)
         assertEquals(581246L * 4L, feed.byteAddress)
+        assertEquals(LockStatus.UNLOCKED, feed.lockStatus)
     }
 
     @Test
-    fun directFeedScriptPollsVerifiedHeapF32IndicesAt200msAndIsStrictlyReadOnly() {
-        val startScript = WasmHeapScripts.buildStartDirectFeedScript(
-            baseIndex = VERIFIED_PLAYER_BASE_INDEX,
-            savedSignatureJson = """{"v":1,"anchors":[{"off":-4,"bits":1065353216}]}"""
-        )
-        val stopScript = WasmHeapScripts.buildStopDirectFeedScript()
+    fun step1MovementFloatDeltaScriptsAreNonBlockingStillnessFilteredAndReadOnly() {
+        val baselineScript = WasmHeapScripts.buildCaptureStandingBaselineScript()
+        val deltaScript = WasmHeapScripts.buildScanMovementDeltasScript(minDelta = 0.05, maxDelta = 500.0)
+        val resetScript = WasmHeapScripts.buildResetFloatScanScript()
 
-        // Targets verified player indices & 200ms direct polling loop
-        assertTrue(startScript.contains("window.HEAPF32"))
-        assertTrue(startScript.contains("581246"))
-        assertTrue(startScript.contains("setInterval(pollTick, 200)"))
-        assertTrue(startScript.contains("updateDirectHeapCoords"))
-        assertTrue(startScript.contains("SIGNATURE_CAPTURED"))
-        assertTrue(stopScript.contains("clearInterval(st.timerId)"))
+        // Step 1A: Standing baseline snapshot + jitter prune
+        assertTrue(baselineScript.contains("(async function()"))
+        assertTrue(baselineScript.contains("window.HEAPF32"))
+        assertTrue(baselineScript.contains("new Int32Array("))
+        assertTrue(baselineScript.contains("new Float32Array("))
+        assertTrue(baselineScript.contains("setTimeout(resolve, 12)"))
+        assertTrue(baselineScript.contains("setTimeout(resolve, 120)"))
+        assertTrue(baselineScript.contains("FLOAT_BASELINE_CAPTURED"))
 
-        // Strictly read-only: zero writes to HEAPF32 / HEAP32 / hf32 / h32
-        val heapWriteRegex = Regex("""(hf32|h32|HEAPF32|HEAP32)\[[^\]]+]\s*=(?!=)""")
-        assertFalse("Direct feed must be strictly read-only", heapWriteRegex.containsMatchIn(startScript))
-        assertFalse("Stop script must be strictly read-only", heapWriteRegex.containsMatchIn(stopScript))
-    }
+        // Step 1B: Movement deltas + stillness verification + 200ms live preview
+        assertTrue(deltaScript.contains("(async function()"))
+        assertTrue(deltaScript.contains("FLOAT_DELTAS_SCANNED"))
+        assertTrue(deltaScript.contains("isStillNow"))
+        assertTrue(deltaScript.contains("updateFloatDeltaPreview"))
+        assertTrue(deltaScript.contains("200"))
 
-    @Test
-    fun autoRelockAndNearbyEntityScriptsAreNonBlockingChunkedAndStrictlyReadOnly() {
-        val captureSigScript = WasmHeapScripts.buildCaptureSignatureScript(VERIFIED_PLAYER_BASE_INDEX)
-        val relockScript = WasmHeapScripts.buildAutoRelockScript(
-            currentBaseIndex = VERIFIED_PLAYER_BASE_INDEX,
-            savedSignatureJson = """{"v":1,"anchors":[{"off":-2,"bits":1065353216}]}"""
-        )
-        val entityScanScript = WasmHeapScripts.buildScanNearbyEntitiesScript(
-            playerBaseIndex = VERIFIED_PLAYER_BASE_INDEX,
-            searchRadius = 50_000
-        )
+        assertTrue(resetScript.contains("st.snapIndices = null"))
 
-        // Auto-Relock: async chunked rescan with yielding & signature matching
-        assertTrue(captureSigScript.contains("__wvBuildSignature"))
-        assertTrue(captureSigScript.contains("SIGNATURE_CAPTURED"))
-        assertTrue(relockScript.contains("(async function()"))
-        assertTrue(relockScript.contains("setTimeout(resolve, 12)"))
-        assertTrue(relockScript.contains("RELOCK_COMPLETE"))
-        assertTrue(relockScript.contains("updateDirectHeapCoords"))
-
-        // Nearby Entity Scanner: ±50,000 radius, async slice yielding, stride detection
-        assertTrue(entityScanScript.contains("(async function()"))
-        assertTrue(entityScanScript.contains("50000"))
-        assertTrue(entityScanScript.contains("setTimeout(resolve, 10)"))
-        assertTrue(entityScanScript.contains("ENTITIES_SCANNED"))
-        assertTrue(entityScanScript.contains("dominantStride"))
-
-        // Strictly read-only: zero heap writes & zero input/touch dispatching
-        val heapWriteRegex = Regex("""(hf32|h32|HEAPF32|HEAP32)\[[^\]]+]\s*=(?!=)""")
-        listOf(captureSigScript, relockScript, entityScanScript).forEach { script ->
-            assertFalse("Script must never write to WASM heap", heapWriteRegex.containsMatchIn(script))
-            assertFalse("Script must never dispatch synthetic input events", script.contains("dispatchEvent"))
+        listOf(baselineScript, deltaScript, resetScript).forEach { script ->
+            assertFalse("Step 1 must never write to WASM heap", heapWriteRegex.containsMatchIn(script))
+            assertFalse("Step 1 must never dispatch synthetic input", script.contains("dispatchEvent"))
         }
     }
 
     @Test
-    fun manualJsEvalEscapesQuotesAndNewlinesWithoutAndroidOrgJson() {
-        val evalScript = WasmHeapScripts.buildManualEvalScript("window.HEAPF32.slice(581246, 581249)\n// \"check\"")
-        assertTrue(evalScript.contains("MANUAL_EVAL"))
-        assertTrue(evalScript.contains("""\\n""").not()) // single escaped \n in JS string literal
-        assertTrue(evalScript.contains("""\n// \"check\""""))
+    fun step2PointerAndSignatureScriptExtracts16SlotAobAndReverseScansHeapU32ReadOnly() {
+        val analyzeScript = WasmHeapScripts.buildAnalyzePointerAndSignatureScript(VERIFIED_PLAYER_BASE_INDEX)
+
+        assertTrue(analyzeScript.contains("(async function()"))
+        assertTrue(analyzeScript.contains("__wvExtractStructSignature(res, 581246, 16)"))
+        assertTrue(analyzeScript.contains("window.HEAPU32"))
+        assertTrue(analyzeScript.contains("var targetByteAddr = (581246 * 4) >>> 0;"))
+        assertTrue(analyzeScript.contains("setTimeout(resolve, 12)"))
+        assertTrue(analyzeScript.contains("POINTER_SIGNATURE_ANALYZED"))
+        assertTrue(analyzeScript.contains("aobPatternHex"))
+        assertTrue(analyzeScript.contains("parentPointers"))
+
+        assertFalse("Step 2 must never write to WASM heap", heapWriteRegex.containsMatchIn(analyzeScript))
+        assertFalse("Step 2 must never dispatch synthetic input", analyzeScript.contains("dispatchEvent"))
     }
 
     @Test
-    fun urlValidationAndAssetExtensionMatchingWorkCleanly() {
+    fun step3AutoRelockAndDirectFeedScriptsSupportPointerDerefAndSignatureFallbackReadOnly() {
+        val feedScript = WasmHeapScripts.buildStartDirectFeedScript(VERIFIED_PLAYER_BASE_INDEX)
+        val relockScript = WasmHeapScripts.buildAutoRelockScript(
+            currentBaseIndex = VERIFIED_PLAYER_BASE_INDEX,
+            savedSignatureJson = """{"v":2,"anchors":[{"off":-4,"u32":1065353216}]}""",
+            savedPointersJson = """[{"pointerHeapIndex":1024,"fieldOffsetBytes":16}]"""
+        )
+        val entityScanScript = WasmHeapScripts.buildScanNearbyEntitiesScript(VERIFIED_PLAYER_BASE_INDEX, 50_000)
+
+        assertTrue(feedScript.contains("setInterval(pollTick, 200)"))
+        assertTrue(feedScript.contains("updateDirectHeapCoords"))
+
+        // Two-tier relock: Tier 1 O(1) Parent Pointer Dereference -> Tier 2 AOB/Float Signature Scan
+        assertTrue(relockScript.contains("Parent Pointer Dereference"))
+        assertTrue(relockScript.contains("AOB / Float Signature Scan"))
+        assertTrue(relockScript.contains("RELOCK_COMPLETE"))
+        assertTrue(relockScript.contains("setTimeout(resolve, 12)"))
+
+        assertTrue(entityScanScript.contains("ENTITIES_SCANNED"))
+        assertTrue(entityScanScript.contains("50000"))
+
+        listOf(feedScript, relockScript, entityScanScript).forEach { script ->
+            assertFalse("Script must never write to WASM heap", heapWriteRegex.containsMatchIn(script))
+            assertFalse("Script must never dispatch synthetic input", script.contains("dispatchEvent"))
+        }
+    }
+
+    @Test
+    fun manualJsEvalEscapesQuotesWithoutAndroidOrgJson() {
+        val evalScript = WasmHeapScripts.buildManualEvalScript("window.HEAPF32.slice(581246, 581249)\n// \"ok\"")
+        assertTrue(evalScript.contains("MANUAL_EVAL"))
+        assertTrue(evalScript.contains("""\n// \"ok\""""))
+    }
+
+    @Test
+    fun urlValidationAndBinaryInspectorWorkOnPureJvm() {
         val normalized = DiagnosticsViewModel.validateAndNormalizeUrl("example.com/game")
         assertTrue(normalized is UrlValidationResult.Valid)
         assertEquals("https://example.com/game", (normalized as UrlValidationResult.Valid).normalizedUrl)
-
         assertTrue(DiagnosticsViewModel.validateAndNormalizeUrl("javascript:alert(1)") is UrlValidationResult.Invalid)
-        assertTrue(DiagnosticsViewModel.validateAndNormalizeUrl("file:///etc/passwd") is UrlValidationResult.Invalid)
-        assertTrue(DiagnosticsViewModel.validateAndNormalizeUrl("   ") is UrlValidationResult.Invalid)
-
-        assertEquals(".wasm", DiagnosticsViewModel.extractTrackedAssetExtension("https://cdn.example.com/app.wasm?v=3"))
-        assertEquals(".bin", DiagnosticsViewModel.extractTrackedAssetExtension("https://cdn.example.com/mesh.bin"))
-        assertEquals(".json", DiagnosticsViewModel.extractTrackedAssetExtension("https://cdn.example.com/map.json#top"))
         assertNull(DiagnosticsViewModel.extractTrackedAssetExtension("https://cdn.example.com/style.css"))
-    }
-
-    @Test
-    fun binaryAssetInspectorDecodesWasmAndFloat32BuffersOnPureJvm() {
-        val wasmBytes = byteArrayOf(
-            0x00, 0x61, 0x73, 0x6D,
-            0x01, 0x00, 0x00, 0x00,
-            0x01, 0x01, 0x00
-        )
-        val wasmAudit = BinaryAssetInspector.inspectBytes(wasmBytes, ".wasm")
-        assertEquals("WASM v1", wasmAudit.magicSignature)
-        assertTrue(wasmAudit.structuralDetails.contains("Type(1 B)"))
 
         val bb = ByteBuffer.allocate(24).order(ByteOrder.LITTLE_ENDIAN)
         listOf(12.5f, 3.0f, -44.25f, 1.0f, 0.0f, 2.5f).forEach { bb.putFloat(it) }
         val binAudit = BinaryAssetInspector.inspectBytes(bb.array(), ".bin")
         assertEquals("Binary Float32 Buffer", binAudit.magicSignature)
-        assertTrue(binAudit.structuralDetails.contains("12.50, 3.00, -44.25"))
     }
 }

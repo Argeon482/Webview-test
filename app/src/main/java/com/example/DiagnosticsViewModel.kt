@@ -35,6 +35,7 @@ sealed interface DiagnosticsCommand {
 
 class DiagnosticsViewModel(application: Application) : AndroidViewModel(application) {
 
+    private val profileStore = LockProfileStore(application)
     private val _uiState = MutableStateFlow(DiagnosticsUiState())
     val uiState: StateFlow<DiagnosticsUiState> = _uiState.asStateFlow()
 
@@ -43,14 +44,53 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
 
     private val nextLogId = AtomicLong(1L)
     private var exportFallbackJob: Job? = null
+    private var autoRelockDelayJob: Job? = null
     private val inFlightAssetUrls = HashSet<String>()
 
     init {
-        appendLog(
-            category = LogCategory.SYSTEM,
-            summary = "WebViewDiagnosticsApp ready (strictly observational, remote debugging OFF)",
-            payload = "Verified target: window.HEAPF32[$VERIFIED_PLAYER_BASE_INDEX] (X), [${VERIFIED_PLAYER_BASE_INDEX + 1}] (Y), [${VERIFIED_PLAYER_BASE_INDEX + 2}] (Z) @ 200ms"
-        )
+        val persisted = profileStore.loadProfile()
+        val autoRelockPref = profileStore.isAutoRelockEnabled()
+
+        if (persisted != null) {
+            _uiState.update { state ->
+                state.copy(
+                    savedProfile = persisted,
+                    heapFeed = state.heapFeed.copy(
+                        baseIndex = persisted.baseIndex,
+                        baseIndexInput = persisted.baseIndex.toString(),
+                        hasSignature = true,
+                        signatureAnchorCount = persisted.anchorCount,
+                        signatureCapturedAtIndex = persisted.baseIndex,
+                        signatureJson = persisted.signatureJson,
+                        autoRelockOnReload = autoRelockPref,
+                        lastRelockSummary = "Loaded saved profile (${persisted.anchorCount} anchors, ${persisted.parentPointers.size} ptrs)"
+                    ),
+                    pointerAnalysis = state.pointerAnalysis.copy(
+                        inspectedBaseIndex = persisted.baseIndex,
+                        inspectedByteAddress = persisted.baseIndex.toLong() * 4L,
+                        aobPatternHex = persisted.aobPatternHex,
+                        floatPatternSummary = persisted.floatPatternSummary,
+                        anchorCount = persisted.anchorCount,
+                        signatureJson = persisted.signatureJson,
+                        parentPointers = persisted.parentPointers
+                    )
+                )
+            }
+            appendLog(
+                category = LogCategory.RELOCK,
+                summary = "Restored saved lock profile from SharedPreferences (HEAPF32[${persisted.baseIndex}])",
+                payload = "Anchors: ${persisted.anchorCount} | Parent Pointers: ${persisted.parentPointers.size} | Auto-Relock: $autoRelockPref"
+            )
+        } else {
+            _uiState.update { state ->
+                state.copy(heapFeed = state.heapFeed.copy(autoRelockOnReload = autoRelockPref))
+            }
+            appendLog(
+                category = LogCategory.SYSTEM,
+                summary = "WASM Memory Scanner & Persistent Lock ready (remote debugging OFF)",
+                payload = "Default target: window.HEAPF32[$VERIFIED_PLAYER_BASE_INDEX..${VERIFIED_PLAYER_BASE_INDEX + 2}] @ 200ms"
+            )
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -65,11 +105,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         val rawInput = _uiState.value.urlInput
         when (val validation = validateAndNormalizeUrl(rawInput)) {
             is UrlValidationResult.Invalid -> {
-                appendLog(
-                    category = LogCategory.ERROR,
-                    summary = "Blocked invalid URL",
-                    payload = validation.reason
-                )
+                appendLog(LogCategory.ERROR, "Blocked invalid URL", validation.reason)
                 _commands.tryEmit(DiagnosticsCommand.ShowToast(validation.reason))
             }
 
@@ -82,11 +118,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                         loadProgress = 5
                     )
                 }
-                appendLog(
-                    category = LogCategory.SYSTEM,
-                    summary = "Loading target URL",
-                    payload = validation.normalizedUrl
-                )
+                appendLog(LogCategory.SYSTEM, "Loading target URL", validation.normalizedUrl)
                 _commands.tryEmit(DiagnosticsCommand.LoadUrl(validation.normalizedUrl))
             }
         }
@@ -98,10 +130,9 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
             _commands.tryEmit(DiagnosticsCommand.ShowToast("Load a valid URL first"))
             return
         }
-        // Preserve captured relock signature across reloads so Relock Coordinates works immediately.
         appendLog(
             category = LogCategory.SYSTEM,
-            summary = "Reloading target page (signature preserved)",
+            summary = "Reloading target page (saved profile preserved)",
             payload = current
         )
         _commands.tryEmit(DiagnosticsCommand.Reload)
@@ -121,6 +152,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     fun onPageStarted(url: String) {
+        autoRelockDelayJob?.cancel()
         _uiState.update { state ->
             state.copy(
                 activeUrl = url,
@@ -129,7 +161,8 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                 loadProgress = 10,
                 heapFeed = state.heapFeed.copy(
                     isHeapReady = false,
-                    statusMessage = "Page loading… will auto-attach 200ms HEAPF32 feed"
+                    lockStatus = LockStatus.UNLOCKED,
+                    statusMessage = "Page loading… preparing 200ms HEAPF32 feed"
                 )
             )
         }
@@ -149,22 +182,25 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
             )
         }
         if (url != "about:blank") {
-            appendLog(
-                category = LogCategory.SYSTEM,
-                summary = "Page loaded: ${title.ifBlank { url }}",
-                payload = url
-            )
-            // Auto-attach the verified 200ms direct HEAPF32 feed on page load
+            appendLog(LogCategory.SYSTEM, "Page loaded: ${title.ifBlank { url }}", url)
             startDirectHeapFeed()
+
+            // Automatic Relock on reload if a saved signature/pointer profile exists
+            val stateNow = _uiState.value
+            if (stateNow.heapFeed.autoRelockOnReload &&
+                (stateNow.savedProfile != null || stateNow.heapFeed.hasSignature)
+            ) {
+                autoRelockDelayJob?.cancel()
+                autoRelockDelayJob = viewModelScope.launch {
+                    delay(1_400L) // allow WASM module & linear memory heap to finish booting
+                    autoRelockCoordinates(isAutomatic = true)
+                }
+            }
         }
     }
 
     fun onWebViewError(description: String, failingUrl: String) {
-        appendLog(
-            category = LogCategory.ERROR,
-            summary = "WebView load error: $description",
-            payload = failingUrl
-        )
+        appendLog(LogCategory.ERROR, "WebView load error: $description", failingUrl)
         _uiState.update { it.copy(isLoading = false) }
     }
 
@@ -185,8 +221,264 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     // -------------------------------------------------------------------------
-    // Direct Verified HEAPF32 Telemetry Feed (200ms) & Auto-Relock Signature
+    // Step 1: Movement Float Delta Scanner (window.HEAPF32)
     // -------------------------------------------------------------------------
+
+    fun captureStandingBaseline() {
+        if (!ensurePageLoadedForInspection()) return
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Capturing standing float baseline…",
+                floatScanner = state.floatScanner.copy(
+                    isBusy = true,
+                    isLivePreviewing = false,
+                    statusMessage = "Snapshotting static floats in window.HEAPF32 (stand completely still)…"
+                )
+            )
+        }
+        appendLog(
+            category = LogCategory.SCAN,
+            summary = "Step 1A: Capturing standing float baseline",
+            payload = "Non-blocking chunked snapshot of window.HEAPF32 + 120ms jitter prune"
+        )
+        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildCaptureStandingBaselineScript()))
+    }
+
+    fun scanMovementDeltas() {
+        if (!ensurePageLoadedForInspection()) return
+        if (!_uiState.value.floatScanner.baselineCaptured) {
+            _commands.tryEmit(DiagnosticsCommand.ShowToast("Tap '1. Capture Standing Baseline' first"))
+            return
+        }
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Scanning movement float deltas…",
+                floatScanner = state.floatScanner.copy(
+                    isBusy = true,
+                    statusMessage = "Filtering window.HEAPF32 for floats that shifted & stopped…"
+                )
+            )
+        }
+        appendLog(
+            category = LogCategory.SCAN,
+            summary = "Step 1B: Scanning movement float deltas",
+            payload = "Comparing current window.HEAPF32 against baseline with 120ms stillness filter"
+        )
+        _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildScanMovementDeltasScript()))
+    }
+
+    fun resetFloatScan() {
+        _uiState.update { state ->
+            state.copy(floatScanner = FloatDeltaScannerState())
+        }
+        if (_uiState.value.activeUrl != "about:blank") {
+            _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildResetFloatScanScript()))
+        }
+        appendLog(LogCategory.SCAN, "Reset Movement Float Delta Scanner", "Cleared baseline and candidates.")
+    }
+
+    fun onFloatDeltaPreviewFromBridge(jsonPayload: String) {
+        val obj = runCatching { JSONObject(jsonPayload) }.getOrNull() ?: return
+        val updatesArr = obj.optJSONArray("updates") ?: return
+        if (updatesArr.length() == 0) return
+
+        val updateMap = HashMap<Int, Triple<Double, Double, Double>>(updatesArr.length())
+        for (i in 0 until updatesArr.length()) {
+            val item = updatesArr.optJSONObject(i) ?: continue
+            val idx = item.optInt("heapIndex", -1)
+            if (idx < 0) continue
+            updateMap[idx] = Triple(
+                item.optDouble("currentValue", 0.0),
+                item.optDouble("previewY", 0.0),
+                item.optDouble("previewZ", 0.0)
+            )
+        }
+        if (updateMap.isEmpty()) return
+
+        _uiState.update { state ->
+            val updatedList = state.floatScanner.candidates.map { cand ->
+                val live = updateMap[cand.heapIndex] ?: return@map cand
+                val changed = kotlin.math.abs(live.first - cand.currentValue) > 0.001
+                cand.copy(
+                    currentValue = live.first,
+                    delta = live.first - cand.baselineValue,
+                    previewY = live.second,
+                    previewZ = live.third,
+                    liveChangeCount = if (changed) cand.liveChangeCount + 1 else cand.liveChangeCount
+                )
+            }
+            state.copy(
+                floatScanner = state.floatScanner.copy(
+                    isLivePreviewing = true,
+                    candidates = updatedList
+                )
+            )
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Step 2: Pointer & Memory Signature Analyzer + Persistent SharedPreferences Lock
+    // -------------------------------------------------------------------------
+
+    fun inspectAndLockCandidate(baseIndex: Int) {
+        if (!ensurePageLoadedForInspection()) return
+        val safeBase = baseIndex.coerceAtLeast(0)
+        _uiState.update { state ->
+            state.copy(
+                activeConsoleTab = ConsoleTab.ANALYZER,
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Analyzing ±16 block & HEAPU32 pointers for [$safeBase]…",
+                heapFeed = state.heapFeed.copy(
+                    baseIndex = safeBase,
+                    baseIndexInput = safeBase.toString(),
+                    lockStatus = LockStatus.LOCKED
+                ),
+                pointerAnalysis = state.pointerAnalysis.copy(
+                    inspectedBaseIndex = safeBase,
+                    inspectedByteAddress = safeBase.toLong() * 4L,
+                    isAnalyzing = true,
+                    errorMessage = null
+                )
+            )
+        }
+        appendLog(
+            category = LogCategory.PTR,
+            summary = "Step 2: Analyzing ±16 struct signature & reverse HEAPU32 pointers for [$safeBase]",
+            payload = "Byte address: 0x${(safeBase.toLong() * 4L).toString(16).uppercase(Locale.US)}"
+        )
+        _commands.tryEmit(
+            DiagnosticsCommand.EvaluateJs(
+                WasmHeapScripts.buildAnalyzePointerAndSignatureScript(safeBase)
+            )
+        )
+        // Lock the 200ms top Live Telemetry Bar onto this candidate immediately
+        startDirectHeapFeed()
+    }
+
+    fun saveAndLockProfile() {
+        val state = _uiState.value
+        val analysis = state.pointerAnalysis
+        val sigJson = analysis.signatureJson ?: state.heapFeed.signatureJson
+        val targetIndex = analysis.inspectedBaseIndex ?: state.heapFeed.baseIndex
+
+        if (sigJson.isNullOrBlank()) {
+            _commands.tryEmit(DiagnosticsCommand.ShowToast("Analyze a candidate index first before saving"))
+            return
+        }
+
+        val host = extractHost(state.activeUrl)
+        val profile = SavedLockProfile(
+            baseIndex = targetIndex,
+            host = host,
+            aobPatternHex = analysis.aobPatternHex,
+            floatPatternSummary = analysis.floatPatternSummary,
+            anchorCount = analysis.anchorCount.takeIf { it > 0 } ?: state.heapFeed.signatureAnchorCount,
+            signatureJson = sigJson,
+            parentPointers = analysis.parentPointers,
+            autoRelockOnReload = state.heapFeed.autoRelockOnReload,
+            savedAtEpochMs = System.currentTimeMillis()
+        )
+
+        profileStore.saveProfile(profile)
+
+        _uiState.update { current ->
+            current.copy(
+                savedProfile = profile,
+                heapFeed = current.heapFeed.copy(
+                    baseIndex = targetIndex,
+                    baseIndexInput = targetIndex.toString(),
+                    lockStatus = LockStatus.LOCKED,
+                    hasSignature = true,
+                    signatureAnchorCount = profile.anchorCount,
+                    signatureCapturedAtIndex = targetIndex,
+                    signatureJson = sigJson,
+                    lastRelockSummary = "Profile saved to SharedPreferences (${profile.anchorCount} anchors, ${profile.parentPointers.size} ptrs)"
+                )
+            )
+        }
+
+        appendLog(
+            category = LogCategory.PTR,
+            summary = "Saved & Locked Profile to SharedPreferences (HEAPF32[$targetIndex])",
+            payload = "AOB: ${profile.aobPatternHex.take(120)} | Parent Pointers: ${profile.parentPointers.size}"
+        )
+        _commands.tryEmit(
+            DiagnosticsCommand.ShowToast("Profile saved & locked @ HEAPF32[$targetIndex]")
+        )
+        if (state.activeUrl != "about:blank") {
+            startDirectHeapFeed()
+        }
+    }
+
+    fun clearSavedProfile() {
+        profileStore.clearProfile()
+        _uiState.update { state ->
+            state.copy(
+                savedProfile = null,
+                heapFeed = state.heapFeed.copy(
+                    lockStatus = LockStatus.UNLOCKED,
+                    hasSignature = false,
+                    signatureAnchorCount = 0,
+                    signatureCapturedAtIndex = null,
+                    signatureJson = null,
+                    lastRelockSummary = "Saved lock profile cleared"
+                )
+            )
+        }
+        appendLog(LogCategory.RELOCK, "Cleared saved lock profile from SharedPreferences", "")
+        _commands.tryEmit(DiagnosticsCommand.ShowToast("Saved lock profile cleared"))
+    }
+
+    // -------------------------------------------------------------------------
+    // Step 3: One-Tap & Automatic Relock Across Reloads + Direct Feed Controls
+    // -------------------------------------------------------------------------
+
+    fun onToggleAutoRelockOnReload(enabled: Boolean) {
+        profileStore.setAutoRelockEnabled(enabled)
+        _uiState.update { state ->
+            state.copy(
+                savedProfile = state.savedProfile?.copy(autoRelockOnReload = enabled),
+                heapFeed = state.heapFeed.copy(autoRelockOnReload = enabled)
+            )
+        }
+    }
+
+    fun autoRelockCoordinates(isAutomatic: Boolean = false) {
+        if (!ensurePageLoadedForInspection()) return
+        val state = _uiState.value
+        val feed = state.heapFeed
+        val sigJson = state.savedProfile?.signatureJson ?: feed.signatureJson
+        val pointers = state.savedProfile?.parentPointers ?: state.pointerAnalysis.parentPointers
+        val pointersJson = serializePointersJson(pointers)
+
+        _uiState.update { current ->
+            current.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = if (isAutomatic) "Auto-Relock on reload…" else "Relocking saved profile…",
+                heapFeed = current.heapFeed.copy(
+                    isRelocking = true,
+                    lockStatus = LockStatus.RELOCKING,
+                    statusMessage = "Running Pointer Deref -> AOB/Float signature relock…"
+                )
+            )
+        }
+        appendLog(
+            category = LogCategory.RELOCK,
+            summary = if (isAutomatic) "Automatic reload relock started" else "One-tap Auto-Relock triggered",
+            payload = "Base=${feed.baseIndex} | Anchors=${feed.signatureAnchorCount} | Saved Pointers=${pointers.size}"
+        )
+        _commands.tryEmit(
+            DiagnosticsCommand.EvaluateJs(
+                WasmHeapScripts.buildAutoRelockScript(
+                    currentBaseIndex = feed.baseIndex,
+                    savedSignatureJson = sigJson,
+                    savedPointersJson = pointersJson
+                )
+            )
+        )
+    }
 
     fun onBaseIndexInputChanged(raw: String) {
         val digitsOnly = raw.filter { it.isDigit() }.take(9)
@@ -206,15 +498,10 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                 heapFeed = state.heapFeed.copy(
                     baseIndex = parsed,
                     baseIndexInput = parsed.toString(),
-                    statusMessage = "Updated base index to window.HEAPF32[$parsed..${parsed + 2}]"
+                    statusMessage = "Switched base index to window.HEAPF32[$parsed..${parsed + 2}]"
                 )
             )
         }
-        appendLog(
-            category = LogCategory.FEED,
-            summary = "Base index updated to $parsed (0x${(parsed.toLong() * 4L).toString(16).uppercase(Locale.US)})",
-            payload = "window.HEAPF32[$parsed], [${parsed + 1}], [${parsed + 2}]"
-        )
         if (_uiState.value.activeUrl != "about:blank") {
             startDirectHeapFeed()
         }
@@ -225,16 +512,10 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
             state.copy(
                 heapFeed = state.heapFeed.copy(
                     baseIndex = VERIFIED_PLAYER_BASE_INDEX,
-                    baseIndexInput = VERIFIED_PLAYER_BASE_INDEX.toString(),
-                    statusMessage = "Reset to verified window.HEAPF32[$VERIFIED_PLAYER_BASE_INDEX..${VERIFIED_PLAYER_BASE_INDEX + 2}]"
+                    baseIndexInput = VERIFIED_PLAYER_BASE_INDEX.toString()
                 )
             )
         }
-        appendLog(
-            category = LogCategory.FEED,
-            summary = "Reset base index to verified $VERIFIED_PLAYER_BASE_INDEX",
-            payload = "window.HEAPF32[$VERIFIED_PLAYER_BASE_INDEX..${VERIFIED_PLAYER_BASE_INDEX + 2}]"
-        )
         if (_uiState.value.activeUrl != "about:blank") {
             startDirectHeapFeed()
         }
@@ -255,7 +536,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
             DiagnosticsCommand.EvaluateJs(
                 WasmHeapScripts.buildStartDirectFeedScript(
                     baseIndex = feed.baseIndex,
-                    savedSignatureJson = feed.signatureJson
+                    savedSignatureJson = _uiState.value.savedProfile?.signatureJson ?: feed.signatureJson
                 )
             )
         )
@@ -275,53 +556,6 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
-    fun captureRelockSignature() {
-        if (!ensurePageLoadedForInspection()) return
-        val baseIndex = _uiState.value.heapFeed.baseIndex
-        appendLog(
-            category = LogCategory.RELOCK,
-            summary = "Capturing memory signature around HEAPF32[$baseIndex]…",
-            payload = "Sampling ±24 surrounding Int32/Float32 anchor words (read-only)"
-        )
-        _commands.tryEmit(
-            DiagnosticsCommand.EvaluateJs(
-                WasmHeapScripts.buildCaptureSignatureScript(baseIndex)
-            )
-        )
-    }
-
-    fun relockCoordinates() {
-        if (!ensurePageLoadedForInspection()) return
-        val feed = _uiState.value.heapFeed
-        _uiState.update { state ->
-            state.copy(
-                scanStatus = AsyncScanStatus.RUNNING,
-                scanStatusDetail = "Relocking HEAPF32 signature…",
-                heapFeed = state.heapFeed.copy(
-                    isRelocking = true,
-                    statusMessage = if (feed.hasSignature) {
-                        "Scanning window.HEAPF32 for ${feed.signatureAnchorCount}-anchor signature…"
-                    } else {
-                        "Capturing signature & verifying HEAPF32[${feed.baseIndex}]…"
-                    }
-                )
-            )
-        }
-        appendLog(
-            category = LogCategory.RELOCK,
-            summary = "Auto-Relock triggered (base=${feed.baseIndex}, anchors=${feed.signatureAnchorCount})",
-            payload = "Non-blocking chunked signature scan across window.HEAPF32"
-        )
-        _commands.tryEmit(
-            DiagnosticsCommand.EvaluateJs(
-                WasmHeapScripts.buildAutoRelockScript(
-                    currentBaseIndex = feed.baseIndex,
-                    savedSignatureJson = feed.signatureJson
-                )
-            )
-        )
-    }
-
     // -------------------------------------------------------------------------
     // Nearby Entity Struct Scanner (±50,000)
     // -------------------------------------------------------------------------
@@ -334,7 +568,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
             state.copy(
                 isScanningEntities = true,
                 scanStatus = AsyncScanStatus.RUNNING,
-                scanStatusDetail = "Scanning ±$radius indices around ${feed.baseIndex}…",
+                scanStatusDetail = "Scanning ±$radius around ${feed.baseIndex}…",
                 activeConsoleTab = ConsoleTab.ENTITIES
             )
         }
@@ -367,7 +601,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     // -------------------------------------------------------------------------
-    // Bridge Callbacks (Direct 200ms Coords, Status, Telemetry Events)
+    // Bridge Callbacks (Direct 200ms Coords, Status, Structured Telemetry)
     // -------------------------------------------------------------------------
 
     fun onDirectHeapCoordsUpdatedFromBridge(
@@ -393,12 +627,18 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         _uiState.update { state ->
             val prevFeed = state.heapFeed
             val updatedStream = (listOf(streamLine) + state.liveStreamHistory).take(MAX_LIVE_STREAM_LINES)
+            val resolvedLock = when {
+                prevFeed.isRelocking -> LockStatus.RELOCKING
+                prevFeed.lockStatus == LockStatus.LOCKED || state.savedProfile != null -> LockStatus.LOCKED
+                else -> prevFeed.lockStatus
+            }
             state.copy(
                 heapFeed = prevFeed.copy(
                     baseIndex = baseIndex,
                     baseIndexInput = if (prevFeed.baseIndex != baseIndex) baseIndex.toString() else prevFeed.baseIndexInput,
                     heapSourceLabel = heapSource,
                     heapByteLength = heapByteLength,
+                    lockStatus = resolvedLock,
                     isPolling = true,
                     isHeapReady = true,
                     x = x,
@@ -415,19 +655,14 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
 
     fun onScanStatusChangedFromBridge(status: AsyncScanStatus, detail: String) {
         _uiState.update { state ->
+            val finished = status == AsyncScanStatus.COMPLETED || status == AsyncScanStatus.ERROR
             state.copy(
                 scanStatus = status,
                 scanStatusDetail = detail,
-                isScanningEntities = if (status == AsyncScanStatus.COMPLETED || status == AsyncScanStatus.ERROR) {
-                    false
-                } else {
-                    state.isScanningEntities
-                },
-                heapFeed = if (status == AsyncScanStatus.COMPLETED || status == AsyncScanStatus.ERROR) {
-                    state.heapFeed.copy(isRelocking = false)
-                } else {
-                    state.heapFeed
-                }
+                isScanningEntities = if (finished) false else state.isScanningEntities,
+                floatScanner = if (finished) state.floatScanner.copy(isBusy = false) else state.floatScanner,
+                pointerAnalysis = if (finished) state.pointerAnalysis.copy(isAnalyzing = false) else state.pointerAnalysis,
+                heapFeed = if (finished) state.heapFeed.copy(isRelocking = false) else state.heapFeed
             )
         }
     }
@@ -436,8 +671,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         val category = LogCategory.fromRaw(rawCategory)
         val trimmed = payload.trim()
         if (trimmed.startsWith("{")) {
-            val handled = tryHandleStructuredTelemetry(trimmed)
-            if (handled) return
+            if (tryHandleStructuredTelemetry(trimmed)) return
         }
         val summaryLine = trimmed.lineSequence().firstOrNull()?.take(110).orEmpty().ifBlank { category.label }
         appendLog(category = category, summary = summaryLine, payload = trimmed)
@@ -459,44 +693,205 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                         )
                     )
                 }
-                if (message.isNotBlank()) {
-                    appendLog(LogCategory.FEED, message, jsonStr)
-                }
+                if (message.isNotBlank()) appendLog(LogCategory.FEED, message, jsonStr)
                 true
             }
 
-            "SIGNATURE_CAPTURED" -> {
-                val baseIdx = obj.optInt("baseIndex", _uiState.value.heapFeed.baseIndex)
-                val anchorCount = obj.optInt("anchorCount", 0)
-                val sigJson = obj.optString("signatureJson", "")
-                val auto = obj.optBoolean("auto", false)
-                if (sigJson.isNotBlank()) {
-                    _uiState.update { state ->
-                        state.copy(
-                            heapFeed = state.heapFeed.copy(
-                                hasSignature = true,
-                                signatureAnchorCount = anchorCount,
-                                signatureCapturedAtIndex = baseIdx,
-                                signatureJson = sigJson,
-                                lastRelockSummary = if (auto) {
-                                    "Auto-captured $anchorCount anchors @ $baseIdx"
-                                } else {
-                                    "Captured $anchorCount anchors @ $baseIdx"
-                                }
+            "FLOAT_BASELINE_CAPTURED" -> {
+                val sampled = obj.optInt("sampledCount", 0)
+                val pruned = obj.optInt("prunedJitterCount", 0)
+                val durationMs = obj.optDouble("durationMs", 0.0)
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Baseline captured ($sampled static floats)",
+                        floatScanner = state.floatScanner.copy(
+                            isBusy = false,
+                            baselineCaptured = true,
+                            baselineSampleCount = sampled,
+                            prunedJitterCount = pruned,
+                            scanDurationMs = durationMs,
+                            candidates = emptyList(),
+                            isLivePreviewing = false,
+                            statusMessage = "Baseline ready ($sampled static floats, $pruned timers pruned). Walk a few steps, stop, then tap '2. Scan Movement Deltas'."
+                        )
+                    )
+                }
+                appendLog(
+                    category = LogCategory.SCAN,
+                    summary = "Baseline captured: $sampled static floats ($pruned jitter pruned) in ${durationMs}ms",
+                    payload = jsonStr
+                )
+                true
+            }
+
+            "FLOAT_BASELINE_ERROR", "FLOAT_DELTA_ERROR" -> {
+                val reason = obj.optString("reason", "Float scan failed.")
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.ERROR,
+                        scanStatusDetail = reason,
+                        floatScanner = state.floatScanner.copy(isBusy = false, statusMessage = reason)
+                    )
+                }
+                appendLog(LogCategory.ERROR, "Float scanner error", reason)
+                _commands.tryEmit(DiagnosticsCommand.ShowToast(reason))
+                true
+            }
+
+            "FLOAT_DELTAS_SCANNED" -> {
+                val round = obj.optInt("scanRound", 1)
+                val totalMatches = obj.optInt("totalMatches", 0)
+                val stillCount = obj.optInt("stillCount", 0)
+                val durationMs = obj.optDouble("durationMs", 0.0)
+                val arr = obj.optJSONArray("candidates") ?: JSONArray()
+
+                val parsed = buildList {
+                    for (i in 0 until arr.length()) {
+                        val c = arr.optJSONObject(i) ?: continue
+                        val idx = c.optInt("heapIndex", -1)
+                        if (idx < 0) continue
+                        add(
+                            FloatDeltaCandidate(
+                                heapIndex = idx,
+                                byteAddress = c.optLong("byteAddress", idx.toLong() * 4L),
+                                baselineValue = c.optDouble("baselineValue", 0.0),
+                                currentValue = c.optDouble("currentValue", 0.0),
+                                delta = c.optDouble("delta", 0.0),
+                                previewY = c.optDouble("previewY", 0.0),
+                                previewZ = c.optDouble("previewZ", 0.0),
+                                isStillNow = c.optBoolean("isStillNow", true),
+                                clusterSize = c.optInt("clusterSize", 1),
+                                axisHint = c.optString("axisHint", "X")
                             )
                         )
                     }
-                    appendLog(
-                        category = LogCategory.RELOCK,
-                        summary = "${if (auto) "Auto-captured" else "Captured"} $anchorCount signature anchors @ HEAPF32[$baseIdx]",
-                        payload = "Ready to relocate player coordinates after page reload or zone change."
+                }
+
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Round #$round: $totalMatches movement deltas",
+                        floatScanner = state.floatScanner.copy(
+                            isBusy = false,
+                            scanRound = round,
+                            totalMatchesFound = totalMatches,
+                            scanDurationMs = durationMs,
+                            isLivePreviewing = parsed.isNotEmpty(),
+                            candidates = parsed,
+                            statusMessage = if (parsed.isNotEmpty()) {
+                                "Round #$round: $totalMatches matches ($stillCount stopped). Showing top ${parsed.size} live — tap 'Inspect & Lock' on your player X coordinate."
+                            } else {
+                                "No movement deltas found. Move further in-game and scan again, or Reset Scan."
+                            }
+                        )
                     )
-                    if (!auto) {
-                        _commands.tryEmit(
-                            DiagnosticsCommand.ShowToast("Signature captured ($anchorCount anchors @ $baseIdx)")
+                }
+                appendLog(
+                    category = LogCategory.SCAN,
+                    summary = "Delta Scan #$round: $totalMatches hits ($stillCount stopped) in ${durationMs}ms",
+                    payload = "Top ${parsed.size} live candidates streaming at 200ms"
+                )
+                true
+            }
+
+            "POINTER_SIGNATURE_ANALYZED" -> {
+                val baseIdx = obj.optInt("baseIndex", _uiState.value.heapFeed.baseIndex)
+                val byteAddr = obj.optLong("byteAddress", baseIdx.toLong() * 4L)
+                val aobHex = obj.optString("aobPatternHex", "")
+                val floatSummary = obj.optString("floatPatternSummary", "")
+                val anchorCount = obj.optInt("anchorCount", 0)
+                val sigJson = obj.optString("signatureJson", "")
+                val durationMs = obj.optDouble("durationMs", 0.0)
+
+                val ptrArr = obj.optJSONArray("parentPointers") ?: JSONArray()
+                val pointers = buildList {
+                    for (i in 0 until ptrArr.length()) {
+                        val p = ptrArr.optJSONObject(i) ?: continue
+                        val pIdx = p.optInt("pointerHeapIndex", -1)
+                        if (pIdx < 0) continue
+                        add(
+                            ParentPointerMatch(
+                                pointerHeapIndex = pIdx,
+                                pointerByteAddress = p.optLong("pointerByteAddress", pIdx.toLong() * 4L),
+                                targetByteAddress = p.optLong("targetByteAddress", byteAddr),
+                                fieldOffsetBytes = p.optInt("fieldOffsetBytes", 0),
+                                isExactMatch = p.optBoolean("isExactMatch", false)
+                            )
                         )
                     }
                 }
+
+                val slotsArr = obj.optJSONArray("surroundingSlots") ?: JSONArray()
+                val slots = buildList {
+                    for (i in 0 until slotsArr.length()) {
+                        val s = slotsArr.optJSONObject(i) ?: continue
+                        val hIdx = s.optInt("heapIndex", -1)
+                        if (hIdx < 0) continue
+                        add(
+                            MemorySlotPreview(
+                                offset = s.optInt("offset", 0),
+                                heapIndex = hIdx,
+                                byteAddress = s.optLong("byteAddress", hIdx.toLong() * 4L),
+                                floatValue = s.optDouble("floatValue", 0.0),
+                                uint32Hex = s.optString("uint32Hex", "0x00000000"),
+                                isCoordAxis = s.optBoolean("isCoordAxis", false),
+                                isAnchor = s.optBoolean("isAnchor", false)
+                            )
+                        )
+                    }
+                }
+
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.COMPLETED,
+                        scanStatusDetail = "Analyzed [$baseIdx]: $anchorCount anchors, ${pointers.size} ptrs",
+                        heapFeed = state.heapFeed.copy(
+                            baseIndex = baseIdx,
+                            baseIndexInput = baseIdx.toString(),
+                            lockStatus = LockStatus.LOCKED,
+                            hasSignature = sigJson.isNotBlank(),
+                            signatureAnchorCount = anchorCount,
+                            signatureCapturedAtIndex = baseIdx,
+                            signatureJson = sigJson.ifBlank { state.heapFeed.signatureJson }
+                        ),
+                        pointerAnalysis = PointerSignatureAnalysis(
+                            inspectedBaseIndex = baseIdx,
+                            inspectedByteAddress = byteAddr,
+                            isAnalyzing = false,
+                            aobPatternHex = aobHex,
+                            floatPatternSummary = floatSummary,
+                            anchorCount = anchorCount,
+                            signatureJson = sigJson.ifBlank { null },
+                            parentPointers = pointers,
+                            surroundingSlots = slots,
+                            analysisDurationMs = durationMs,
+                            errorMessage = null
+                        )
+                    )
+                }
+                appendLog(
+                    category = LogCategory.PTR,
+                    summary = "Analyzed [$baseIdx]: $anchorCount AOB/Float anchors & ${pointers.size} HEAPU32 parent pointers (${durationMs}ms)",
+                    payload = "AOB: $aobHex\nFloats: $floatSummary"
+                )
+                true
+            }
+
+            "POINTER_SIGNATURE_ERROR" -> {
+                val reason = obj.optString("reason", "Pointer & Signature analysis failed.")
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.ERROR,
+                        scanStatusDetail = reason,
+                        pointerAnalysis = state.pointerAnalysis.copy(
+                            isAnalyzing = false,
+                            errorMessage = reason
+                        )
+                    )
+                }
+                appendLog(LogCategory.ERROR, "Pointer/Signature error", reason)
+                _commands.tryEmit(DiagnosticsCommand.ShowToast(reason))
                 true
             }
 
@@ -506,6 +901,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                 val confidence = obj.optInt("confidencePercent", 0)
                 val matched = obj.optInt("matchedAnchors", 0)
                 val total = obj.optInt("totalAnchors", 0)
+                val method = obj.optString("method", "Signature Scan")
                 val nx = obj.optDouble("x", _uiState.value.heapFeed.x)
                 val ny = obj.optDouble("y", _uiState.value.heapFeed.y)
                 val nz = obj.optDouble("z", _uiState.value.heapFeed.z)
@@ -513,11 +909,21 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                 val heapBytes = obj.optLong("heapByteLength", _uiState.value.heapFeed.heapByteLength)
                 val heapSource = obj.optString("heapSource", _uiState.value.heapFeed.heapSourceLabel)
                 val note = obj.optString("note", "Relocked @ $newIdx ($confidence%)")
+                val freshSigJson = obj.optString("signatureJson", "").ifBlank { null }
+
+                // Update persisted baseIndex if a profile is saved
+                _uiState.value.savedProfile?.let { existing ->
+                    if (existing.baseIndex != newIdx) {
+                        val updatedProfile = existing.copy(baseIndex = newIdx)
+                        profileStore.saveProfile(updatedProfile)
+                        _uiState.update { it.copy(savedProfile = updatedProfile) }
+                    }
+                }
 
                 _uiState.update { state ->
                     state.copy(
                         scanStatus = AsyncScanStatus.COMPLETED,
-                        scanStatusDetail = "Relocked @ HEAPF32[$newIdx] ($confidence%)",
+                        scanStatusDetail = "LOCKED @ HEAPF32[$newIdx] ($confidence%)",
                         heapFeed = state.heapFeed.copy(
                             baseIndex = newIdx,
                             baseIndexInput = newIdx.toString(),
@@ -526,21 +932,25 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                             z = if (nz.isFinite()) nz else state.heapFeed.z,
                             heapByteLength = heapBytes,
                             heapSourceLabel = heapSource,
+                            lockStatus = LockStatus.LOCKED,
                             isRelocking = false,
                             isHeapReady = true,
+                            hasSignature = freshSigJson != null || state.heapFeed.hasSignature,
+                            signatureAnchorCount = if (total > 0) total else state.heapFeed.signatureAnchorCount,
+                            signatureJson = freshSigJson ?: state.heapFeed.signatureJson,
                             relockConfidencePercent = confidence,
-                            lastRelockSummary = "$note • $matched/$total anchors • ${String.format(Locale.US, "%.0f", durationMs)}ms",
-                            statusMessage = "Relocked @ $heapSource[$newIdx..${newIdx + 2}] ($confidence%)"
+                            relockMethodUsed = method,
+                            lastRelockSummary = "$note • $method • $matched/$total anchors • ${String.format(Locale.US, "%.0f", durationMs)}ms",
+                            statusMessage = "LOCKED • $heapSource[$newIdx..${newIdx + 2}] ($confidence%)"
                         )
                     )
                 }
                 appendLog(
                     category = LogCategory.RELOCK,
                     summary = note,
-                    payload = "old=$oldIdx -> new=$newIdx | confidence=$confidence% ($matched/$total anchors) | coords=(${fmtCoord(nx)}, ${fmtCoord(ny)}, ${fmtCoord(nz)}) | ${durationMs}ms"
+                    payload = "method=$method | old=$oldIdx -> new=$newIdx | confidence=$confidence% ($matched/$total) | (${fmtCoord(nx)}, ${fmtCoord(ny)}, ${fmtCoord(nz)}) | ${durationMs}ms"
                 )
-                _commands.tryEmit(DiagnosticsCommand.ShowToast("Relocked @ HEAPF32[$newIdx] ($confidence%)"))
-                // Ensure the 200ms loop is actively polling the relocated base index
+                _commands.tryEmit(DiagnosticsCommand.ShowToast("LOCKED @ HEAPF32[$newIdx] ($confidence%)"))
                 startDirectHeapFeed()
                 true
             }
@@ -553,6 +963,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                         scanStatusDetail = "Relock failed",
                         heapFeed = state.heapFeed.copy(
                             isRelocking = false,
+                            lockStatus = LockStatus.UNLOCKED,
                             lastRelockSummary = reason,
                             statusMessage = reason
                         )
@@ -567,11 +978,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                 val error = obj.optString("error", "")
                 if (error.isNotBlank()) {
                     _uiState.update { state ->
-                        state.copy(
-                            isScanningEntities = false,
-                            scanStatus = AsyncScanStatus.ERROR,
-                            scanStatusDetail = error
-                        )
+                        state.copy(isScanningEntities = false, scanStatus = AsyncScanStatus.ERROR, scanStatusDetail = error)
                     }
                     appendLog(LogCategory.ERROR, "Entity scan error", error)
                     _commands.tryEmit(DiagnosticsCommand.ShowToast(error))
@@ -582,10 +989,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                 val durationMs = obj.optDouble("durationMs", 0.0)
                 val dominantStride = obj.optInt("dominantStride", 0).takeIf { it > 0 }
                 val totalCandidates = obj.optInt("totalCandidates", arr.length())
-                val pinnedIndices = _uiState.value.discoveredEntities
-                    .filter { it.isPinned }
-                    .map { it.baseIndex }
-                    .toSet()
+                val pinnedIndices = _uiState.value.discoveredEntities.filter { it.isPinned }.map { it.baseIndex }.toSet()
 
                 val parsed = buildList {
                     for (i in 0 until arr.length()) {
@@ -636,11 +1040,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
             "MANUAL_EVAL" -> {
                 val expr = obj.optString("expression", "")
                 val res = obj.optString("result", "")
-                appendLog(
-                    category = LogCategory.JS,
-                    summary = "JS> ${expr.take(72)}",
-                    payload = res
-                )
+                appendLog(LogCategory.JS, "JS> ${expr.take(72)}", res)
                 true
             }
 
@@ -674,8 +1074,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
 
         var isNewUrl = false
         _uiState.update { state ->
-            val exists = state.interceptedAssets.any { it.url == url }
-            if (exists) {
+            if (state.interceptedAssets.any { it.url == url }) {
                 state
             } else {
                 isNewUrl = true
@@ -684,15 +1083,9 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         }
 
         if (isNewUrl) {
-            appendLog(
-                category = LogCategory.ASSET,
-                summary = "Observed $matchedExt asset ($fileName)",
-                payload = "$method $url"
-            )
+            appendLog(LogCategory.ASSET, "Observed $matchedExt asset ($fileName)", "$method $url")
             if (shouldMirror) {
-                val shouldLaunch = synchronized(inFlightAssetUrls) {
-                    inFlightAssetUrls.add(url)
-                }
+                val shouldLaunch = synchronized(inFlightAssetUrls) { inFlightAssetUrls.add(url) }
                 if (shouldLaunch) {
                     val userAgent = if (_uiState.value.isDesktopMode) DESKTOP_USER_AGENT else "Android WebView"
                     val referer = _uiState.value.activeUrl
@@ -719,9 +1112,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                                 )
                             }
                         } finally {
-                            synchronized(inFlightAssetUrls) {
-                                inFlightAssetUrls.remove(url)
-                            }
+                            synchronized(inFlightAssetUrls) { inFlightAssetUrls.remove(url) }
                         }
                     }
                 }
@@ -732,20 +1123,14 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
     fun onClearAssetCache() {
         viewModelScope.launch(Dispatchers.IO) {
             val removed = BinaryAssetInspector.clearLocalCache(getApplication())
-            _uiState.update { state ->
-                state.copy(interceptedAssets = emptyList())
-            }
-            appendLog(
-                category = LogCategory.ASSET,
-                summary = "Cleared local binary asset cache ($removed files deleted)",
-                payload = "filesDir/captured_assets cleared."
-            )
+            _uiState.update { state -> state.copy(interceptedAssets = emptyList()) }
+            appendLog(LogCategory.ASSET, "Cleared local binary asset cache ($removed files deleted)", "")
             _commands.tryEmit(DiagnosticsCommand.ShowToast("Cleared $removed cached binary files"))
         }
     }
 
     // -------------------------------------------------------------------------
-    // Manual JS Console & Log Filter
+    // Manual JS Console & Log Filters
     // -------------------------------------------------------------------------
 
     fun onToggleJsDrawer() {
@@ -758,8 +1143,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
 
     fun onExecuteManualScript() {
         val code = _uiState.value.manualJsInput.trim()
-        if (code.isEmpty()) return
-        if (!ensurePageLoadedForInspection()) return
+        if (code.isEmpty() || !ensurePageLoadedForInspection()) return
         _commands.tryEmit(DiagnosticsCommand.EvaluateJs(WasmHeapScripts.buildManualEvalScript(code)))
     }
 
@@ -772,16 +1156,15 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
     }
 
     // -------------------------------------------------------------------------
-    // Structured Report & Full Log Dump Exports (MediaStore Downloads)
+    // Structured Report & Log Dump Exports
     // -------------------------------------------------------------------------
 
     fun requestExportReport(armBridge: () -> Unit, disarmBridge: () -> Boolean) {
         if (_uiState.value.isExporting) return
         _uiState.update { it.copy(isExporting = true) }
 
-        val activeUrl = _uiState.value.activeUrl
-        if (activeUrl == "about:blank") {
-            writeCombinedJsonReport(webViewMetricsJson = null)
+        if (_uiState.value.activeUrl == "about:blank") {
+            writeCombinedJsonReport(null)
             return
         }
 
@@ -795,9 +1178,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         exportFallbackJob?.cancel()
         exportFallbackJob = viewModelScope.launch {
             delay(2_200L)
-            if (disarmBridge()) {
-                writeCombinedJsonReport(webViewMetricsJson = null)
-            }
+            if (disarmBridge()) writeCombinedJsonReport(null)
         }
     }
 
@@ -816,28 +1197,16 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
                 ReportExporter.exportJsonToDownloads(
                     context = getApplication(),
                     jsonContent = combinedJson,
-                    filePrefix = "webview_heap_diagnostics"
+                    filePrefix = "webview_wasm_diagnostics"
                 )
             }
             _uiState.update { it.copy(isExporting = false, lastExport = outcome) }
             if (outcome.success) {
-                appendLog(
-                    category = LogCategory.SYSTEM,
-                    summary = "Exported JSON report: ${outcome.fileName}",
-                    payload = outcome.displayPath
-                )
-                _commands.tryEmit(
-                    DiagnosticsCommand.ShowToast("Report saved to ${outcome.displayPath}")
-                )
+                appendLog(LogCategory.SYSTEM, "Exported JSON report: ${outcome.fileName}", outcome.displayPath)
+                _commands.tryEmit(DiagnosticsCommand.ShowToast("Report saved to ${outcome.displayPath}"))
             } else {
-                appendLog(
-                    category = LogCategory.ERROR,
-                    summary = "Report export failed",
-                    payload = outcome.errorMessage.orEmpty()
-                )
-                _commands.tryEmit(
-                    DiagnosticsCommand.ShowToast("Export failed: ${outcome.errorMessage}")
-                )
+                appendLog(LogCategory.ERROR, "Report export failed", outcome.errorMessage.orEmpty())
+                _commands.tryEmit(DiagnosticsCommand.ShowToast("Export failed: ${outcome.errorMessage}"))
             }
         }
     }
@@ -846,11 +1215,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         val last = _uiState.value.lastExport
         if (last?.success == true && last.contentUri != null) {
             _commands.tryEmit(
-                DiagnosticsCommand.ShareFile(
-                    uri = last.contentUri,
-                    mimeType = last.mimeType,
-                    title = "Share Diagnostic Report (${last.fileName})"
-                )
+                DiagnosticsCommand.ShareFile(last.contentUri, last.mimeType, "Share Report (${last.fileName})")
             )
         }
     }
@@ -863,39 +1228,25 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         viewModelScope.launch {
             val outcome = withContext(Dispatchers.IO) {
                 if (asJson) {
-                    val json = buildCombinedReportJson(snapshot, null)
                     ReportExporter.exportJsonToDownloads(
                         context = getApplication(),
-                        jsonContent = json,
+                        jsonContent = buildCombinedReportJson(snapshot, null),
                         filePrefix = "webview_log_dump"
                     )
                 } else {
-                    val text = buildPlainTextLogDump(snapshot)
                     ReportExporter.exportTextLogDumpToDownloads(
                         context = getApplication(),
-                        textContent = text
+                        textContent = buildPlainTextLogDump(snapshot)
                     )
                 }
             }
             _uiState.update { it.copy(isExportingLogDump = false, lastLogDumpExport = outcome) }
             if (outcome.success) {
-                appendLog(
-                    category = LogCategory.SYSTEM,
-                    summary = "Exported log dump: ${outcome.fileName}",
-                    payload = outcome.displayPath
-                )
-                _commands.tryEmit(
-                    DiagnosticsCommand.ShowToast("Log dump saved to ${outcome.displayPath}")
-                )
+                appendLog(LogCategory.SYSTEM, "Exported log dump: ${outcome.fileName}", outcome.displayPath)
+                _commands.tryEmit(DiagnosticsCommand.ShowToast("Log dump saved to ${outcome.displayPath}"))
             } else {
-                appendLog(
-                    category = LogCategory.ERROR,
-                    summary = "Log dump export failed",
-                    payload = outcome.errorMessage.orEmpty()
-                )
-                _commands.tryEmit(
-                    DiagnosticsCommand.ShowToast("Export failed: ${outcome.errorMessage}")
-                )
+                appendLog(LogCategory.ERROR, "Log dump export failed", outcome.errorMessage.orEmpty())
+                _commands.tryEmit(DiagnosticsCommand.ShowToast("Export failed: ${outcome.errorMessage}"))
             }
         }
     }
@@ -904,11 +1255,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         val last = _uiState.value.lastLogDumpExport
         if (last?.success == true && last.contentUri != null) {
             _commands.tryEmit(
-                DiagnosticsCommand.ShareFile(
-                    uri = last.contentUri,
-                    mimeType = last.mimeType,
-                    title = "Share Log Dump (${last.fileName})"
-                )
+                DiagnosticsCommand.ShareFile(last.contentUri, last.mimeType, "Share Log Dump (${last.fileName})")
             )
         }
     }
@@ -941,6 +1288,28 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         }
     }
 
+    private fun serializePointersJson(pointers: List<ParentPointerMatch>): String? {
+        if (pointers.isEmpty()) return null
+        val arr = JSONArray()
+        pointers.forEach { ptr ->
+            arr.put(
+                JSONObject().apply {
+                    put("pointerHeapIndex", ptr.pointerHeapIndex)
+                    put("pointerByteAddress", ptr.pointerByteAddress)
+                    put("targetByteAddress", ptr.targetByteAddress)
+                    put("fieldOffsetBytes", ptr.fieldOffsetBytes)
+                    put("isExactMatch", ptr.isExactMatch)
+                }
+            )
+        }
+        return arr.toString()
+    }
+
+    private fun extractHost(url: String): String {
+        if (!url.contains("://")) return ""
+        return url.substringAfter("://").substringBefore('/').substringBefore('?')
+    }
+
     private fun buildCombinedReportJson(
         state: DiagnosticsUiState,
         webViewMetricsJson: String?
@@ -954,25 +1323,47 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         root.put("pageTitle", state.pageTitle)
 
         val feed = state.heapFeed
-        val feedJson = JSONObject().apply {
-            put("baseIndex", feed.baseIndex)
-            put("byteAddress", feed.byteAddress)
-            put("byteAddressHex", "0x${feed.byteAddress.toString(16).uppercase(Locale.US)}")
-            put("heapSource", feed.heapSourceLabel)
-            put("heapByteLength", feed.heapByteLength)
-            put("isPolling", feed.isPolling)
-            put("isHeapReady", feed.isHeapReady)
-            put("x", feed.x)
-            put("y", feed.y)
-            put("z", feed.z)
-            put("tickCount", feed.tickCount)
-            put("hasSignature", feed.hasSignature)
-            put("signatureAnchorCount", feed.signatureAnchorCount)
-            put("signatureCapturedAtIndex", feed.signatureCapturedAtIndex ?: JSONObject.NULL)
-            put("relockConfidencePercent", feed.relockConfidencePercent)
-            put("lastRelockSummary", feed.lastRelockSummary)
-        }
-        root.put("directHeapFeed", feedJson)
+        root.put(
+            "liveTelemetryFeed",
+            JSONObject().apply {
+                put("lockStatus", feed.lockStatus.name)
+                put("baseIndex", feed.baseIndex)
+                put("byteAddressHex", "0x${feed.byteAddress.toString(16).uppercase(Locale.US)}")
+                put("heapSource", feed.heapSourceLabel)
+                put("x", feed.x)
+                put("y", feed.y)
+                put("z", feed.z)
+                put("tickCount", feed.tickCount)
+                put("autoRelockOnReload", feed.autoRelockOnReload)
+                put("relockConfidencePercent", feed.relockConfidencePercent)
+                put("relockMethodUsed", feed.relockMethodUsed)
+            }
+        )
+
+        val analysis = state.pointerAnalysis
+        root.put(
+            "pointerAndSignature",
+            JSONObject().apply {
+                put("inspectedBaseIndex", analysis.inspectedBaseIndex ?: JSONObject.NULL)
+                put("aobPatternHex", analysis.aobPatternHex)
+                put("floatPatternSummary", analysis.floatPatternSummary)
+                put("anchorCount", analysis.anchorCount)
+                put("isSavedInSharedPreferences", state.savedProfile != null)
+                val ptrArr = JSONArray()
+                analysis.parentPointers.forEach { ptr ->
+                    ptrArr.put(
+                        JSONObject().apply {
+                            put("pointerHeapIndex", ptr.pointerHeapIndex)
+                            put("pointerByteAddressHex", "0x${ptr.pointerByteAddress.toString(16).uppercase(Locale.US)}")
+                            put("targetByteAddressHex", "0x${ptr.targetByteAddress.toString(16).uppercase(Locale.US)}")
+                            put("fieldOffsetBytes", ptr.fieldOffsetBytes)
+                            put("isExactMatch", ptr.isExactMatch)
+                        }
+                    )
+                }
+                put("parentPointers", ptrArr)
+            }
+        )
 
         if (!webViewMetricsJson.isNullOrBlank()) {
             runCatching { JSONObject(webViewMetricsJson) }.getOrNull()?.let {
@@ -981,40 +1372,21 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
         }
 
         val entitiesArr = JSONArray()
-        state.discoveredEntities.forEach { entity ->
+        state.discoveredEntities.forEach { e ->
             entitiesArr.put(
                 JSONObject().apply {
-                    put("baseIndex", entity.baseIndex)
-                    put("byteAddressHex", "0x${entity.byteAddress.toString(16).uppercase(Locale.US)}")
-                    put("offsetFromPlayer", entity.offsetFromPlayer)
-                    put("x", entity.x)
-                    put("y", entity.y)
-                    put("z", entity.z)
-                    put("distanceToPlayer", entity.distanceToPlayer)
-                    put("strideGroup", entity.strideGroup)
-                    put("confidenceScore", entity.confidenceScore)
-                    put("isPinned", entity.isPinned)
+                    put("baseIndex", e.baseIndex)
+                    put("byteAddressHex", "0x${e.byteAddress.toString(16).uppercase(Locale.US)}")
+                    put("offsetFromPlayer", e.offsetFromPlayer)
+                    put("x", e.x)
+                    put("y", e.y)
+                    put("z", e.z)
+                    put("distanceToPlayer", e.distanceToPlayer)
+                    put("strideGroup", e.strideGroup)
                 }
             )
         }
         root.put("discoveredEntities", entitiesArr)
-
-        val assetsArr = JSONArray()
-        state.interceptedAssets.forEach { asset ->
-            assetsArr.put(
-                JSONObject().apply {
-                    put("fileName", asset.fileName)
-                    put("url", asset.url)
-                    put("extension", asset.extension)
-                    put("captureStatus", asset.captureStatus.name)
-                    put("byteSize", asset.byteSize)
-                    put("magicSignature", asset.magicSignature)
-                    put("sha256Prefix", asset.sha256Prefix)
-                    put("structuralSummary", asset.structuralSummary)
-                }
-            )
-        }
-        root.put("interceptedAssets", assetsArr)
 
         val logsArr = JSONArray()
         state.logs.forEach { log ->
@@ -1035,34 +1407,16 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
     private fun buildPlainTextLogDump(state: DiagnosticsUiState): String = buildString {
         val feed = state.heapFeed
         appendLine("============================================================")
-        appendLine("WebViewDiagnosticsApp - Observational Telemetry Log Dump")
+        appendLine("WebViewDiagnosticsApp - WASM Memory & Pointer Lock Dump")
         appendLine("============================================================")
         appendLine("Target URL   : ${state.activeUrl}")
-        appendLine("Page Title   : ${state.pageTitle}")
-        appendLine("Direct Feed  : ${feed.heapSourceLabel}[${feed.baseIndex}..${feed.baseIndex + 2}] (0x${feed.byteAddress.toString(16).uppercase(Locale.US)})")
-        appendLine("Live Coords  : X=${fmtCoord(feed.x)}  Y=${fmtCoord(feed.y)}  Z=${fmtCoord(feed.z)}  (ticks=${feed.tickCount})")
-        appendLine("Signature    : ${if (feed.hasSignature) "${feed.signatureAnchorCount} anchors @ ${feed.signatureCapturedAtIndex}" else "Not captured"}")
-        appendLine("Entities     : ${state.discoveredEntities.size} nearby structs (stride=${state.entityDetectedStride ?: "n/a"})")
-        appendLine("Assets       : ${state.cachedAssetCount}/${state.interceptedAssets.size} cached")
+        appendLine("Lock Status  : ${feed.lockStatus.label}")
+        appendLine("Base Index   : ${feed.baseIndex} (0x${feed.byteAddress.toString(16).uppercase(Locale.US)})")
+        appendLine("Live Coords  : X=${fmtCoord(feed.x)}  Y=${fmtCoord(feed.y)}  Z=${fmtCoord(feed.z)}")
+        appendLine("AOB Pattern  : ${state.pointerAnalysis.aobPatternHex.ifBlank { "(not analyzed)" }}")
+        appendLine("Parent Ptrs  : ${state.pointerAnalysis.parentPointers.size}")
+        appendLine("Saved Prefs  : ${if (state.savedProfile != null) "YES" else "NO"}")
         appendLine()
-
-        if (state.liveStreamHistory.isNotEmpty()) {
-            appendLine("--- Recent 200ms Live Coordinate Stream ---")
-            state.liveStreamHistory.forEach { appendLine(it) }
-            appendLine()
-        }
-
-        if (state.discoveredEntities.isNotEmpty()) {
-            appendLine("--- Nearby Entity Structs ---")
-            state.discoveredEntities.forEach { e ->
-                appendLine(
-                    "[${e.baseIndex}] (0x${e.byteAddress.toString(16).uppercase(Locale.US)}, Δ${e.offsetFromPlayer}) " +
-                        "X=${fmtCoord(e.x)} Y=${fmtCoord(e.y)} Z=${fmtCoord(e.z)} dist=${String.format(Locale.US, "%.2f", e.distanceToPlayer)} conf=${e.confidenceScore}%"
-                )
-            }
-            appendLine()
-        }
-
         appendLine("--- Telemetry Logs (${state.logs.size}) ---")
         state.logs.asReversed().forEach { entry ->
             appendLine("[${entry.timestamp}] [${entry.category.tag}] ${entry.summary}")
@@ -1092,9 +1446,7 @@ class DiagnosticsViewModel(application: Application) : AndroidViewModel(applicat
 
         fun validateAndNormalizeUrl(rawInput: String): UrlValidationResult {
             val trimmed = rawInput.trim()
-            if (trimmed.isEmpty()) {
-                return UrlValidationResult.Invalid("Please enter a target URL.")
-            }
+            if (trimmed.isEmpty()) return UrlValidationResult.Invalid("Please enter a target URL.")
             val lower = trimmed.lowercase(Locale.US)
             val blockedSchemes = listOf("javascript:", "file:", "content:", "data:", "vbscript:", "intent:")
             if (blockedSchemes.any { lower.startsWith(it) }) {

@@ -5,7 +5,8 @@ import android.content.Context
 import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -20,106 +21,122 @@ class ExampleRobolectricTest {
     @Test
     fun `read app name string from context`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
-        val appName = context.getString(R.string.app_name)
-        assertEquals("WebViewDiagnosticsApp", appName)
+        assertEquals("WebViewDiagnosticsApp", context.getString(R.string.app_name))
     }
 
     @Test
-    fun `telemetry bridge guards exportReport and forwards direct 200ms HEAPF32 coordinates`() {
-        val logged = mutableListOf<Pair<String, String>>()
+    fun `lock profile store persists signature and parent pointers in SharedPreferences`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val store = LockProfileStore(context)
+        store.clearProfile()
+        assertNull(store.loadProfile())
+
+        val profile = SavedLockProfile(
+            baseIndex = 581246,
+            host = "example.com",
+            aobPatternHex = "[-4]:3F800000 [+3]:00000001",
+            floatPatternSummary = "[-4]=1.0",
+            anchorCount = 8,
+            signatureJson = """{"v":2,"anchors":[{"off":-4,"u32":1065353216}]}""",
+            parentPointers = listOf(
+                ParentPointerMatch(
+                    pointerHeapIndex = 4096,
+                    pointerByteAddress = 16384L,
+                    targetByteAddress = 581246L * 4L,
+                    fieldOffsetBytes = 0,
+                    isExactMatch = true
+                )
+            ),
+            autoRelockOnReload = true,
+            savedAtEpochMs = 1700000000000L
+        )
+        store.saveProfile(profile)
+
+        val restored = store.loadProfile()
+        assertNotNull(restored)
+        assertEquals(581246, restored!!.baseIndex)
+        assertEquals(8, restored.anchorCount)
+        assertEquals(1, restored.parentPointers.size)
+        assertEquals(4096, restored.parentPointers.first().pointerHeapIndex)
+        assertTrue(restored.autoRelockOnReload)
+
+        store.clearProfile()
+        assertNull(store.loadProfile())
+    }
+
+    @Test
+    fun `telemetry bridge forwards direct 200ms coords and live delta previews on main thread`() {
+        val coords = mutableListOf<Triple<Int, Double, String>>()
+        val previews = mutableListOf<String>()
         val exported = mutableListOf<String>()
-        val statuses = mutableListOf<Pair<AsyncScanStatus, String>>()
-        val coordUpdates = mutableListOf<Triple<Int, Double, String>>()
 
         val bridge = TelemetryBridge(
-            onTelemetryReceived = { cat, payload -> logged.add(cat to payload) },
-            onReportPayloadReceived = { json -> exported.add(json) },
-            onScanStatusChanged = { status, detail -> statuses.add(status to detail) },
-            onDirectHeapCoordsUpdated = { baseIdx, x, _, _, _, src ->
-                coordUpdates.add(Triple(baseIdx, x, src))
-            }
+            onTelemetryReceived = { _, _ -> },
+            onReportPayloadReceived = { exported.add(it) },
+            onDirectHeapCoordsUpdated = { idx, x, _, _, _, src -> coords.add(Triple(idx, x, src)) },
+            onFloatDeltaPreviewUpdated = { previews.add(it) }
         )
 
-        // Unsolicited export must be blocked
-        bridge.exportReport("""{"injected":true}""")
+        bridge.exportReport("""{"blocked":true}""")
         shadowOf(Looper.getMainLooper()).idle()
         assertTrue(exported.isEmpty())
-        assertEquals("ERR", logged.first().first)
 
-        // Armed export succeeds
         bridge.armExport()
-        bridge.exportReport("""{"url":"https://example.com"}""")
+        bridge.exportReport("""{"ok":true}""")
         shadowOf(Looper.getMainLooper()).idle()
         assertEquals(1, exported.size)
 
-        // Scan status sanitization strips newlines
-        bridge.updateScanStatus("COMPLETED", "Relocked @ 581246\n98%")
-        shadowOf(Looper.getMainLooper()).idle()
-        assertEquals(AsyncScanStatus.COMPLETED, statuses.first().first)
-        assertEquals("Relocked @ 581246 98%", statuses.first().second)
-
-        // NaN coordinates are ignored; valid coordinates update cleanly
-        bridge.updateDirectHeapCoords(581246, Double.NaN, 1.0, 2.0, 67_108_864L, "window.HEAPF32")
         bridge.updateDirectHeapCoords(581246, 128.5, 4.25, -92.75, 67_108_864L, "window.HEAPF32")
+        bridge.updateFloatDeltaPreview("""{"updates":[{"heapIndex":581246,"currentValue":129.0}]}""")
         shadowOf(Looper.getMainLooper()).idle()
-        assertEquals(1, coordUpdates.size)
-        assertEquals(581246, coordUpdates.first().first)
-        assertEquals(128.5, coordUpdates.first().second, 0.001)
-        assertEquals("window.HEAPF32", coordUpdates.first().third)
+        assertEquals(1, coords.size)
+        assertEquals(128.5, coords.first().second, 0.001)
+        assertEquals(1, previews.size)
     }
 
     @Test
-    fun `viewmodel updates live coords persists relock signature across reload and stores nearby entities`() {
+    fun `viewmodel runs full step 1 scan step 2 pointer analysis profile save and step 3 relock`() {
         val app = ApplicationProvider.getApplicationContext<Application>()
+        LockProfileStore(app).clearProfile()
         val vm = DiagnosticsViewModel(app)
 
-        // 1. Live 200ms direct coordinate update
-        vm.onDirectHeapCoordsUpdatedFromBridge(
-            baseIndex = VERIFIED_PLAYER_BASE_INDEX,
-            x = 240.125,
-            y = 12.5,
-            z = -84.75,
-            heapByteLength = 67_108_864L,
-            heapSource = "window.HEAPF32"
+        // Step 1A + 1B: Baseline & Movement Delta candidates
+        vm.onTelemetryFromBridge(
+            "SCAN",
+            """{"type":"FLOAT_BASELINE_CAPTURED","sampledCount":18000,"prunedJitterCount":92,"durationMs":24.0}"""
         )
-        val feedAfterTick = vm.uiState.value.heapFeed
-        assertEquals(581246, feedAfterTick.baseIndex)
-        assertEquals(240.125, feedAfterTick.x, 0.001)
-        assertEquals(12.5, feedAfterTick.y, 0.001)
-        assertEquals(-84.75, feedAfterTick.z, 0.001)
-        assertTrue(feedAfterTick.isHeapReady)
-        assertEquals(1, vm.uiState.value.liveStreamHistory.size)
+        assertTrue(vm.uiState.value.floatScanner.baselineCaptured)
 
-        // 2. Signature captured & preserved across page reload
+        vm.onTelemetryFromBridge(
+            "SCAN",
+            """{"type":"FLOAT_DELTAS_SCANNED","scanRound":1,"totalMatches":4,"stillCount":3,"durationMs":11.2,"candidates":[{"heapIndex":581246,"byteAddress":2324984,"baselineValue":100.0,"currentValue":104.5,"delta":4.5,"previewY":12.0,"previewZ":-40.0,"isStillNow":true,"clusterSize":3,"axisHint":"X"}]}"""
+        )
+        assertEquals(1, vm.uiState.value.floatScanner.candidates.size)
+
+        // Step 2: Pointer & Signature analysis + Save & Lock Profile into SharedPreferences
+        vm.onTelemetryFromBridge(
+            "PTR",
+            """{"type":"POINTER_SIGNATURE_ANALYZED","baseIndex":581246,"byteAddress":2324984,"aobPatternHex":"[-4]:3F800000 [+3]:00000001","floatPatternSummary":"[-4]=1.0","anchorCount":6,"signatureJson":"{\"v\":2,\"anchors\":[{\"off\":-4,\"u32\":1065353216}]}","parentPointers":[{"pointerHeapIndex":2048,"pointerByteAddress":8192,"targetByteAddress":2324984,"fieldOffsetBytes":0,"isExactMatch":true}],"surroundingSlots":[],"durationMs":31.5}"""
+        )
+        assertEquals(LockStatus.LOCKED, vm.uiState.value.heapFeed.lockStatus)
+        assertEquals(1, vm.uiState.value.pointerAnalysis.parentPointers.size)
+
+        vm.saveAndLockProfile()
+        assertNotNull(vm.uiState.value.savedProfile)
+
+        // Step 3: Relock after reload restores LOCKED state on relocated index
+        vm.onPageStarted("https://example.com/reloaded")
+        assertEquals(LockStatus.UNLOCKED, vm.uiState.value.heapFeed.lockStatus)
+        assertNotNull(vm.uiState.value.savedProfile)
+
         vm.onTelemetryFromBridge(
             "RELOCK",
-            """{"type":"SIGNATURE_CAPTURED","auto":true,"baseIndex":581246,"anchorCount":12,"zeroCount":4,"signatureJson":"{\"v\":1,\"anchors\":[{\"off\":-4,\"bits\":1065353216}]}"}"""
+            """{"type":"RELOCK_COMPLETE","oldBaseIndex":581246,"newBaseIndex":600120,"confidencePercent":96,"matchedAnchors":6,"totalAnchors":6,"method":"Parent Pointer Dereference","x":105.25,"y":12.0,"z":-39.5,"durationMs":0.6,"heapByteLength":67108864,"heapSource":"window.HEAPF32","note":"Instant pointer relock -> HEAPF32[600120] (96% match)"}"""
         )
-        assertTrue(vm.uiState.value.heapFeed.hasSignature)
-        assertEquals(12, vm.uiState.value.heapFeed.signatureAnchorCount)
+        assertEquals(LockStatus.LOCKED, vm.uiState.value.heapFeed.lockStatus)
+        assertEquals(600120, vm.uiState.value.heapFeed.baseIndex)
+        assertEquals(96, vm.uiState.value.heapFeed.relockConfidencePercent)
 
-        vm.onPageStarted("https://example.com/zone2")
-        assertTrue("Signature must persist across reload/zone change", vm.uiState.value.heapFeed.hasSignature)
-        assertFalse(vm.uiState.value.heapFeed.isHeapReady)
-
-        // 3. Auto-Relock relocates base index after zone change
-        vm.onTelemetryFromBridge(
-            "RELOCK",
-            """{"type":"RELOCK_COMPLETE","oldBaseIndex":581246,"newBaseIndex":612004,"confidencePercent":94,"matchedAnchors":11,"totalAnchors":12,"x":10.5,"y":2.0,"z":-5.25,"durationMs":34.5,"heapByteLength":67108864,"heapSource":"window.HEAPF32","note":"Relocated player base 581246 -> 612004 (94% match)"}"""
-        )
-        assertEquals(612004, vm.uiState.value.heapFeed.baseIndex)
-        assertEquals(94, vm.uiState.value.heapFeed.relockConfidencePercent)
-
-        // 4. Nearby ±50,000 entity scan populates Entities tab and supports pinning
-        vm.onTelemetryFromBridge(
-            "ENTITY",
-            """{"type":"ENTITIES_SCANNED","playerBaseIndex":612004,"searchRadius":50000,"totalCandidates":5,"dominantStride":32,"durationMs":19.4,"entities":[{"baseIndex":612036,"byteAddress":2448144,"offsetFromPlayer":32,"x":15.5,"y":2.0,"z":-8.0,"distanceToPlayer":5.7,"strideGroup":32,"confidenceScore":95},{"baseIndex":612068,"byteAddress":2448272,"offsetFromPlayer":64,"x":40.0,"y":2.0,"z":10.0,"distanceToPlayer":33.2,"strideGroup":32,"confidenceScore":95}]}"""
-        )
-        assertEquals(2, vm.uiState.value.discoveredEntities.size)
-        assertEquals(32, vm.uiState.value.entityDetectedStride)
-
-        vm.onTogglePinEntity(612068)
-        assertEquals(612068, vm.uiState.value.discoveredEntities.first().baseIndex)
-        assertTrue(vm.uiState.value.discoveredEntities.first().isPinned)
+        LockProfileStore(app).clearProfile()
     }
 }

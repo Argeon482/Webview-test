@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,22 +19,19 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.Fingerprint
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Radar
-import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -42,10 +40,11 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -55,8 +54,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
-import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -79,22 +76,26 @@ import com.example.ui.theme.OnSignalEmerald
 import com.example.ui.theme.OnTelemetryViolet
 import com.example.ui.theme.SignalEmerald
 import com.example.ui.theme.TelemetryViolet
-import java.util.Locale
 
 /**
- * High-contrast, permanently accessible primary action buttons with generous touch targets (>= 50dp).
- * Placed inside the scrollable diagnostics deck so buttons never clip or get overlapped by live text.
+ * Step 3 Action Card: Prominent `"Auto-Relock"` button + Auto-Relock on Page Reload switch +
+ * 200ms Feed toggle + `"Scan Entities"` & `"Export Report"` controls with generous >=50dp padding.
  */
 @Composable
 fun PrimaryActionButtonsBar(
     state: DiagnosticsUiState,
-    onRelockCoordinates: () -> Unit,
+    onAutoRelock: () -> Unit,
+    onToggleAutoRelockOnReload: (Boolean) -> Unit,
+    onStartFeed: () -> Unit,
+    onPauseFeed: () -> Unit,
     onScanEntities: () -> Unit,
     onExportReport: () -> Unit,
     onShareLastReport: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val feed = state.heapFeed
+    val saved = state.savedProfile
+
     Surface(
         shape = RoundedCornerShape(14.dp),
         color = ObsidianSurface,
@@ -105,9 +106,9 @@ fun PrimaryActionButtonsBar(
             modifier = Modifier.padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // Primary prominent button: Relock Coordinates (full width, unmistakable, never truncated)
+            // Prominent One-Tap Auto-Relock button
             Button(
-                onClick = onRelockCoordinates,
+                onClick = onAutoRelock,
                 enabled = !feed.isRelocking,
                 shape = RoundedCornerShape(12.dp),
                 colors = ButtonDefaults.buttonColors(
@@ -120,7 +121,7 @@ fun PrimaryActionButtonsBar(
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(min = 52.dp)
-                    .testTag("relock_coordinates_button")
+                    .testTag("auto_relock_button")
             ) {
                 if (feed.isRelocking) {
                     CircularProgressIndicator(
@@ -136,15 +137,95 @@ fun PrimaryActionButtonsBar(
                     )
                 }
                 Spacer(Modifier.width(8.dp))
+                val suffix = when {
+                    saved != null -> " (${saved.anchorCount} sig, ${saved.parentPointers.size} ptr)"
+                    feed.hasSignature -> " (${feed.signatureAnchorCount} anchors)"
+                    else -> ""
+                }
                 Text(
-                    text = if (feed.hasSignature) {
-                        "${stringResource(R.string.action_relock_coordinates)} (${feed.signatureAnchorCount} anchors)"
-                    } else {
-                        stringResource(R.string.action_relock_coordinates)
-                    },
+                    text = "${stringResource(R.string.action_auto_relock)}$suffix",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
                     maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+
+            // Auto-Relock on Page Reload toggle + 200ms Feed Start/Pause pill
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(ObsidianBg)
+                    .padding(horizontal = 10.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Switch(
+                        checked = feed.autoRelockOnReload,
+                        onCheckedChange = onToggleAutoRelockOnReload,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = OnSignalEmerald,
+                            checkedTrackColor = SignalEmerald
+                        ),
+                        modifier = Modifier.testTag("auto_relock_reload_switch")
+                    )
+                    Text(
+                        text = stringResource(R.string.label_auto_relock_on_reload),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Surface(
+                    onClick = if (feed.isPolling) onPauseFeed else onStartFeed,
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (feed.isPolling) SignalEmerald.copy(alpha = 0.16f) else ObsidianSurfaceElevated,
+                    border = BorderStroke(
+                        1.dp,
+                        if (feed.isPolling) SignalEmerald.copy(alpha = 0.65f) else ObsidianBorder
+                    ),
+                    modifier = Modifier
+                        .heightIn(min = 38.dp)
+                        .testTag("toggle_direct_feed_button")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = if (feed.isPolling) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            contentDescription = null,
+                            tint = if (feed.isPolling) SignalEmerald else MaterialTheme.colorScheme.onSurface,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Text(
+                            text = if (feed.isPolling) "200ms ON" else "Start",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = if (feed.isPolling) SignalEmerald else MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            }
+
+            if (feed.lastRelockSummary.isNotBlank()) {
+                Text(
+                    text = feed.lastRelockSummary,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    color = ElectricCyan,
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
             }
@@ -259,21 +340,24 @@ fun PrimaryActionButtonsBar(
 }
 
 /**
- * Tabbed Diagnostic Console Deck (`Controls`, `Entities`, `Assets`, `Logs` + Manual JS Drawer).
- * Uses bounded inner height ([tabListHeight]) for `LazyColumn` tabs so it safely nests inside
- * the scrollable parent container on portrait mobile screens.
+ * 5-Tab WASM Diagnostics Console Deck:
+ * `Scanner` (Step 1) | `Ptr / Sig` (Step 2) | `Entities` | `Assets` | `Logs` + Manual JS Drawer.
  */
 @Composable
 fun TelemetryConsolePanel(
     state: DiagnosticsUiState,
     filteredLogs: List<TelemetryLogEntry>,
     onSelectConsoleTab: (ConsoleTab) -> Unit,
+    onCaptureBaseline: () -> Unit,
+    onScanMovementDeltas: () -> Unit,
+    onResetFloatScan: () -> Unit,
+    onInspectAndLockCandidate: (Int) -> Unit,
     onBaseIndexInputChanged: (String) -> Unit,
     onApplyBaseIndex: () -> Unit,
     onResetVerifiedIndex: () -> Unit,
-    onStartFeed: () -> Unit,
-    onPauseFeed: () -> Unit,
-    onCaptureSignature: () -> Unit,
+    onAnalyzeCurrentIndex: () -> Unit,
+    onSaveAndLockProfile: () -> Unit,
+    onClearSavedProfile: () -> Unit,
     onTogglePinEntity: (Int) -> Unit,
     onClearAssetCache: () -> Unit,
     onToggleJsDrawer: () -> Unit,
@@ -295,7 +379,7 @@ fun TelemetryConsolePanel(
         modifier = modifier.fillMaxWidth()
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            // Tab Bar Header + JS Toggle
+            // Scrollable Tab Bar Header + JS Toggle
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -304,42 +388,48 @@ fun TelemetryConsolePanel(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                ConsoleTabButton(
-                    label = stringResource(R.string.tab_controls),
-                    selected = state.activeConsoleTab == ConsoleTab.CONTROLS,
-                    accent = SignalEmerald,
-                    onClick = { onSelectConsoleTab(ConsoleTab.CONTROLS) },
+                Row(
                     modifier = Modifier
                         .weight(1f)
-                        .testTag("tab_controls")
-                )
-                ConsoleTabButton(
-                    label = "${stringResource(R.string.tab_entities)} (${state.discoveredEntities.size})",
-                    selected = state.activeConsoleTab == ConsoleTab.ENTITIES,
-                    accent = TelemetryViolet,
-                    onClick = { onSelectConsoleTab(ConsoleTab.ENTITIES) },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("tab_entities")
-                )
-                ConsoleTabButton(
-                    label = "${stringResource(R.string.tab_assets)} (${state.interceptedAssets.size})",
-                    selected = state.activeConsoleTab == ConsoleTab.ASSETS,
-                    accent = AssetAmber,
-                    onClick = { onSelectConsoleTab(ConsoleTab.ASSETS) },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("tab_assets")
-                )
-                ConsoleTabButton(
-                    label = "${stringResource(R.string.tab_logs)} (${state.logs.size})",
-                    selected = state.activeConsoleTab == ConsoleTab.LOGS,
-                    accent = ElectricCyan,
-                    onClick = { onSelectConsoleTab(ConsoleTab.LOGS) },
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("tab_logs")
-                )
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    ConsoleTabButton(
+                        label = stringResource(R.string.tab_scanner),
+                        selected = state.activeConsoleTab == ConsoleTab.SCANNER,
+                        accent = ElectricCyan,
+                        onClick = { onSelectConsoleTab(ConsoleTab.SCANNER) },
+                        modifier = Modifier.testTag("tab_scanner")
+                    )
+                    ConsoleTabButton(
+                        label = stringResource(R.string.tab_analyzer),
+                        selected = state.activeConsoleTab == ConsoleTab.ANALYZER,
+                        accent = TelemetryViolet,
+                        onClick = { onSelectConsoleTab(ConsoleTab.ANALYZER) },
+                        modifier = Modifier.testTag("tab_analyzer")
+                    )
+                    ConsoleTabButton(
+                        label = "${stringResource(R.string.tab_entities)} (${state.discoveredEntities.size})",
+                        selected = state.activeConsoleTab == ConsoleTab.ENTITIES,
+                        accent = SignalEmerald,
+                        onClick = { onSelectConsoleTab(ConsoleTab.ENTITIES) },
+                        modifier = Modifier.testTag("tab_entities")
+                    )
+                    ConsoleTabButton(
+                        label = "${stringResource(R.string.tab_assets)} (${state.interceptedAssets.size})",
+                        selected = state.activeConsoleTab == ConsoleTab.ASSETS,
+                        accent = AssetAmber,
+                        onClick = { onSelectConsoleTab(ConsoleTab.ASSETS) },
+                        modifier = Modifier.testTag("tab_assets")
+                    )
+                    ConsoleTabButton(
+                        label = "${stringResource(R.string.tab_logs)} (${state.logs.size})",
+                        selected = state.activeConsoleTab == ConsoleTab.LOGS,
+                        accent = ElectricCyan,
+                        onClick = { onSelectConsoleTab(ConsoleTab.LOGS) },
+                        modifier = Modifier.testTag("tab_logs")
+                    )
+                }
 
                 Surface(
                     onClick = onToggleJsDrawer,
@@ -364,7 +454,6 @@ fun TelemetryConsolePanel(
                 }
             }
 
-            // Collapsible Manual JS Drawer
             AnimatedVisibility(visible = state.isJsDrawerOpen) {
                 ManualJsDrawer(
                     jsInput = state.manualJsInput,
@@ -376,18 +465,27 @@ fun TelemetryConsolePanel(
 
             HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
-            // Active Tab Content
             when (state.activeConsoleTab) {
-                ConsoleTab.CONTROLS -> {
-                    DirectFeedControlsTab(
+                ConsoleTab.SCANNER -> {
+                    Step1FloatDeltaScannerTab(
+                        state = state,
+                        onCaptureBaseline = onCaptureBaseline,
+                        onScanMovementDeltas = onScanMovementDeltas,
+                        onResetScan = onResetFloatScan,
+                        onInspectAndLockCandidate = onInspectAndLockCandidate
+                    )
+                }
+
+                ConsoleTab.ANALYZER -> {
+                    Step2PointerSignatureTab(
                         state = state,
                         onBaseIndexInputChanged = onBaseIndexInputChanged,
                         onApplyBaseIndex = onApplyBaseIndex,
                         onResetVerifiedIndex = onResetVerifiedIndex,
-                        onStartFeed = onStartFeed,
-                        onPauseFeed = onPauseFeed,
-                        onCaptureSignature = onCaptureSignature,
-                        onOpenEntitiesTab = { onSelectConsoleTab(ConsoleTab.ENTITIES) }
+                        onAnalyzeCurrentIndex = onAnalyzeCurrentIndex,
+                        onSaveAndLockProfile = onSaveAndLockProfile,
+                        onClearSavedProfile = onClearSavedProfile,
+                        onCopyText = onCopyText
                     )
                 }
 
@@ -445,315 +543,21 @@ private fun ConsoleTabButton(
     Surface(
         onClick = onClick,
         shape = RoundedCornerShape(8.dp),
-        color = if (selected) accent.copy(alpha = 0.2f) else ObsidianBg,
+        color = if (selected) accent.copy(alpha = 0.22f) else ObsidianBg,
         border = BorderStroke(1.dp, if (selected) accent else ObsidianBorder),
         modifier = modifier.heightIn(min = 48.dp)
     ) {
         Box(
             contentAlignment = Alignment.Center,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp)
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
         ) {
             Text(
                 text = label,
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
                 color = if (selected) accent else MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
+                maxLines = 1
             )
-        }
-    }
-}
-
-@Composable
-private fun DirectFeedControlsTab(
-    state: DiagnosticsUiState,
-    onBaseIndexInputChanged: (String) -> Unit,
-    onApplyBaseIndex: () -> Unit,
-    onResetVerifiedIndex: () -> Unit,
-    onStartFeed: () -> Unit,
-    onPauseFeed: () -> Unit,
-    onCaptureSignature: () -> Unit,
-    onOpenEntitiesTab: () -> Unit
-) {
-    val feed = state.heapFeed
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(ObsidianBg)
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
-    ) {
-        // Card 1: Direct Verified HEAPF32 Feed Controls
-        Surface(
-            shape = RoundedCornerShape(12.dp),
-            color = ObsidianSurface,
-            border = BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.45f)),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = stringResource(R.string.controls_feed_title),
-                        style = MaterialTheme.typography.titleSmall,
-                        color = SignalEmerald
-                    )
-                    Text(
-                        text = "Ticks: ${feed.tickCount}",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-
-                Text(
-                    text = stringResource(R.string.controls_feed_description),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                // Start / Pause 200ms polling & Reset 581246
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Button(
-                        onClick = if (feed.isPolling) onPauseFeed else onStartFeed,
-                        shape = RoundedCornerShape(10.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (feed.isPolling) ObsidianSurfaceElevated else SignalEmerald,
-                            contentColor = if (feed.isPolling) SignalEmerald else OnSignalEmerald
-                        ),
-                        border = if (feed.isPolling) BorderStroke(1.dp, SignalEmerald.copy(alpha = 0.7f)) else null,
-                        modifier = Modifier
-                            .weight(1f)
-                            .heightIn(min = 48.dp)
-                            .testTag("toggle_direct_feed_button")
-                    ) {
-                        Icon(
-                            imageVector = if (feed.isPolling) Icons.Default.Pause else Icons.Default.PlayArrow,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = if (feed.isPolling) {
-                                stringResource(R.string.action_pause_feed)
-                            } else {
-                                stringResource(R.string.action_start_feed)
-                            },
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    OutlinedButton(
-                        onClick = onResetVerifiedIndex,
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, ObsidianBorder),
-                        modifier = Modifier
-                            .heightIn(min = 48.dp)
-                            .testTag("reset_verified_index_button")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.RestartAlt,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onSurface,
-                            modifier = Modifier.size(16.dp)
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Text(
-                            text = stringResource(R.string.action_reset_verified_index),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurface
-                        )
-                    }
-                }
-
-                // Custom Base Index override row
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedTextField(
-                        value = feed.baseIndexInput,
-                        onValueChange = onBaseIndexInputChanged,
-                        singleLine = true,
-                        placeholder = {
-                            Text(
-                                text = stringResource(R.string.base_index_input_hint),
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        },
-                        textStyle = MaterialTheme.typography.bodySmall.copy(
-                            fontFamily = JetBrainsMonoFontFamily,
-                            color = MaterialTheme.colorScheme.onSurface
-                        ),
-                        keyboardOptions = KeyboardOptions(
-                            keyboardType = KeyboardType.Number,
-                            imeAction = ImeAction.Done
-                        ),
-                        keyboardActions = KeyboardActions(onDone = { onApplyBaseIndex() }),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedBorderColor = ElectricCyan,
-                            unfocusedBorderColor = ObsidianBorder,
-                            focusedContainerColor = ObsidianBg,
-                            unfocusedContainerColor = ObsidianBg
-                        ),
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("base_index_input")
-                    )
-
-                    OutlinedButton(
-                        onClick = onApplyBaseIndex,
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.7f)),
-                        modifier = Modifier
-                            .heightIn(min = 52.dp)
-                            .testTag("apply_base_index_button")
-                    ) {
-                        Text(
-                            text = stringResource(R.string.action_apply_base_index),
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = ElectricCyan
-                        )
-                    }
-                }
-            }
-        }
-
-        // Card 2: Auto-Relock Memory Signature Status & Manual Capture
-        Surface(
-            shape = RoundedCornerShape(12.dp),
-            color = ObsidianSurface,
-            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.45f)),
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = stringResource(R.string.controls_relock_title),
-                        style = MaterialTheme.typography.titleSmall,
-                        color = ElectricCyan
-                    )
-                    Surface(
-                        shape = RoundedCornerShape(6.dp),
-                        color = if (feed.hasSignature) SignalEmerald.copy(alpha = 0.18f) else AssetAmber.copy(alpha = 0.16f)
-                    ) {
-                        Text(
-                            text = if (feed.hasSignature) {
-                                "${feed.signatureAnchorCount} anchors saved"
-                            } else {
-                                "No signature yet"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            fontWeight = FontWeight.Bold,
-                            color = if (feed.hasSignature) SignalEmerald else AssetAmber,
-                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
-                        )
-                    }
-                }
-
-                Text(
-                    text = stringResource(R.string.controls_relock_description),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-
-                if (feed.lastRelockSummary.isNotBlank()) {
-                    Text(
-                        text = feed.lastRelockSummary,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = ElectricCyan,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(6.dp))
-                            .background(ObsidianBg)
-                            .padding(8.dp)
-                    )
-                }
-
-                OutlinedButton(
-                    onClick = onCaptureSignature,
-                    shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.75f)),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 48.dp)
-                        .testTag("capture_signature_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Fingerprint,
-                        contentDescription = null,
-                        tint = ElectricCyan,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = "${stringResource(R.string.action_capture_signature)} @ HEAPF32[${feed.baseIndex}]",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = ElectricCyan
-                    )
-                }
-            }
-        }
-
-        // Card 3: Nearby Entity Scanner Summary
-        Surface(
-            shape = RoundedCornerShape(12.dp),
-            color = ObsidianSurface,
-            border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.45f)),
-            modifier = Modifier
-                .fillMaxWidth()
-                .clickable(onClick = onOpenEntitiesTab)
-        ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text(
-                        text = stringResource(R.string.controls_entities_title),
-                        style = MaterialTheme.typography.titleSmall,
-                        color = TelemetryViolet
-                    )
-                    Text(
-                        text = "${state.discoveredEntities.size} found →",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        fontWeight = FontWeight.Bold,
-                        color = TelemetryViolet
-                    )
-                }
-                Text(
-                    text = stringResource(R.string.controls_entities_description),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
         }
     }
 }
@@ -844,8 +648,7 @@ private fun ManualJsDrawer(
 
 /**
  * Fixed, collapsible bottom Live Telemetry Stream Card.
- * Completely isolated from the interactive buttons above so rapid 200ms text stream updates
- * never shift, overlap, or clip primary controls.
+ * Completely separated from interactive controls so 200ms text ticks never overlap buttons.
  */
 @Composable
 fun CollapsibleLiveTelemetryStreamCard(
@@ -859,14 +662,16 @@ fun CollapsibleLiveTelemetryStreamCard(
 
     Surface(
         color = ObsidianSurface,
-        border = BorderStroke(1.dp, if (feed.isPolling && feed.isHeapReady) SignalEmerald.copy(alpha = 0.55f) else ObsidianBorder),
+        border = BorderStroke(
+            1.dp,
+            if (feed.isPolling && feed.isHeapReady) SignalEmerald.copy(alpha = 0.55f) else ObsidianBorder
+        ),
         shape = RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp),
         modifier = modifier
             .fillMaxWidth()
             .testTag("collapsible_telemetry_stream")
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            // Fixed 48dp header bar (always tappable, never obscures content above)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -882,7 +687,7 @@ fun CollapsibleLiveTelemetryStreamCard(
                         .clip(CircleShape)
                         .background(
                             when {
-                                feed.isRelocking || state.isScanningEntities -> ElectricCyan
+                                feed.isRelocking || state.isScanningEntities || state.floatScanner.isBusy -> ElectricCyan
                                 feed.isPolling && feed.isHeapReady -> SignalEmerald
                                 else -> AssetAmber
                             }

@@ -35,7 +35,6 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -44,6 +43,8 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Computer
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.LockOpen
 import androidx.compose.material.icons.filled.OpenInFull
 import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Refresh
@@ -72,8 +73,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.rememberNestedScrollInteropConnection
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -88,6 +91,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.DiagnosticsCommand
 import com.example.DiagnosticsUiState
 import com.example.DiagnosticsViewModel
+import com.example.LockStatus
 import com.example.LogCategory
 import com.example.R
 import com.example.TelemetryBridge
@@ -105,16 +109,16 @@ import kotlinx.coroutines.flow.collectLatest
 import java.util.Locale
 
 /**
- * Main mobile-first adaptive diagnostics interface.
+ * Main mobile-first adaptive WASM Memory Scanner, Pointer/Signature Analyzer & Persistent Lock UI.
  *
  * Layout hierarchy:
- * 1. Compact URL Navigation Bar (top)
- * 2. Prominent Top Live Coordinate HUD reading `window.HEAPF32[581246..581248]` @ 200ms
- * 3. Scrollable Parent Body (portrait) or Side-by-Side Split (wide >= 840dp):
- *    - Interactive WebView Card (expandable height toggle)
- *    - Permanent High-Contrast Primary Action Bar (`Relock Coordinates`, `Scan Entities`, `Export Report`)
- *    - Tabbed Console Deck (`Controls`, `Entities`, `Assets`, `Logs` + Manual JS Drawer)
- * 4. Fixed, Collapsible Live Telemetry Stream Card anchored at the bottom (isolated from buttons)
+ * 1. Compact URL Navigation Bar
+ * 2. Compact, Fixed Live Telemetry Bar pinned at the top:
+ *    `LOCKED / UNLOCKED`, `Base Index`, `Hex Address`, and fixed-height 3-decimal `X, Y, Z`
+ *    updating every 200ms with ZERO layout shift below it.
+ * 3. Smooth NestedScrollView-compatible scrollable diagnostics container (portrait) or
+ *    Side-by-Side Split (wide >= 840dp) with clear cards and generous button padding.
+ * 4. Fixed, Collapsible Live Telemetry Stream Bar anchored at the bottom.
  */
 @Composable
 fun DiagnosticsScreen(
@@ -145,6 +149,9 @@ fun DiagnosticsScreen(
                     heapByteLength = heapByteLength,
                     heapSource = heapSource
                 )
+            },
+            onFloatDeltaPreviewUpdated = { jsonPayload ->
+                viewModel.onFloatDeltaPreviewFromBridge(jsonPayload)
             }
         )
     }
@@ -152,22 +159,12 @@ fun DiagnosticsScreen(
     LaunchedEffect(viewModel, context) {
         viewModel.commands.collectLatest { command ->
             when (command) {
-                is DiagnosticsCommand.LoadUrl -> {
-                    webViewRef?.loadUrl(command.url)
-                }
-
-                DiagnosticsCommand.Reload -> {
-                    webViewRef?.reload()
-                }
-
-                is DiagnosticsCommand.EvaluateJs -> {
-                    webViewRef?.evaluateJavascript(command.script, null)
-                }
-
+                is DiagnosticsCommand.LoadUrl -> webViewRef?.loadUrl(command.url)
+                DiagnosticsCommand.Reload -> webViewRef?.reload()
+                is DiagnosticsCommand.EvaluateJs -> webViewRef?.evaluateJavascript(command.script, null)
                 is DiagnosticsCommand.ShowToast -> {
                     Toast.makeText(context, command.message, Toast.LENGTH_SHORT).show()
                 }
-
                 is DiagnosticsCommand.ShareFile -> {
                     val intent = DiagnosticsViewModel.createShareIntent(
                         uri = command.uri,
@@ -227,7 +224,7 @@ fun DiagnosticsScreen(
                 .padding(innerPadding)
                 .background(ObsidianBg)
         ) {
-            // 1. Compact URL Navigation Bar
+            // 1. Compact URL Bar
             CompactUrlNavigationBar(
                 urlInput = state.urlInput,
                 isDesktopMode = state.isDesktopMode,
@@ -242,19 +239,20 @@ fun DiagnosticsScreen(
                 onToggleDesktopMode = viewModel::onToggleDesktopMode
             )
 
-            // 2. Prominent Top Live Coordinate HUD (HEAPF32[581246..581248])
-            TopLiveCoordinateHud(
+            // 2. Compact, Fixed Live Telemetry Bar (zero layout shift @ 200ms)
+            FixedLiveTelemetryBar(
                 state = state,
-                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
             )
 
-            // 3. Adaptive Main Body (Scrollable Parent on Portrait, Side-by-Side Split on Wide)
+            // 3. Adaptive Main Body
             BoxWithConstraints(
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth()
             ) {
                 val isWideLayout = maxWidth >= 840.dp
+                val nestedScrollInterop = rememberNestedScrollInteropConnection()
 
                 if (isWideLayout) {
                     Row(
@@ -284,12 +282,16 @@ fun DiagnosticsScreen(
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxHeight()
+                                .nestedScroll(nestedScrollInterop)
                                 .verticalScroll(rememberScrollState()),
                             verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
                             PrimaryActionButtonsBar(
                                 state = state,
-                                onRelockCoordinates = viewModel::relockCoordinates,
+                                onAutoRelock = { viewModel.autoRelockCoordinates(isAutomatic = false) },
+                                onToggleAutoRelockOnReload = viewModel::onToggleAutoRelockOnReload,
+                                onStartFeed = viewModel::startDirectHeapFeed,
+                                onPauseFeed = viewModel::pauseDirectHeapFeed,
                                 onScanEntities = viewModel::scanNearbyEntities,
                                 onExportReport = {
                                     viewModel.requestExportReport(
@@ -304,12 +306,16 @@ fun DiagnosticsScreen(
                                 state = state,
                                 filteredLogs = filteredLogs,
                                 onSelectConsoleTab = viewModel::onSelectConsoleTab,
+                                onCaptureBaseline = viewModel::captureStandingBaseline,
+                                onScanMovementDeltas = viewModel::scanMovementDeltas,
+                                onResetFloatScan = viewModel::resetFloatScan,
+                                onInspectAndLockCandidate = viewModel::inspectAndLockCandidate,
                                 onBaseIndexInputChanged = viewModel::onBaseIndexInputChanged,
                                 onApplyBaseIndex = viewModel::onApplyBaseIndex,
                                 onResetVerifiedIndex = viewModel::onResetToVerifiedBaseIndex,
-                                onStartFeed = viewModel::startDirectHeapFeed,
-                                onPauseFeed = viewModel::pauseDirectHeapFeed,
-                                onCaptureSignature = viewModel::captureRelockSignature,
+                                onAnalyzeCurrentIndex = { viewModel.inspectAndLockCandidate(state.heapFeed.baseIndex) },
+                                onSaveAndLockProfile = viewModel::saveAndLockProfile,
+                                onClearSavedProfile = viewModel::clearSavedProfile,
                                 onTogglePinEntity = viewModel::onTogglePinEntity,
                                 onClearAssetCache = viewModel::onClearAssetCache,
                                 onToggleJsDrawer = viewModel::onToggleJsDrawer,
@@ -328,17 +334,16 @@ fun DiagnosticsScreen(
                         }
                     }
                 } else {
-                    // Portrait / Mobile Scrollable Parent Container:
-                    // Guarantees buttons and tabs are NEVER clipped or pushed off-screen.
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
+                            .nestedScroll(nestedScrollInterop)
                             .verticalScroll(rememberScrollState())
                             .padding(horizontal = 12.dp, vertical = 4.dp)
                             .testTag("main_scrollable_container"),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        val webViewHeight = if (state.isWebViewExpanded) 430.dp else 280.dp
+                        val webViewHeight = if (state.isWebViewExpanded) 430.dp else 270.dp
                         DiagnosticWebViewCard(
                             state = state,
                             telemetryBridge = telemetryBridge,
@@ -358,7 +363,10 @@ fun DiagnosticsScreen(
 
                         PrimaryActionButtonsBar(
                             state = state,
-                            onRelockCoordinates = viewModel::relockCoordinates,
+                            onAutoRelock = { viewModel.autoRelockCoordinates(isAutomatic = false) },
+                            onToggleAutoRelockOnReload = viewModel::onToggleAutoRelockOnReload,
+                            onStartFeed = viewModel::startDirectHeapFeed,
+                            onPauseFeed = viewModel::pauseDirectHeapFeed,
                             onScanEntities = viewModel::scanNearbyEntities,
                             onExportReport = {
                                 viewModel.requestExportReport(
@@ -373,12 +381,16 @@ fun DiagnosticsScreen(
                             state = state,
                             filteredLogs = filteredLogs,
                             onSelectConsoleTab = viewModel::onSelectConsoleTab,
+                            onCaptureBaseline = viewModel::captureStandingBaseline,
+                            onScanMovementDeltas = viewModel::scanMovementDeltas,
+                            onResetFloatScan = viewModel::resetFloatScan,
+                            onInspectAndLockCandidate = viewModel::inspectAndLockCandidate,
                             onBaseIndexInputChanged = viewModel::onBaseIndexInputChanged,
                             onApplyBaseIndex = viewModel::onApplyBaseIndex,
                             onResetVerifiedIndex = viewModel::onResetToVerifiedBaseIndex,
-                            onStartFeed = viewModel::startDirectHeapFeed,
-                            onPauseFeed = viewModel::pauseDirectHeapFeed,
-                            onCaptureSignature = viewModel::captureRelockSignature,
+                            onAnalyzeCurrentIndex = { viewModel.inspectAndLockCandidate(state.heapFeed.baseIndex) },
+                            onSaveAndLockProfile = viewModel::saveAndLockProfile,
+                            onClearSavedProfile = viewModel::clearSavedProfile,
                             onTogglePinEntity = viewModel::onTogglePinEntity,
                             onClearAssetCache = viewModel::onClearAssetCache,
                             onToggleJsDrawer = viewModel::onToggleJsDrawer,
@@ -402,11 +414,12 @@ fun DiagnosticsScreen(
 }
 
 /**
- * Prominent Top Live Coordinate HUD displaying verified `window.HEAPF32[581246..581248]` (X, Y, Z)
- * coordinates clearly at the top of the interface with live polling badge and hex address.
+ * Compact, fixed-height Live Telemetry Bar pinned at the top.
+ * Displays: Lock Status (`LOCKED` / `UNLOCKED` / `RELOCKING…`), `Base Index`, `Hex Address`,
+ * and live 3-decimal `X, Y, Z` coordinates updating every 200ms with zero vertical jitter.
  */
 @Composable
-private fun TopLiveCoordinateHud(
+private fun FixedLiveTelemetryBar(
     state: DiagnosticsUiState,
     modifier: Modifier = Modifier
 ) {
@@ -414,77 +427,70 @@ private fun TopLiveCoordinateHud(
     val hexAddress = remember(feed.byteAddress) {
         "0x${feed.byteAddress.toString(16).uppercase(Locale.US)}"
     }
-    val statusColor = when {
-        feed.isRelocking -> ElectricCyan
-        feed.isPolling && feed.isHeapReady -> SignalEmerald
-        else -> AssetAmber
+    val statusColor = when (feed.lockStatus) {
+        LockStatus.LOCKED -> SignalEmerald
+        LockStatus.RELOCKING -> ElectricCyan
+        LockStatus.UNLOCKED -> AssetAmber
     }
-    val statusText = when {
-        feed.isRelocking -> stringResource(R.string.hud_status_relocking)
-        feed.isPolling && feed.isHeapReady -> stringResource(R.string.hud_status_live)
-        else -> stringResource(R.string.hud_status_standby)
+    val statusLabel = when (feed.lockStatus) {
+        LockStatus.LOCKED -> stringResource(R.string.hud_status_locked)
+        LockStatus.RELOCKING -> stringResource(R.string.hud_status_relocking)
+        LockStatus.UNLOCKED -> stringResource(R.string.hud_status_unlocked)
     }
 
     Surface(
-        shape = RoundedCornerShape(14.dp),
+        shape = RoundedCornerShape(12.dp),
         color = ObsidianSurface,
-        border = BorderStroke(1.2.dp, statusColor.copy(alpha = 0.65f)),
+        border = BorderStroke(1.2.dp, statusColor.copy(alpha = 0.7f)),
         modifier = modifier
             .fillMaxWidth()
-            .testTag("top_live_coordinate_hud")
+            .height(92.dp) // Fixed height guarantees zero layout shift below during 200ms updates
+            .testTag("top_live_telemetry_bar")
     ) {
         Column(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 10.dp, vertical = 7.dp),
+            verticalArrangement = Arrangement.SpaceBetween
         ) {
+            // Row 1: Lock Status Pill + Base Index + Hex Address
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = stringResource(R.string.hud_title_live_coords),
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold,
-                        color = statusColor
-                    )
-                    Text(
-                        text = "${feed.heapSourceLabel}[${feed.baseIndex}..${feed.baseIndex + 2}] • $hexAddress",
-                        style = MaterialTheme.typography.labelSmall,
-                        fontFamily = JetBrainsMonoFontFamily,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
                 Surface(
                     shape = RoundedCornerShape(999.dp),
                     color = statusColor.copy(alpha = 0.18f),
-                    border = BorderStroke(1.dp, statusColor.copy(alpha = 0.7f))
+                    border = BorderStroke(1.dp, statusColor.copy(alpha = 0.75f)),
+                    modifier = Modifier.testTag("hud_lock_status_badge")
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
                         verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        if (feed.isRelocking) {
-                            CircularProgressIndicator(
+                        when (feed.lockStatus) {
+                            LockStatus.RELOCKING -> CircularProgressIndicator(
                                 modifier = Modifier.size(10.dp),
                                 strokeWidth = 1.6.dp,
                                 color = statusColor
                             )
-                        } else {
-                            Box(
-                                modifier = Modifier
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(statusColor)
+                            LockStatus.LOCKED -> Icon(
+                                imageVector = Icons.Default.Lock,
+                                contentDescription = null,
+                                tint = statusColor,
+                                modifier = Modifier.size(11.dp)
+                            )
+                            LockStatus.UNLOCKED -> Icon(
+                                imageVector = Icons.Default.LockOpen,
+                                contentDescription = null,
+                                tint = statusColor,
+                                modifier = Modifier.size(11.dp)
                             )
                         }
                         Text(
-                            text = statusText,
+                            text = statusLabel,
                             style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.Bold,
                             color = statusColor,
@@ -492,34 +498,61 @@ private fun TopLiveCoordinateHud(
                         )
                     }
                 }
+
+                Text(
+                    text = "IDX [${feed.baseIndex}] • $hexAddress",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontFamily = JetBrainsMonoFontFamily,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .clip(CircleShape)
+                            .background(if (feed.isPolling && feed.isHeapReady) SignalEmerald else AssetAmber)
+                    )
+                    Text(
+                        text = if (feed.isPolling && feed.isHeapReady) "200ms" else "IDLE",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontFamily = JetBrainsMonoFontFamily,
+                        color = if (feed.isPolling && feed.isHeapReady) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 9.sp
+                    )
+                }
             }
 
-            // Clean 3-column Coordinate Readout (X, Y, Z)
+            // Row 2: Fixed 3-Column Tabular X, Y, Z Coordinates (3 decimal places)
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                HudCoordinateTile(
+                FixedCoordCell(
                     axis = "X",
-                    index = feed.baseIndex,
                     value = feed.x,
                     accent = SignalEmerald,
                     modifier = Modifier
                         .weight(1f)
                         .testTag("hud_coord_x")
                 )
-                HudCoordinateTile(
+                FixedCoordCell(
                     axis = "Y",
-                    index = feed.baseIndex + 1,
                     value = feed.y,
                     accent = ElectricCyan,
                     modifier = Modifier
                         .weight(1f)
                         .testTag("hud_coord_y")
                 )
-                HudCoordinateTile(
+                FixedCoordCell(
                     axis = "Z",
-                    index = feed.baseIndex + 2,
                     value = feed.z,
                     accent = TelemetryViolet,
                     modifier = Modifier
@@ -532,47 +565,36 @@ private fun TopLiveCoordinateHud(
 }
 
 @Composable
-private fun HudCoordinateTile(
+private fun FixedCoordCell(
     axis: String,
-    index: Int,
     value: Double,
     accent: Color,
     modifier: Modifier = Modifier
 ) {
-    Column(
+    Row(
         modifier = modifier
-            .clip(RoundedCornerShape(10.dp))
+            .height(38.dp)
+            .clip(RoundedCornerShape(8.dp))
             .background(ObsidianBg)
-            .padding(horizontal = 10.dp, vertical = 7.dp),
-        verticalArrangement = Arrangement.spacedBy(2.dp)
+            .padding(horizontal = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = axis,
-                style = MaterialTheme.typography.labelSmall,
-                fontWeight = FontWeight.Bold,
-                color = accent
-            )
-            Text(
-                text = "[$index]",
-                style = MaterialTheme.typography.labelSmall,
-                fontFamily = JetBrainsMonoFontFamily,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                fontSize = 9.sp
-            )
-        }
+        Text(
+            text = axis,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+            color = accent
+        )
         Text(
             text = String.format(Locale.US, "%.3f", value),
-            style = MaterialTheme.typography.titleSmall,
+            style = MaterialTheme.typography.bodySmall,
             fontFamily = JetBrainsMonoFontFamily,
             fontWeight = FontWeight.Bold,
             color = MaterialTheme.colorScheme.onSurface,
             maxLines = 1,
-            overflow = TextOverflow.Ellipsis
+            softWrap = false,
+            overflow = TextOverflow.Clip
         )
     }
 }
@@ -596,7 +618,7 @@ private fun CompactUrlNavigationBar(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 10.dp, vertical = 8.dp),
+                .padding(horizontal = 10.dp, vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(6.dp)
         ) {
@@ -731,7 +753,6 @@ private fun DiagnosticWebViewCard(
         modifier = modifier
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-            // Card Header
             Row(
                 modifier = Modifier
                     .fillMaxWidth()

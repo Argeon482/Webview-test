@@ -630,6 +630,8 @@ private fun LogEntryCard(
 fun categoryAccentColor(category: LogCategory): Color = when (category) {
     LogCategory.ALL -> ElectricCyan
     LogCategory.FEED -> SignalEmerald
+    LogCategory.SCAN -> ElectricCyan
+    LogCategory.PTR -> TelemetryViolet
     LogCategory.RELOCK -> ElectricCyan
     LogCategory.ENTITY -> TelemetryViolet
     LogCategory.ASSET -> AssetAmber

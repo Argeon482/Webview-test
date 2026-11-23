@@ -6,58 +6,69 @@
     <string name="action_desktop_ua">Desktop UA</string>
     <string name="action_mobile_ua">Mobile UA</string>
 
-    <!-- Top Live Coordinate HUD & Direct Heap Feed -->
-    <string name="hud_title_live_coords">LIVE HEAPF32 FEED</string>
-    <string name="hud_status_live">LIVE 200ms</string>
-    <string name="hud_status_standby">STANDBY</string>
+    <!-- Top Fixed Live Telemetry Bar -->
+    <string name="hud_status_locked">LOCKED</string>
+    <string name="hud_status_unlocked">UNLOCKED</string>
     <string name="hud_status_relocking">RELOCKING…</string>
 
-    <!-- Primary Action Buttons -->
-    <string name="action_relock_coordinates">Relock Coordinates</string>
+    <!-- Step 1: Movement Float Delta Scanner -->
+    <string name="step1_card_title">Step 1: Movement Float Delta Scanner (HEAPF32)</string>
+    <string name="step1_card_subtitle">Stand still, capture baseline, move your character and stop, then scan deltas to isolate live coordinates.</string>
+    <string name="action_capture_baseline">1. Capture Standing Baseline</string>
+    <string name="action_scan_movement_deltas">2. Scan Movement Deltas</string>
+    <string name="action_reset_scan">Reset Scan</string>
+    <string name="action_inspect_and_lock">Tap to Inspect &amp; Lock</string>
+
+    <!-- Step 2: Pointer & Memory Signature Analyzer -->
+    <string name="step2_card_title">Pointer &amp; Signature</string>
+    <string name="step2_card_subtitle">Inspects ±16 neighboring HEAPF32 / HEAPU32 slots for static AOB/Float patterns and reverse-scans HEAPU32 for parent pointers.</string>
+    <string name="action_inspect_current_index">Analyze ±16 Block &amp; Reverse Pointers</string>
+    <string name="action_save_lock_profile">Save &amp; Lock Profile</string>
+    <string name="action_clear_saved_profile">Clear Profile</string>
+    <string name="base_index_input_hint">Base index (default 581246)</string>
+    <string name="action_apply_base_index">Apply</string>
+    <string name="action_reset_verified_index">581246</string>
+
+    <!-- Step 3: One-Tap & Automatic Relock Across Reloads -->
+    <string name="action_auto_relock">Auto-Relock</string>
+    <string name="label_auto_relock_on_reload">Auto-Relock on Page Reload</string>
     <string name="action_scan_entities">Scan Entities</string>
     <string name="action_export_report">Export Report</string>
     <string name="action_share_report">Share</string>
-    <string name="action_capture_signature">Capture Signature</string>
     <string name="action_start_feed">Start 200ms Feed</string>
     <string name="action_pause_feed">Pause Feed</string>
-    <string name="action_apply_base_index">Apply Index</string>
-    <string name="action_reset_verified_index">Reset 581246</string>
 
     <!-- Tabs -->
-    <string name="tab_controls">Controls</string>
+    <string name="tab_scanner">Scanner</string>
+    <string name="tab_analyzer">Ptr / Sig</string>
     <string name="tab_entities">Entities</string>
     <string name="tab_assets">Assets</string>
     <string name="tab_logs">Logs</string>
 
-    <!-- Controls & Guidance Copy -->
-    <string name="controls_feed_title">Direct Heap Feed (window.HEAPF32)</string>
-    <string name="controls_feed_description">Reads verified player coordinates directly from window.HEAPF32[581246] (X), [581247] (Y), and [581248] (Z) every 200ms.</string>
-    <string name="controls_relock_title">Auto-Relock Memory Signature</string>
-    <string name="controls_relock_description">Captures the static float/int32 signature around the player base index and rescans window.HEAPF32 after page reloads or zone changes.</string>
-    <string name="controls_entities_title">Nearby Entity Struct Scanner (±50,000)</string>
-    <string name="controls_entities_description">Searches ±50,000 indices around the player for repeating (X, Y, Z) float triplets within valid world bounds.</string>
-    <string name="base_index_input_hint">Base index (default 581246)</string>
-
     <!-- Collapsible Live Telemetry Stream -->
-    <string name="telemetry_stream_title">LIVE TELEMETRY STREAM</string>
-    <string name="telemetry_stream_empty">Waiting for 200ms window.HEAPF32 coordinate samples…</string>
+    <string name="telemetry_stream_title">LIVE STREAM</string>
+    <string name="telemetry_stream_empty">Waiting for 200ms window.HEAPF32 samples…</string>
 
     <!-- Manual JS & Logs & Assets -->
     <string name="action_js_drawer">JS</string>
     <string name="action_execute_script">Execute Script</string>
-    <string name="js_input_hint">Enter JS expression or query path…</string>
+    <string name="js_input_hint">Enter read-only JS expression…</string>
     <string name="action_export_log_dump_txt">Export Log Dump (.txt)</string>
     <string name="action_export_log_dump_json">.json</string>
     <string name="action_share_log_dump">Share</string>
     <string name="action_clear_asset_cache">Clear Cache</string>
 
     <!-- Empty States -->
+    <string name="scanner_empty_title">No Movement Deltas Isolated Yet</string>
+    <string name="scanner_empty_subtitle">Tap \'1. Capture Standing Baseline\' while idle, walk a few steps and stop, then tap \'2. Scan Movement Deltas\'.</string>
+    <string name="analyzer_empty_title">No Struct Signature Analyzed</string>
+    <string name="analyzer_empty_subtitle">Tap \'Tap to Inspect &amp; Lock\' on any scanner hit (or analyze the current base index) to extract AOB/Float patterns and reverse HEAPU32 parent pointers.</string>
     <string name="entities_empty_title">No Nearby Entity Structs Scanned</string>
-    <string name="entities_empty_subtitle">Tap \'Scan Entities\' above to search ±50,000 indices around the player in window.HEAPF32 for repeating (X, Y, Z) float triplets.</string>
+    <string name="entities_empty_subtitle">Tap \'Scan Entities\' above to search ±50,000 indices around the locked player in window.HEAPF32.</string>
     <string name="assets_empty_title">No Binary Assets Intercepted Yet</string>
     <string name="assets_empty_subtitle">Load a web application to passively capture .wasm, .bin, and .json requests into private app storage and inspect ByteBuffer headers, sections, and entropy here.</string>
     <string name="console_empty_title">Diagnostic Engine Armed</string>
-    <string name="console_empty_subtitle">Load your target page to start the 200ms window.HEAPF32 direct coordinate feed, capture a relock signature, or scan nearby entities.</string>
+    <string name="console_empty_subtitle">Load your target page to scan movement float deltas, inspect pointer signatures, or auto-relock saved profiles.</string>
 
     <!-- Accessibility Content Descriptions -->
     <string name="cd_reload_page">Reload current page</string>

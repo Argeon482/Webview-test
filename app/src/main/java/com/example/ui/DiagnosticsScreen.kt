@@ -125,6 +125,9 @@ fun DiagnosticsScreen(
             },
             onBatchProgressChanged = { progress ->
                 viewModel.onBatchProgressChanged(progress)
+            },
+            onWasmNeighborsUpdated = { jsonPayload ->
+                viewModel.onWasmNeighborsUpdatedFromBridge(jsonPayload)
             }
         )
     }
@@ -274,6 +277,20 @@ fun DiagnosticsScreen(
                         onClearLogs = viewModel::onClearLogs,
                         onToggleExpanded = viewModel::onToggleConsoleExpanded,
                         onCopyPayload = { text -> copyToClipboard(context, text) },
+                        onWasmValueChanged = viewModel::onWasmTargetValueChanged,
+                        onRunWasmScan = {
+                            focusManager.clearFocus()
+                            viewModel.runWasmHeapInitialScan()
+                        },
+                        onRunWasmFilter = {
+                            focusManager.clearFocus()
+                            viewModel.runWasmHeapFilterDelta()
+                        },
+                        onInspectWasmCandidate = viewModel::onInspectWasmCandidate,
+                        onStopWasmPoll = viewModel::onStopWasmNeighborPolling,
+                        onResetWasmTracker = viewModel::onResetWasmHeapTracker,
+                        onExportWasmMemoryMap = { viewModel.exportWasmMemoryMapJson(context) },
+                        onShareWasmMemoryMap = viewModel::onShareLastWasmMemoryMap,
                         modifier = Modifier
                             .weight(if (state.isConsoleExpanded) 0.58f else 0.40f)
                             .fillMaxHeight()
@@ -341,6 +358,20 @@ fun DiagnosticsScreen(
                         onClearLogs = viewModel::onClearLogs,
                         onToggleExpanded = viewModel::onToggleConsoleExpanded,
                         onCopyPayload = { text -> copyToClipboard(context, text) },
+                        onWasmValueChanged = viewModel::onWasmTargetValueChanged,
+                        onRunWasmScan = {
+                            focusManager.clearFocus()
+                            viewModel.runWasmHeapInitialScan()
+                        },
+                        onRunWasmFilter = {
+                            focusManager.clearFocus()
+                            viewModel.runWasmHeapFilterDelta()
+                        },
+                        onInspectWasmCandidate = viewModel::onInspectWasmCandidate,
+                        onStopWasmPoll = viewModel::onStopWasmNeighborPolling,
+                        onResetWasmTracker = viewModel::onResetWasmHeapTracker,
+                        onExportWasmMemoryMap = { viewModel.exportWasmMemoryMapJson(context) },
+                        onShareWasmMemoryMap = viewModel::onShareLastWasmMemoryMap,
                         modifier = Modifier
                             .weight(if (state.isConsoleExpanded) 0.66f else 0.42f)
                             .fillMaxWidth()

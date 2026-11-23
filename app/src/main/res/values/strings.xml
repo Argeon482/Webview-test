@@ -74,7 +74,22 @@
     <string name="cd_share_log_dump">Share exported full log dump</string>
     <string name="toast_report_saved">Diagnostic report saved to Downloads: %1$s</string>
     <string name="toast_log_dump_saved">Full log dump saved to Downloads: %1$s</string>
+    <string name="toast_wasm_map_saved">WASM memory map saved to Downloads: %1$s</string>
     <string name="toast_report_failed">Failed to export report: %1$s</string>
     <string name="toast_log_copied">Copied to clipboard</string>
     <string name="share_report_chooser_title">Share Diagnostic Telemetry File</string>
+
+    <!-- WASM Heap Value-Tracker -->
+    <string name="tab_wasm_heap">WASM Heap</string>
+    <string name="wasm_tracker_title">WASM Heap Value-Tracker (HP / Stat Scanner)</string>
+    <string name="wasm_value_input_hint">Enter exact stat / HP value (e.g. 4338)</string>
+    <string name="wasm_action_scan_heap">1. Scan HEAP32 / F32</string>
+    <string name="wasm_action_filter_delta">2. Filter Changed Value</string>
+    <string name="wasm_action_reset">Reset</string>
+    <string name="wasm_action_stop_poll">Stop Poll</string>
+    <string name="wasm_action_export_map">Export Memory Map (.json)</string>
+    <string name="wasm_filter_instruction">Take damage or heal in-game so your HP changes, enter your new HP value, and tap filter.</string>
+    <string name="wasm_neighbors_title">Neighboring Memory Inspector (±4 to ±16 Bytes)</string>
+    <string name="wasm_neighbors_hint">Walk or move in-game — adjacent floats that highlight in green reveal live player coordinates.</string>
+    <string name="cd_export_wasm_map">Export isolated WASM memory map as JSON</string>
 </resources>

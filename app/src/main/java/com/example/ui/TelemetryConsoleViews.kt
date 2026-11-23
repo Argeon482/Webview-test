@@ -1231,6 +1231,7 @@ internal fun categoryAccentColor(category: LogCategory): Color = when (category)
     LogCategory.SCOPE -> ElectricCyan
     LogCategory.DELTA -> SignalEmerald
     LogCategory.ENTITY -> TelemetryViolet
+    LogCategory.WASM -> Color(0xFF38BDF8)
     LogCategory.ASSET -> AssetAmber
     LogCategory.JS -> Color(0xFF60A5FA)
     LogCategory.SYSTEM -> Color(0xFF94A3B8)

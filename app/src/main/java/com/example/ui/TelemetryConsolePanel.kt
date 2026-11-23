@@ -123,6 +123,14 @@ fun TelemetryConsolePanel(
     onClearLogs: () -> Unit,
     onToggleExpanded: () -> Unit,
     onCopyPayload: (String) -> Unit,
+    onWasmValueChanged: (String) -> Unit,
+    onRunWasmScan: () -> Unit,
+    onRunWasmFilter: () -> Unit,
+    onInspectWasmCandidate: (heapType: String, index: Int) -> Unit,
+    onStopWasmPoll: () -> Unit,
+    onResetWasmTracker: () -> Unit,
+    onExportWasmMemoryMap: () -> Unit,
+    onShareWasmMemoryMap: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     if (state.isJsDrawerOpen) {
@@ -174,6 +182,24 @@ fun TelemetryConsolePanel(
                         onOpenStaging = { onSelectConsoleTab(ConsoleTab.STAGING) },
                         onOpenEntities = { onSelectConsoleTab(ConsoleTab.ENTITIES) },
                         onOpenLogs = { onSelectConsoleTab(ConsoleTab.LOGS) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxWidth()
+                    )
+                }
+
+                ConsoleTab.WASM_HEAP -> {
+                    WasmHeapTrackerView(
+                        state = state,
+                        onValueInputChanged = onWasmValueChanged,
+                        onRunInitialScan = onRunWasmScan,
+                        onRunFilterDelta = onRunWasmFilter,
+                        onInspectCandidate = onInspectWasmCandidate,
+                        onStopNeighborPoll = onStopWasmPoll,
+                        onResetTracker = onResetWasmTracker,
+                        onExportMemoryMap = onExportWasmMemoryMap,
+                        onShareMemoryMap = onShareWasmMemoryMap,
+                        onCopyText = onCopyPayload,
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxWidth()
@@ -273,6 +299,18 @@ private fun ConsoleHeaderBar(
                     accent = ElectricCyan,
                     testTag = "tab_wizard_button",
                     onClick = { onSelectTab(ConsoleTab.WIZARD) }
+                )
+                val wasmLabel = if (state.wasmHeap.totalMatches > 0) {
+                    "${stringResource(R.string.tab_wasm_heap)} (${state.wasmHeap.totalMatches})"
+                } else {
+                    stringResource(R.string.tab_wasm_heap)
+                }
+                HeaderTabPill(
+                    label = wasmLabel,
+                    selected = state.activeConsoleTab == ConsoleTab.WASM_HEAP,
+                    accent = SignalEmerald,
+                    testTag = "tab_wasm_heap_button",
+                    onClick = { onSelectTab(ConsoleTab.WASM_HEAP) }
                 )
                 HeaderTabPill(
                     label = "${stringResource(R.string.tab_staging)} (${state.stagingBuffer.size})",
@@ -394,6 +432,22 @@ private fun ConsoleHeaderBar(
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
                         color = SignalEmerald,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
+                    )
+                }
+            }
+            if (state.wasmHeap.isNeighborPolling) {
+                Surface(
+                    color = ElectricCyan.copy(alpha = 0.16f),
+                    shape = RoundedCornerShape(4.dp),
+                    border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.55f))
+                ) {
+                    Text(
+                        text = "WASM ±16B",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan,
                         fontSize = 9.sp,
                         modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp)
                     )

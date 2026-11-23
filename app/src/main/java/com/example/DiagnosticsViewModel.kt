@@ -82,6 +82,7 @@ class DiagnosticsViewModel : ViewModel() {
                         entityViewportHeight = 0,
                         discoveredEntities = emptyList(),
                         lastEntityCount = 0,
+                        wasmHeap = WasmHeapTrackerState(),
                         interceptedAssets = emptyList(),
                         estimatedFps = null,
                         canvasCount = 0
@@ -99,7 +100,12 @@ class DiagnosticsViewModel : ViewModel() {
 
     fun onReloadRequested() {
         val current = _uiState.value.activeUrl
-        _uiState.update { it.copy(livePollActive = false) }
+        _uiState.update {
+            it.copy(
+                livePollActive = false,
+                wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false)
+            )
+        }
         appendLog(LogCategory.SYSTEM, "Reloading $current", current)
         _effects.tryEmit(DiagnosticsEffect.ReloadWebView)
     }
@@ -128,7 +134,8 @@ class DiagnosticsViewModel : ViewModel() {
                 urlInput = if (url == "about:blank") it.urlInput else url,
                 isLoading = true,
                 loadProgress = 10,
-                livePollActive = false
+                livePollActive = false,
+                wasmHeap = it.wasmHeap.copy(isNeighborPolling = false, isScanning = false)
             )
         }
     }
@@ -374,6 +381,263 @@ class DiagnosticsViewModel : ViewModel() {
             "Climbing 1–3 parent levels up from $anchor to inspect sibling Arrays/Maps/Sets & project to 2D canvas"
         )
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildScanEntitiesScript(anchor)))
+    }
+
+    // Targeted WebAssembly Heap Value-Tracker (Read-Only HP / Stat Scanner & ±16B Neighbor Inspector)
+    fun onWasmTargetValueChanged(input: String) {
+        val sanitized = input.filter { it.isDigit() || it == '.' || it == '-' }.take(18)
+        _uiState.update { state ->
+            state.copy(wasmHeap = state.wasmHeap.copy(targetValueInput = sanitized))
+        }
+    }
+
+    fun runWasmHeapInitialScan() {
+        val raw = _uiState.value.wasmHeap.targetValueInput.trim()
+        val parsed = raw.toDoubleOrNull()
+        if (parsed == null || !parsed.isFinite()) {
+            val msg = "Enter a valid current HP / stat number (e.g. 4338) first."
+            appendLog(LogCategory.WASM, msg, raw)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Scanning HEAP32 / HEAPF32 for $raw…",
+                wasmHeap = state.wasmHeap.copy(
+                    isScanning = true,
+                    initialSearchValue = parsed,
+                    lastFilterValue = null,
+                    filterRound = 0,
+                    isolatedHeapType = null,
+                    isolatedIndex = null,
+                    isolatedByteAddress = null,
+                    isolatedCurrentValue = "",
+                    isNeighborPolling = false,
+                    neighborPollTickCount = 0,
+                    neighborFloats = emptyList(),
+                    statusMessage = "Scanning HEAP32 / HEAPF32 in non-blocking 1 MB chunks for $raw…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "WASM Heap Scan: Searching HEAP32 & HEAPF32 for $raw…",
+            "Target value: $parsed"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildInitialScanScript(parsed)))
+    }
+
+    fun runWasmHeapFilterDelta() {
+        val raw = _uiState.value.wasmHeap.targetValueInput.trim()
+        val parsed = raw.toDoubleOrNull()
+        if (parsed == null || !parsed.isFinite()) {
+            val msg = "Enter your updated HP value after taking damage or healing, then tap Filter."
+            appendLog(LogCategory.WASM, msg, raw)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        if (_uiState.value.wasmHeap.totalMatches <= 0) {
+            val msg = "Run '1. Scan HEAP32 / F32' with your initial HP value first."
+            appendLog(LogCategory.WASM, msg, msg)
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+        _uiState.update { state ->
+            state.copy(
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Filtering WASM matches for new value $raw…",
+                wasmHeap = state.wasmHeap.copy(
+                    isScanning = true,
+                    lastFilterValue = parsed,
+                    statusMessage = "Filtering ${_uiState.value.wasmHeap.totalMatches} stored addresses for new value $raw…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "WASM Value-Delta Filter: Narrowing matches to $raw…",
+            "Updated target value: $parsed"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildFilterDeltaScript(parsed)))
+    }
+
+    fun onInspectWasmCandidate(heapType: String, index: Int) {
+        val hexAddr = formatHexAddress(index.toLong() * 4L)
+        _uiState.update { state ->
+            state.copy(
+                wasmHeap = state.wasmHeap.copy(
+                    isolatedHeapType = heapType,
+                    isolatedIndex = index,
+                    isolatedByteAddress = index.toLong() * 4L,
+                    isNeighborPolling = true,
+                    neighborPollTickCount = 0,
+                    neighborFloats = emptyList(),
+                    statusMessage = "Polling ±16B around $heapType[$index] ($hexAddr) every 200ms…"
+                )
+            )
+        }
+        appendLog(
+            LogCategory.WASM,
+            "Locked WASM Neighbor Inspector on $heapType[$index] ($hexAddr)",
+            "Reading ±4 to ±16 byte floats every 200ms"
+        )
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildInspectNeighborsScript(heapType, index)))
+    }
+
+    fun onStopWasmNeighborPolling() {
+        _uiState.update { state ->
+            state.copy(
+                wasmHeap = state.wasmHeap.copy(
+                    isNeighborPolling = false,
+                    statusMessage = "Paused neighbor polling (memory map still ready to export)."
+                )
+            )
+        }
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildStopNeighborPollScript()))
+    }
+
+    fun onResetWasmHeapTracker() {
+        _uiState.update { state ->
+            state.copy(wasmHeap = WasmHeapTrackerState())
+        }
+        appendLog(LogCategory.WASM, "Reset WASM Heap Value-Tracker", "Cleared stored candidate indices and stopped neighbor polling")
+        _effects.tryEmit(DiagnosticsEffect.EvaluateJs(WasmHeapScripts.buildResetTrackerScript()))
+    }
+
+    fun onWasmNeighborsUpdatedFromBridge(jsonPayload: String) {
+        val json = try {
+            JSONObject(jsonPayload)
+        } catch (_: Exception) {
+            return
+        }
+        if (json.optString("stage", "") != "WASM_NEIGHBORS_TICK") return
+
+        val heapType = json.optString("heapType", "HEAP32")
+        val isolatedIndex = json.optInt("isolatedIndex", -1)
+        if (isolatedIndex < 0) return
+        val isolatedByteAddress = json.optLong("isolatedByteAddress", isolatedIndex.toLong() * 4L)
+        val currentVal = json.optString("currentValue", "")
+        val tick = json.optInt("tick", 1)
+        val sourceLabel = json.optString("heapSourceLabel", "")
+        val byteLen = json.optLong("heapByteLength", 0L)
+        val neighborsArr = json.optJSONArray("neighbors") ?: JSONArray()
+
+        _uiState.update { state ->
+            val prevWasm = state.wasmHeap
+            val isSameAnchor = prevWasm.isolatedIndex == isolatedIndex && prevWasm.isolatedHeapType == heapType
+            val prevByOffset = if (isSameAnchor) {
+                prevWasm.neighborFloats.associateBy { it.byteOffset }
+            } else {
+                emptyMap()
+            }
+
+            val updatedNeighbors = buildList {
+                for (i in 0 until neighborsArr.length()) {
+                    val obj = neighborsArr.optJSONObject(i) ?: continue
+                    val offset = obj.optInt("byteOffset", 0)
+                    val idx = obj.optInt("heapIndex", isolatedIndex + (offset / 4))
+                    val addr = obj.optLong("byteAddress", idx.toLong() * 4L)
+                    val fv = obj.optDouble("floatValue", 0.0)
+                    val iv = obj.optInt("intValue", 0)
+                    val prev = prevByOffset[offset]
+                    val changed = prev != null && (
+                        kotlin.math.abs(fv - prev.floatValue) > 0.0001 || iv != prev.intValue
+                    )
+                    val nextCount = when {
+                        prev == null -> 0
+                        changed -> prev.changeCount + 1
+                        else -> prev.changeCount
+                    }
+                    add(
+                        WasmNeighborFloat(
+                            byteOffset = offset,
+                            heapIndex = idx,
+                            byteAddress = addr,
+                            floatValue = fv,
+                            intValue = iv,
+                            changedFromPrev = changed,
+                            changeCount = nextCount
+                        )
+                    )
+                }
+            }
+
+            state.copy(
+                wasmHeap = prevWasm.copy(
+                    heapSourceLabel = sourceLabel.ifBlank { prevWasm.heapSourceLabel },
+                    heapByteLength = if (byteLen > 0L) byteLen else prevWasm.heapByteLength,
+                    isolatedHeapType = heapType,
+                    isolatedIndex = isolatedIndex,
+                    isolatedByteAddress = isolatedByteAddress,
+                    isolatedCurrentValue = currentVal,
+                    isNeighborPolling = true,
+                    neighborPollTickCount = tick,
+                    neighborFloats = updatedNeighbors
+                )
+            )
+        }
+    }
+
+    fun exportWasmMemoryMapJson(context: Context) {
+        val snapshot = _uiState.value
+        if (snapshot.wasmHeap.isExportingMemoryMap) return
+        if (snapshot.wasmHeap.isolatedIndex == null && snapshot.wasmHeap.totalMatches == 0) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("Scan and isolate a WASM memory address first."))
+            return
+        }
+        val appContext = context.applicationContext
+        _uiState.update { state ->
+            state.copy(wasmHeap = state.wasmHeap.copy(isExportingMemoryMap = true))
+        }
+
+        viewModelScope.launch {
+            val mapJson = withContext(Dispatchers.Default) {
+                buildWasmMemoryMapJson(snapshot)
+            }
+            val outcome = withContext(Dispatchers.IO) {
+                ReportExporter.exportJsonToDownloads(
+                    context = appContext,
+                    jsonContent = mapJson,
+                    filePrefix = "wasm_memory_map"
+                )
+            }
+            _uiState.update { state ->
+                state.copy(
+                    wasmHeap = state.wasmHeap.copy(
+                        isExportingMemoryMap = false,
+                        lastMemoryMapExport = outcome
+                    )
+                )
+            }
+            if (outcome.success) {
+                appendLog(
+                    LogCategory.WASM,
+                    "Exported WASM Memory Map -> ${outcome.displayPath}",
+                    "Saved ${mapJson.length} bytes (${snapshot.wasmHeap.isolatedHeapType ?: "HEAP"}[${snapshot.wasmHeap.isolatedIndex ?: -1}]) to ${outcome.displayPath}"
+                )
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_wasm_map_saved, outcome.fileName)
+                    )
+                )
+            } else {
+                val err = outcome.errorMessage ?: "Unknown error"
+                appendLog(LogCategory.ERROR, "WASM Memory Map export failed", err)
+                _effects.tryEmit(
+                    DiagnosticsEffect.ShowToast(
+                        appContext.getString(R.string.toast_report_failed, err)
+                    )
+                )
+            }
+        }
+    }
+
+    fun onShareLastWasmMemoryMap() {
+        val export = _uiState.value.wasmHeap.lastMemoryMapExport
+        if (export != null && export.success && export.contentUri != null) {
+            _effects.tryEmit(DiagnosticsEffect.ShareReport(export.contentUri, export.fileName, export.mimeType))
+        }
     }
 
     // Passive Resource & Asset Request Monitor (called from WebViewClient.shouldInterceptRequest)
@@ -1111,7 +1375,164 @@ class DiagnosticsViewModel : ViewModel() {
                 "Result ($type, ${ms}ms): $preview"
             }
 
+            "WASM_HEAP_SCAN_COMPLETE" -> {
+                val totalMatches = json.optInt("totalMatches", 0)
+                val count32 = json.optInt("heap32MatchCount", 0)
+                val countF32 = json.optInt("heapF32MatchCount", 0)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val sourceLabel = json.optString("heapSourceLabel", "window.HEAP32 / HEAPF32")
+                val byteLength = json.optLong("heapByteLength", 0L)
+                val targetVal = json.optDouble("targetValue", 0.0)
+                val samples = parseWasmCandidates(json.optJSONArray("samples"))
+                val autoObj = json.optJSONObject("autoIsolated")
+                val autoType = autoObj?.optString("heapType", "")?.takeIf { it.isNotBlank() }
+                val autoIdx = autoObj?.optInt("index", -1)?.takeIf { it >= 0 }
+                val autoByteAddr = autoObj?.optLong("byteAddress", (autoIdx ?: 0).toLong() * 4L)
+                val autoVal = autoObj?.optString("currentValue", "").orEmpty()
+
+                val statusMsg = when {
+                    totalMatches == 0 ->
+                        "0 matches for $targetVal in $sourceLabel. Double-check your exact stat value."
+                    autoIdx != null && autoType != null ->
+                        "Exact match isolated: $autoType[$autoIdx] (${formatHexAddress(autoByteAddr ?: 0L)})! Streaming ±16B neighbors."
+                    else ->
+                        "Found $totalMatches matches (HEAP32: $count32, HEAPF32: $countF32) in ${durationMs}ms. Take damage/heal, enter new HP, and tap Filter."
+                }
+
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = if (totalMatches > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = "WASM Scan: $totalMatches matches (${durationMs}ms)",
+                        wasmHeap = state.wasmHeap.copy(
+                            isScanning = false,
+                            heapSourceLabel = sourceLabel,
+                            heapByteLength = byteLength,
+                            initialSearchValue = targetVal,
+                            totalMatches = totalMatches,
+                            heap32MatchCount = count32,
+                            heapF32MatchCount = countF32,
+                            filterRound = 0,
+                            survivingCandidates = samples,
+                            isolatedHeapType = autoType,
+                            isolatedIndex = autoIdx,
+                            isolatedByteAddress = if (autoIdx != null) autoByteAddr else null,
+                            isolatedCurrentValue = autoVal,
+                            isNeighborPolling = autoIdx != null,
+                            statusMessage = statusMsg
+                        )
+                    )
+                }
+                "WASM Scan (${durationMs}ms): Found $totalMatches addresses for $targetVal (HEAP32: $count32, HEAPF32: $countF32) in $sourceLabel"
+            }
+
+            "WASM_HEAP_DELTA_FILTERED" -> {
+                val totalMatches = json.optInt("totalMatches", 0)
+                val prevCount = json.optInt("previousCount", 0)
+                val count32 = json.optInt("heap32MatchCount", 0)
+                val countF32 = json.optInt("heapF32MatchCount", 0)
+                val filterRound = json.optInt("filterRound", 1)
+                val newVal = json.optDouble("newValue", 0.0)
+                val durationMs = json.optDouble("durationMs", 0.0)
+                val sourceLabel = json.optString("heapSourceLabel", "")
+                val byteLength = json.optLong("heapByteLength", 0L)
+                val samples = parseWasmCandidates(json.optJSONArray("samples"))
+                val autoObj = json.optJSONObject("autoIsolated")
+                val autoType = autoObj?.optString("heapType", "")?.takeIf { it.isNotBlank() }
+                val autoIdx = autoObj?.optInt("index", -1)?.takeIf { it >= 0 }
+                val autoByteAddr = autoObj?.optLong("byteAddress", (autoIdx ?: 0).toLong() * 4L)
+                val autoVal = autoObj?.optString("currentValue", "").orEmpty()
+
+                val statusMsg = when {
+                    autoIdx != null && autoType != null ->
+                        "Isolated $autoType[$autoIdx] (${formatHexAddress(autoByteAddr ?: 0L)})! Live ±16B neighbor polling started."
+                    totalMatches == 0 ->
+                        "0 matches left after filtering for $newVal (from $prevCount). Tap Reset and run a fresh Step 1 scan."
+                    else ->
+                        "Filter #$filterRound narrowed $prevCount → $totalMatches matches. Change HP again or tap a candidate below to inspect ±16B."
+                }
+
+                _uiState.update { state ->
+                    val mergedStaging = if (autoIdx != null && autoType != null) {
+                        mergeIntoStagingBuffer(
+                            existing = state.stagingBuffer,
+                            incoming = listOf("$autoType[$autoIdx]" to "Isolated WASM stat (${formatHexAddress(autoByteAddr ?: 0L)}) = $autoVal"),
+                            sourceStep = "WASM Heap",
+                            scanNumber = state.scanCounter.coerceAtLeast(1),
+                            timestamp = nowTs,
+                            forcePin = true
+                        )
+                    } else state.stagingBuffer
+
+                    state.copy(
+                        stagingBuffer = mergedStaging,
+                        scanStatus = if (totalMatches > 0) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
+                        scanStatusDetail = if (autoIdx != null && autoType != null) {
+                            "Isolated $autoType[$autoIdx] • Polling ±16B"
+                        } else {
+                            "WASM Filter #$filterRound: $totalMatches remaining"
+                        },
+                        wasmHeap = state.wasmHeap.copy(
+                            isScanning = false,
+                            heapSourceLabel = sourceLabel.ifBlank { state.wasmHeap.heapSourceLabel },
+                            heapByteLength = if (byteLength > 0L) byteLength else state.wasmHeap.heapByteLength,
+                            lastFilterValue = newVal,
+                            totalMatches = totalMatches,
+                            heap32MatchCount = count32,
+                            heapF32MatchCount = countF32,
+                            filterRound = filterRound,
+                            survivingCandidates = samples,
+                            isolatedHeapType = autoType ?: state.wasmHeap.isolatedHeapType,
+                            isolatedIndex = autoIdx ?: state.wasmHeap.isolatedIndex,
+                            isolatedByteAddress = if (autoIdx != null) autoByteAddr else state.wasmHeap.isolatedByteAddress,
+                            isolatedCurrentValue = if (autoIdx != null) autoVal else state.wasmHeap.isolatedCurrentValue,
+                            isNeighborPolling = autoIdx != null || state.wasmHeap.isNeighborPolling,
+                            statusMessage = statusMsg
+                        )
+                    )
+                }
+                "WASM Filter #$filterRound (${durationMs}ms): $prevCount → $totalMatches matches for $newVal" +
+                    if (autoIdx != null && autoType != null) " • Isolated $autoType[$autoIdx] (${formatHexAddress(autoByteAddr ?: 0L)})" else ""
+            }
+
+            "WASM_HEAP_ERROR" -> {
+                val msg = json.optString("message", "WASM heap operation failed.")
+                _uiState.update { state ->
+                    state.copy(
+                        scanStatus = AsyncScanStatus.ERROR,
+                        scanStatusDetail = msg.take(60),
+                        wasmHeap = state.wasmHeap.copy(
+                            isScanning = false,
+                            statusMessage = msg
+                        )
+                    )
+                }
+                _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+                "WASM Tracker: $msg"
+            }
+
             else -> payload.take(110)
+        }
+    }
+
+    private fun parseWasmCandidates(array: JSONArray?): List<WasmCandidateAddress> {
+        if (array == null) return emptyList()
+        return buildList {
+            for (i in 0 until array.length()) {
+                val obj = array.optJSONObject(i) ?: continue
+                val heapType = obj.optString("heapType", "HEAP32")
+                val index = obj.optInt("index", -1)
+                if (index < 0) continue
+                val byteAddr = obj.optLong("byteAddress", index.toLong() * 4L)
+                val curVal = obj.optString("currentValue", "")
+                add(
+                    WasmCandidateAddress(
+                        heapType = heapType,
+                        index = index,
+                        byteAddress = byteAddr,
+                        currentValue = curVal
+                    )
+                )
+            }
         }
     }
 
@@ -1299,7 +1720,12 @@ class DiagnosticsViewModel : ViewModel() {
                 .put("assets", assetsArray)
         )
 
-        // 6. Session logs
+        // 6. WASM Heap Value-Tracker Memory Map (if active/isolated)
+        if (state.wasmHeap.isolatedIndex != null || state.wasmHeap.totalMatches > 0) {
+            root.put("wasmHeapMemoryMap", JSONObject(buildWasmMemoryMapJson(state)))
+        }
+
+        // 7. Session logs
         val logsArray = JSONArray()
         state.logs.forEach { entry ->
             logsArray.put(
@@ -1487,7 +1913,23 @@ class DiagnosticsViewModel : ViewModel() {
                 }
                 appendLine()
 
-                appendLine("--- [5] COMPLETE ROLLING LOG HISTORY (${state.logs.size} entries) ---")
+                if (state.wasmHeap.isolatedIndex != null || state.wasmHeap.totalMatches > 0) {
+                    appendLine("--- [5] WASM HEAP VALUE-TRACKER MEMORY MAP ---")
+                    appendLine("Heap Source    : ${state.wasmHeap.heapSourceLabel.ifBlank { "(unknown)" }}")
+                    appendLine("Matches        : ${state.wasmHeap.totalMatches} (HEAP32=${state.wasmHeap.heap32MatchCount}, HEAPF32=${state.wasmHeap.heapF32MatchCount})")
+                    state.wasmHeap.isolatedIndex?.let { idx ->
+                        val addr = state.wasmHeap.isolatedByteAddress ?: (idx.toLong() * 4L)
+                        appendLine("Isolated Slot  : ${state.wasmHeap.isolatedHeapType ?: "HEAP32"}[$idx] (${formatHexAddress(addr)}) = ${state.wasmHeap.isolatedCurrentValue}")
+                    }
+                    state.wasmHeap.neighborFloats.forEach { nb ->
+                        val sign = if (nb.byteOffset >= 0) "+" else ""
+                        val dynTag = if (nb.changeCount > 0) " [DYNAMIC ×${nb.changeCount}]" else ""
+                        appendLine("  ${sign}${nb.byteOffset}B (${formatHexAddress(nb.byteAddress)}) | F32=${String.format(Locale.US, "%.4f", nb.floatValue)} | I32=${nb.intValue}$dynTag")
+                    }
+                    appendLine()
+                }
+
+                appendLine("--- [6] COMPLETE ROLLING LOG HISTORY (${state.logs.size} entries) ---")
                 if (state.logs.isEmpty()) {
                     appendLine("  (no log entries)")
                 } else {
@@ -1502,6 +1944,80 @@ class DiagnosticsViewModel : ViewModel() {
                 }
                 appendLine("========================================================================")
             }
+        }
+
+        fun formatHexAddress(byteAddress: Long): String {
+            return String.format(Locale.US, "0x%08X", byteAddress.coerceAtLeast(0L))
+        }
+
+        fun buildWasmMemoryMapJson(state: DiagnosticsUiState): String {
+            val wasm = state.wasmHeap
+            val root = JSONObject()
+            root.put("application", "WebViewDiagnosticsApp")
+            root.put("reportType", "wasm_heap_memory_map")
+            root.put("generatedAtIso", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ", Locale.US).format(Date()))
+            root.put("activeUrl", state.activeUrl)
+            root.put("remoteWebContentsDebuggingEnabled", false)
+            root.put("heapSource", wasm.heapSourceLabel.ifBlank { "window.HEAP32 / window.HEAPF32" })
+            root.put("heapByteLength", wasm.heapByteLength)
+            root.put("initialSearchValue", wasm.initialSearchValue ?: JSONObject.NULL)
+            root.put("lastFilterValue", wasm.lastFilterValue ?: JSONObject.NULL)
+            root.put("filterRounds", wasm.filterRound)
+            root.put("remainingMatches", wasm.totalMatches)
+            root.put("heap32MatchCount", wasm.heap32MatchCount)
+            root.put("heapF32MatchCount", wasm.heapF32MatchCount)
+
+            val isolatedObj = JSONObject()
+            if (wasm.isolatedIndex != null) {
+                val byteAddr = wasm.isolatedByteAddress ?: (wasm.isolatedIndex.toLong() * 4L)
+                isolatedObj.put("heapType", wasm.isolatedHeapType ?: "HEAP32")
+                isolatedObj.put("elementIndex", wasm.isolatedIndex)
+                isolatedObj.put("byteAddress", byteAddr)
+                isolatedObj.put("hexByteAddress", formatHexAddress(byteAddr))
+                isolatedObj.put("currentValue", wasm.isolatedCurrentValue)
+                isolatedObj.put("pollTicksObserved", wasm.neighborPollTickCount)
+                root.put("isolatedTarget", isolatedObj)
+            } else {
+                root.put("isolatedTarget", JSONObject.NULL)
+            }
+
+            val neighborsArr = JSONArray()
+            val dynamicCoordsArr = JSONArray()
+            wasm.neighborFloats.forEach { nb ->
+                val isDynamic = nb.byteOffset != 0 && nb.changeCount > 0
+                val nbJson = JSONObject()
+                    .put("byteOffset", nb.byteOffset)
+                    .put("offsetLabel", if (nb.byteOffset >= 0) "+${nb.byteOffset}B" else "${nb.byteOffset}B")
+                    .put("heapIndex", nb.heapIndex)
+                    .put("byteAddress", nb.byteAddress)
+                    .put("hexByteAddress", formatHexAddress(nb.byteAddress))
+                    .put("float32Value", nb.floatValue)
+                    .put("int32Value", nb.intValue)
+                    .put("changeCount", nb.changeCount)
+                    .put("isTargetSlot", nb.byteOffset == 0)
+                    .put("isDynamicCoordinateCandidate", isDynamic)
+                neighborsArr.put(nbJson)
+                if (isDynamic) {
+                    dynamicCoordsArr.put(nbJson)
+                }
+            }
+            root.put("neighboringMemoryMap", neighborsArr)
+            root.put("dynamicCoordinateCandidates", dynamicCoordsArr)
+
+            val candidatesArr = JSONArray()
+            wasm.survivingCandidates.forEach { c ->
+                candidatesArr.put(
+                    JSONObject()
+                        .put("heapType", c.heapType)
+                        .put("index", c.index)
+                        .put("byteAddress", c.byteAddress)
+                        .put("hexByteAddress", formatHexAddress(c.byteAddress))
+                        .put("currentValue", c.currentValue)
+                )
+            }
+            root.put("survivingCandidates", candidatesArr)
+
+            return root.toString(2)
         }
 
         private fun sortStagingBuffer(items: List<CandidateStagingItem>): List<CandidateStagingItem> {

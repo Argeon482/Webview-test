@@ -325,4 +325,77 @@ class ExampleRobolectricTest {
         assertTrue(step2b.contains("__isExcludedWasmKey(p)"))
         assertTrue(step2b.contains("__isSafeBaselineObject(parentObj)"))
     }
+
+    @Test
+    fun `telemetry bridge forwards wasm neighboring memory snapshots on main thread`() {
+        val snapshots = mutableListOf<String>()
+        val bridge = TelemetryBridge(
+            onTelemetryReceived = { _, _ -> },
+            onReportPayloadReceived = {},
+            onWasmNeighborsUpdated = { snapshots.add(it) }
+        )
+
+        bridge.updateWasmNeighbors("""{"stage":"WASM_NEIGHBORS_TICK","isolatedIndex":1024,"neighbors":[]}""")
+        shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(1, snapshots.size)
+        assertTrue(snapshots.first().contains("WASM_NEIGHBORS_TICK"))
+        assertTrue(snapshots.first().contains("1024"))
+    }
+
+    @Test
+    fun `wasm heap viewmodel tracks scan delta neighbors and exports memory map json`() {
+        val vm = DiagnosticsViewModel()
+        vm.onWasmTargetValueChanged("4338")
+        assertEquals("4338", vm.uiState.value.wasmHeap.targetValueInput)
+
+        // 1. Simulate initial scan finding 42 matches
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_HEAP_SCAN_COMPLETE","durationMs":14.2,"heapSourceLabel":"window.HEAP32 / window.HEAPF32","heapByteLength":67108864,"targetValue":4338,"totalMatches":42,"heap32MatchCount":40,"heapF32MatchCount":2,"samples":[{"heapType":"HEAP32","index":8192,"byteAddress":32768,"currentValue":"4338"}]}"""
+        )
+        val afterScan = vm.uiState.value.wasmHeap
+        assertEquals(42, afterScan.totalMatches)
+        assertEquals(40, afterScan.heap32MatchCount)
+        assertEquals(2, afterScan.heapF32MatchCount)
+        assertFalse(afterScan.isNeighborPolling)
+
+        // 2. Simulate Value-Delta filter narrowing to 1 isolated address
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_HEAP_DELTA_FILTERED","durationMs":0.4,"heapSourceLabel":"window.HEAP32 / window.HEAPF32","heapByteLength":67108864,"filterRound":1,"newValue":4120,"previousCount":42,"totalMatches":1,"heap32MatchCount":1,"heapF32MatchCount":0,"samples":[{"heapType":"HEAP32","index":8192,"byteAddress":32768,"currentValue":"4120"}],"autoIsolated":{"heapType":"HEAP32","index":8192,"byteAddress":32768,"currentValue":"4120"}}"""
+        )
+        val afterFilter = vm.uiState.value.wasmHeap
+        assertEquals(1, afterFilter.totalMatches)
+        assertEquals(8192, afterFilter.isolatedIndex)
+        assertEquals("HEAP32", afterFilter.isolatedHeapType)
+        assertEquals(32768L, afterFilter.isolatedByteAddress)
+        assertTrue(afterFilter.isNeighborPolling)
+
+        // 3. Simulate two neighbor polling ticks where +4B (X coord) changes as player walks
+        vm.onWasmNeighborsUpdatedFromBridge(
+            """{"stage":"WASM_NEIGHBORS_TICK","heapSourceLabel":"window.HEAP32 / window.HEAPF32","heapByteLength":67108864,"heapType":"HEAP32","isolatedIndex":8192,"isolatedByteAddress":32768,"currentValue":"4120","tick":1,"neighbors":[{"byteOffset":-4,"heapIndex":8191,"byteAddress":32764,"floatValue":100.0,"intValue":1120403456},{"byteOffset":0,"heapIndex":8192,"byteAddress":32768,"floatValue":0.0,"intValue":4120},{"byteOffset":4,"heapIndex":8193,"byteAddress":32772,"floatValue":250.5,"intValue":1132085248}]}"""
+        )
+        vm.onWasmNeighborsUpdatedFromBridge(
+            """{"stage":"WASM_NEIGHBORS_TICK","heapSourceLabel":"window.HEAP32 / window.HEAPF32","heapByteLength":67108864,"heapType":"HEAP32","isolatedIndex":8192,"isolatedByteAddress":32768,"currentValue":"4120","tick":2,"neighbors":[{"byteOffset":-4,"heapIndex":8191,"byteAddress":32764,"floatValue":100.0,"intValue":1120403456},{"byteOffset":0,"heapIndex":8192,"byteAddress":32768,"floatValue":0.0,"intValue":4120},{"byteOffset":4,"heapIndex":8193,"byteAddress":32772,"floatValue":256.25,"intValue":1132470272}]}"""
+        )
+
+        val neighbors = vm.uiState.value.wasmHeap.neighborFloats
+        assertEquals(3, neighbors.size)
+        val movingCoord = neighbors.first { it.byteOffset == 4 }
+        assertTrue(movingCoord.changedFromPrev)
+        assertEquals(1, movingCoord.changeCount)
+        assertEquals(256.25, movingCoord.floatValue, 0.001)
+
+        val staticNeighbor = neighbors.first { it.byteOffset == -4 }
+        assertFalse(staticNeighbor.changedFromPrev)
+        assertEquals(0, staticNeighbor.changeCount)
+
+        // 4. Verify exported Memory Map JSON contains isolated address & dynamic coordinate candidate
+        val mapJson = DiagnosticsViewModel.buildWasmMemoryMapJson(vm.uiState.value)
+        assertTrue(mapJson.contains("wasm_heap_memory_map"))
+        assertTrue(mapJson.contains("0x00008000"))
+        assertTrue(mapJson.contains("\"isDynamicCoordinateCandidate\": true"))
+        assertTrue(mapJson.contains("256.25"))
+    }
 }

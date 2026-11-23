@@ -57,6 +57,7 @@ enum class WizardStepBadge(val displayText: String) {
 
 enum class ConsoleTab {
     WIZARD,
+    WASM_HEAP,
     STAGING,
     ENTITIES,
     ASSETS,
@@ -75,6 +76,7 @@ enum class LogCategory(val tag: String, val label: String) {
     SCOPE("SCOPE", "Scope"),
     DELTA("DELTA", "Delta"),
     ENTITY("ENTITY", "Entity"),
+    WASM("WASM", "WASM"),
     ASSET("ASSET", "Asset"),
     JS("JS", "JS"),
     SYSTEM("SYS", "Sys"),
@@ -176,6 +178,51 @@ data class ExportReportOutcome(
 )
 
 @Immutable
+data class WasmNeighborFloat(
+    val byteOffset: Int,
+    val heapIndex: Int,
+    val byteAddress: Long,
+    val floatValue: Double,
+    val intValue: Int,
+    val changedFromPrev: Boolean = false,
+    val changeCount: Int = 0
+)
+
+@Immutable
+data class WasmCandidateAddress(
+    val heapType: String,
+    val index: Int,
+    val byteAddress: Long,
+    val currentValue: String
+)
+
+@Immutable
+data class WasmHeapTrackerState(
+    val targetValueInput: String = "",
+    val isScanning: Boolean = false,
+    val scanProgressPercent: Int = 0,
+    val heapSourceLabel: String = "",
+    val heapByteLength: Long = 0L,
+    val initialSearchValue: Double? = null,
+    val lastFilterValue: Double? = null,
+    val totalMatches: Int = 0,
+    val heap32MatchCount: Int = 0,
+    val heapF32MatchCount: Int = 0,
+    val filterRound: Int = 0,
+    val survivingCandidates: List<WasmCandidateAddress> = emptyList(),
+    val isolatedHeapType: String? = null,
+    val isolatedIndex: Int? = null,
+    val isolatedByteAddress: Long? = null,
+    val isolatedCurrentValue: String = "",
+    val isNeighborPolling: Boolean = false,
+    val neighborPollTickCount: Int = 0,
+    val neighborFloats: List<WasmNeighborFloat> = emptyList(),
+    val statusMessage: String = "",
+    val isExportingMemoryMap: Boolean = false,
+    val lastMemoryMapExport: ExportReportOutcome? = null
+)
+
+@Immutable
 data class DiagnosticsUiState(
     val urlInput: String = "",
     val activeUrl: String = "about:blank",
@@ -216,6 +263,7 @@ data class DiagnosticsUiState(
     val discoveredEntities: List<DiscoveredEntitySample> = emptyList(),
     val lastEntityCount: Int = 0,
     // Step 4/5 Passive asset & console state
+    val wasmHeap: WasmHeapTrackerState = WasmHeapTrackerState(),
     val interceptedAssets: List<InterceptedAsset> = emptyList(),
     val logs: List<TelemetryLogEntry> = emptyList(),
     val selectedFilter: LogCategory = LogCategory.ALL,

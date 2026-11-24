@@ -1084,4 +1084,39 @@ class ExampleRobolectricTest {
         vm.runStep3ScanEntitiesLonger()
         assertEquals(AsyncScanStatus.RUNNING, vm.uiState.value.scanStatus)
     }
+
+    @Test
+    fun `standing on top of a mob promotes it to row zero with isStandingOnMob true tracks erratic drops and toggles walking filter`() {
+        val vm = DiagnosticsViewModel()
+
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":8.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
+        )
+
+        // Initial anti-thrash spatial scan returns 2 stable mobs + reports 412 erratic/jittery floats dropped
+        vm.onTelemetryFromBridge(
+            "ENTITY",
+            """{"stage":"WASM_ENTITIES_DISCOVERED","twoPass":true,"movingOnly":false,"dwellMs":360,"durationMs":395.2,"erraticDroppedCount":412,"staticFilteredCount":0,"arrayPath":"window.HEAPF32 near 0x03E00000","projectionMode":"WASM Anti-Thrash Spatial (0..250u)","viewportWidth":1080,"viewportHeight":1920,"entities":[{"name":"WASM Entity #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6970.0,"worldY":100.0,"worldZ":3309.76,"deltaX":8.02,"deltaZ":0.0,"distanceToPlayer":8.02,"selfMoveDelta":0.0,"isConfirmedMoving":false,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","STABLE"]},{"name":"WASM Entity #2","id":"0x03E02400","path":"HEAPF32[16255270] @ 0x03E02498","coordByteAddress":65021080,"heapIndex":16255270,"worldX":6986.98,"worldY":100.0,"worldZ":3309.76,"deltaX":25.0,"deltaZ":0.0,"distanceToPlayer":25.0,"selfMoveDelta":0.8,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","WALKING"]}]}"""
+        )
+        assertEquals(412, vm.uiState.value.lastErraticEntitiesDroppedCount)
+        assertEquals("0x03E01000", vm.uiState.value.discoveredEntities[0].id)
+        assertFalse(vm.uiState.value.discoveredEntities[0].isStandingOnMob)
+
+        // Player walks right on top of Entity #2 (distance drops to 1.2u <= 4.0u) -> promotes to Row #0 with isStandingOnMob = true!
+        vm.onWasmEntitiesUpdatedFromBridge(
+            """{"stage":"WASM_ENTITIES_TICK","tick":3,"entities":[{"name":"WASM Entity #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6970.0,"worldY":100.0,"worldZ":3309.76,"deltaX":-16.0,"deltaZ":0.0,"distanceToPlayer":16.0,"selfMoveDelta":0.0,"isConfirmedMoving":false,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","STABLE"]},{"name":"WASM Entity #2","id":"0x03E02400","path":"HEAPF32[16255270] @ 0x03E02498","coordByteAddress":65021080,"heapIndex":16255270,"worldX":6986.98,"worldY":100.0,"worldZ":3309.76,"deltaX":1.2,"deltaZ":0.0,"distanceToPlayer":1.2,"selfMoveDelta":0.2,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","WALKING"]}]}"""
+        )
+        val topEntity = vm.uiState.value.discoveredEntities.first()
+        assertEquals("0x03E02400", topEntity.id)
+        assertTrue(topEntity.isStandingOnMob)
+        assertTrue(topEntity.distanceDelta != null && topEntity.distanceDelta!! < -20.0)
+
+        // Toggle All Stable <-> Walking Only filter cleanly
+        assertFalse(vm.uiState.value.showWalkingEntitiesOnly)
+        vm.onToggleShowWalkingEntitiesOnly()
+        assertTrue(vm.uiState.value.showWalkingEntitiesOnly)
+        vm.onToggleShowWalkingEntitiesOnly()
+        assertFalse(vm.uiState.value.showWalkingEntitiesOnly)
+    }
 }

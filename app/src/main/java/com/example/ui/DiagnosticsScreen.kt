@@ -512,6 +512,7 @@ private fun WiredTelemetryConsolePanel(
         onRunStep2B = viewModel::runStep2BComputeDelta,
         onRunStep3 = viewModel::runStep3ScanEntities,
         onRunStep3Longer = viewModel::runStep3ScanEntitiesLonger,
+        onToggleShowWalkingEntitiesOnly = viewModel::onToggleShowWalkingEntitiesOnly,
         onExportReport = {
             viewModel.requestExportReport(
                 context = context,

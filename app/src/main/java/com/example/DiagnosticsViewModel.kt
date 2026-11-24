@@ -672,16 +672,25 @@ class DiagnosticsViewModel : ViewModel() {
         _effects.tryEmit(DiagnosticsEffect.EvaluateJs(DiagnosticsScripts.buildComputeDeltaScript()))
     }
 
-    // Step 3: Player-Anchored Visual Entity Discovery (WASM HEAPF32 Nearby Entity Scan + JS Fallback)
+    // Step 3: Player-Anchored Visual Entity Discovery (WASM HEAPF32 Anti-Thrash Spatial Scan + JS Fallback)
     fun runStep3ScanEntities() {
-        runStep3ScanEntitiesWithDwell(dwellMs = 1200)
+        val movingOnly = _uiState.value.showWalkingEntitiesOnly
+        runStep3ScanEntitiesWithOptions(
+            dwellMs = if (movingOnly) 1200 else 360,
+            movingOnly = movingOnly
+        )
     }
 
     fun runStep3ScanEntitiesLonger() {
-        runStep3ScanEntitiesWithDwell(dwellMs = 2500)
+        _uiState.update { it.copy(showWalkingEntitiesOnly = true) }
+        runStep3ScanEntitiesWithOptions(dwellMs = 1200, movingOnly = true)
     }
 
-    private fun runStep3ScanEntitiesWithDwell(dwellMs: Int) {
+    fun onToggleShowWalkingEntitiesOnly() {
+        _uiState.update { it.copy(showWalkingEntitiesOnly = !it.showWalkingEntitiesOnly) }
+    }
+
+    private fun runStep3ScanEntitiesWithOptions(dwellMs: Int, movingOnly: Boolean) {
         val state = _uiState.value
         val fd = state.wasmFloatDelta
         val activeHudChain = fd.activeHudPointerId?.let { id ->
@@ -723,12 +732,12 @@ class DiagnosticsViewModel : ViewModel() {
             }
 
             val hexPlayer = formatHexAddress(playerAddr)
-            val dwellLabel = String.format(Locale.US, "%.1fs", dwellMs / 1000.0)
-            onScanStatusChanged(AsyncScanStatus.RUNNING, "Two-Pass WASM ($dwellLabel): Scanning 100% HEAPF32…")
+            val modeLabel = if (movingOnly) "Smooth Walkers (${String.format(Locale.US, "%.1fs", dwellMs / 1000.0)})" else "Anti-Thrash Spatial"
+            onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 3 WASM ($modeLabel): Scanning 100% HEAPF32…")
             appendLog(
                 LogCategory.ENTITY,
-                "Step 3 Two-Pass WASM ($dwellLabel): Scanning 100% HEAPF32 for moving mobs around $hexPlayer…",
-                "Player=(${String.format(Locale.US, "%.2f", px)}, ${String.format(Locale.US, "%.2f", py)}, ${String.format(Locale.US, "%.2f", pz)}), structOffset=+0x${structOffset.toString(16).uppercase(Locale.US)}, radius=1.5..250u, dwell=${dwellMs}ms"
+                "Step 3 WASM ($modeLabel): Scanning 100% HEAPF32 around $hexPlayer…",
+                "Player=(${String.format(Locale.US, "%.2f", px)}, ${String.format(Locale.US, "%.2f", py)}, ${String.format(Locale.US, "%.2f", pz)}), structOffset=+0x${structOffset.toString(16).uppercase(Locale.US)}, radius=0..250u, dwell=${dwellMs}ms, movingOnly=$movingOnly"
             )
             _effects.tryEmit(
                 DiagnosticsEffect.EvaluateJs(
@@ -738,7 +747,8 @@ class DiagnosticsViewModel : ViewModel() {
                         playerY = py,
                         playerZ = pz,
                         structCoordOffset = structOffset,
-                        dwellMs = dwellMs
+                        dwellMs = dwellMs,
+                        movingOnly = movingOnly
                     )
                 )
             )
@@ -811,9 +821,12 @@ class DiagnosticsViewModel : ViewModel() {
                     deltaZ = computedDz,
                     distanceDelta = computedDistDelta,
                     selfMoveDelta = computedSelfMove,
-                    isConfirmedMoving = item.isConfirmedMoving || (prev?.isConfirmedMoving == true) || computedSelfMove >= 0.03
+                    isConfirmedMoving = item.isConfirmedMoving || (prev?.isConfirmedMoving == true) || computedSelfMove >= 0.04
                 )
-            }.sortedBy { it.distanceToPlayer }
+            }.sortedWith(
+                compareByDescending<DiscoveredEntitySample> { it.isStandingOnMob }
+                    .thenBy { it.distanceToPlayer }
+            )
 
             state.copy(
                 discoveredEntities = enriched,
@@ -3612,8 +3625,12 @@ class DiagnosticsViewModel : ViewModel() {
                     val vpH = json.optInt("viewportHeight", 0)
                     val rawCount = json.optInt("rawCandidateCount", 0)
                     val staticFiltered = json.optInt("staticFilteredCount", 0)
+                    val erraticDropped = json.optInt("erraticDroppedCount", 0)
                     val parsedEntities = parseWasmEntitiesArray(json.optJSONArray("entities"))
-                        .sortedBy { it.distanceToPlayer }
+                        .sortedWith(
+                            compareByDescending<DiscoveredEntitySample> { it.isStandingOnMob }
+                                .thenBy { it.distanceToPlayer }
+                        )
                     val shouldAutoStartLive = isTwoPass && parsedEntities.isNotEmpty()
 
                     _uiState.update { state ->
@@ -3621,7 +3638,7 @@ class DiagnosticsViewModel : ViewModel() {
                         val mergedStaging = if (parsedEntities.isNotEmpty()) {
                             mergeIntoStagingBuffer(
                                 existing = state.stagingBuffer,
-                                incoming = listOf(arrayPath to "WASM moving mobs (${parsedEntities.size} detected)"),
+                                incoming = listOf(arrayPath to "WASM nearby entities (${parsedEntities.size} stable)"),
                                 sourceStep = "Step 3 WASM",
                                 scanNumber = nextScan,
                                 timestamp = nowTs
@@ -3637,6 +3654,7 @@ class DiagnosticsViewModel : ViewModel() {
                             discoveredEntities = parsedEntities,
                             lastEntityCount = parsedEntities.size,
                             lastStaticEntitiesFilteredCount = staticFiltered,
+                            lastErraticEntitiesDroppedCount = erraticDropped,
                             lastEntityScanDwellMs = dwellMs,
                             lastEntityScanCompleted = true,
                             isWasmEntitiesLivePolling = shouldAutoStartLive,
@@ -3644,7 +3662,8 @@ class DiagnosticsViewModel : ViewModel() {
                             stagingBuffer = mergedStaging,
                             scanStatus = if (parsedEntities.isNotEmpty()) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
                             scanStatusDetail = if (isTwoPass) {
-                                "Two-Pass: ${parsedEntities.size} moving ($staticFiltered static dropped)"
+                                val dropped = erraticDropped + staticFiltered
+                                "Step 3 WASM: ${parsedEntities.size} stable ($dropped noisy dropped)"
                             } else {
                                 "Step 3 WASM: ${parsedEntities.size} nearby (${durationMs}ms)"
                             }
@@ -3659,21 +3678,21 @@ class DiagnosticsViewModel : ViewModel() {
                     }
                     if (parsedEntities.isNotEmpty()) {
                         val toastMsg = if (isTwoPass) {
-                            "Found ${parsedEntities.size} moving mobs ($staticFiltered static dropped) — Live tracking active"
+                            "Found ${parsedEntities.size} stable entities ($erraticDropped jittery dropped) — Live tracking active"
                         } else {
                             "Found ${parsedEntities.size} nearby WASM entities — open Entities tab"
                         }
                         _effects.tryEmit(DiagnosticsEffect.ShowToast(toastMsg))
                         if (isTwoPass) {
-                            "Step 3 Two-Pass (${durationMs}ms): ${parsedEntities.size} moving mobs closest→furthest ($staticFiltered static coords filtered) in $arrayPath"
+                            "Step 3 WASM (${durationMs}ms): ${parsedEntities.size} stable entities closest→furthest ($erraticDropped jittery, $staticFiltered static dropped) in $arrayPath"
                         } else {
                             "Step 3 (WASM, ${durationMs}ms): Found ${parsedEntities.size} nearby entities (from $rawCount raw hits) in $arrayPath"
                         }
                     } else {
                         if (isTwoPass) {
-                            "Step 3 Two-Pass (${durationMs}ms): 0 moving mobs found ($staticFiltered static coords dropped). Try Retry Longer Scan (2.5s)."
+                            "Step 3 WASM (${durationMs}ms): 0 stable entities found ($erraticDropped jittery, $staticFiltered static dropped)."
                         } else {
-                            "Step 3 (WASM, ${durationMs}ms): 0 nearby entity coordinates found within 1.5..250u of player"
+                            "Step 3 (WASM, ${durationMs}ms): 0 nearby entity coordinates found within 0..250u of player"
                         }
                     }
                 }

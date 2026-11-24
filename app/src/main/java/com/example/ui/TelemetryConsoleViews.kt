@@ -504,6 +504,7 @@ fun EntityInspectionConsoleView(
     state: DiagnosticsUiState,
     onRescanEntities: () -> Unit,
     onRescanEntitiesLonger: () -> Unit,
+    onToggleShowWalkingOnly: () -> Unit,
     onToggleLiveEntities: () -> Unit,
     onOpenTargetFinder: () -> Unit,
     onOpenProber: () -> Unit,
@@ -519,6 +520,22 @@ fun EntityInspectionConsoleView(
         state.discoveredEntities.any { it.sampleKeys.contains("WASM_STRUCT") } ||
         state.hasLiveWasmPlayerAnchor ||
         state.structProber.schema.hasAnyBound
+
+    val displayedEntities = remember(state.discoveredEntities, state.showWalkingEntitiesOnly) {
+        val base = if (state.showWalkingEntitiesOnly) {
+            state.discoveredEntities.filter { it.isConfirmedMoving || it.isStandingOnMob || it.isActiveGameTarget }
+        } else {
+            state.discoveredEntities
+        }
+        base.sortedWith(
+            compareByDescending<DiscoveredEntitySample> { it.isStandingOnMob }
+                .thenBy { it.distanceToPlayer }
+        )
+    }
+
+    val standingOnMobTop = remember(displayedEntities) {
+        displayedEntities.firstOrNull { it.isStandingOnMob }
+    }
 
     val trackedEntity = remember(state.discoveredEntities, state.trackedEntityKey) {
         state.trackedEntityKey?.let { key ->
@@ -544,7 +561,7 @@ fun EntityInspectionConsoleView(
                     verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
                     Text(
-                        text = state.discoveredEntityArrayPath ?: "Nearby Moving Mobs (Not Scanned)",
+                        text = state.discoveredEntityArrayPath ?: "Nearby Entities (Not Scanned)",
                         style = MaterialTheme.typography.titleSmall,
                         fontFamily = JetBrainsMonoFontFamily,
                         fontWeight = FontWeight.Bold,
@@ -553,13 +570,11 @@ fun EntityInspectionConsoleView(
                         overflow = TextOverflow.Ellipsis
                     )
                     val meta = buildString {
-                        if (state.lastEntityScanDwellMs > 0) {
-                            append("${state.discoveredEntities.size} moving")
-                            if (state.lastStaticEntitiesFilteredCount > 0) {
-                                append(" • ${state.lastStaticEntitiesFilteredCount} static dropped")
-                            }
-                        } else {
-                            append("${state.discoveredEntities.size} detected")
+                        append("${displayedEntities.size} shown")
+                        if (state.lastErraticEntitiesDroppedCount > 0) {
+                            append(" • ${state.lastErraticEntitiesDroppedCount} jittery dropped")
+                        } else if (state.lastStaticEntitiesFilteredCount > 0) {
+                            append(" • ${state.lastStaticEntitiesFilteredCount} static dropped")
                         }
                         if (state.isWasmEntitiesLivePolling) append(" • LIVE #${state.wasmEntityLiveTickCount}")
                         if (state.structProber.schema.hasAnyBound) {
@@ -698,6 +713,35 @@ fun EntityInspectionConsoleView(
                         }
                     }
                 }
+                if (isWasmEntityMode) {
+                    Surface(
+                        onClick = onToggleShowWalkingOnly,
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (state.showWalkingEntitiesOnly) SignalEmerald.copy(alpha = 0.22f) else ObsidianBg,
+                        border = BorderStroke(
+                            1.dp,
+                            if (state.showWalkingEntitiesOnly) SignalEmerald else ObsidianBorder
+                        ),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .testTag("entities_filter_walking_toggle")
+                    ) {
+                        Box(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = stringResource(
+                                    if (state.showWalkingEntitiesOnly) R.string.entities_filter_walking_only
+                                    else R.string.entities_filter_all_stable
+                                ),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (state.showWalkingEntitiesOnly) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
             }
         }
 
@@ -710,11 +754,20 @@ fun EntityInspectionConsoleView(
                 onFindTargetSlot = { onFindTargetSlotForEntity(trackedEntity) },
                 onDismiss = onClearTrackedEntity
             )
+        } else if (standingOnMobTop != null) {
+            // Auto-illuminated quick card whenever the player is standing right on top of a mob (<= 4.0u)
+            ReadOnlyEntityLocationTrackerCard(
+                entity = standingOnMobTop,
+                playerCoords = state.livePlayerCoords,
+                onProbeEntity = { onProbeEntity(standingOnMobTop) },
+                onFindTargetSlot = { onFindTargetSlotForEntity(standingOnMobTop) },
+                onDismiss = { onToggleTrackEntity(standingOnMobTop.selectionKey) }
+            )
         }
 
         HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
-        if (state.discoveredEntities.isEmpty()) {
+        if (displayedEntities.isEmpty()) {
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -732,26 +785,48 @@ fun EntityInspectionConsoleView(
                         tint = TelemetryViolet.copy(alpha = 0.8f),
                         modifier = Modifier.size(28.dp)
                     )
-                    val filteredStatic = state.lastStaticEntitiesFilteredCount
-                    val showedZeroAfterTwoPass = state.lastEntityScanCompleted && filteredStatic > 0
+                    val totalDropped = state.lastErraticEntitiesDroppedCount + state.lastStaticEntitiesFilteredCount
+                    val showedZeroAfterScan = state.lastEntityScanCompleted && totalDropped > 0
                     Text(
                         text = stringResource(
-                            if (showedZeroAfterTwoPass) R.string.entities_zero_moving_title
+                            if (showedZeroAfterScan) R.string.entities_zero_moving_title
                             else R.string.entities_empty_title
                         ),
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = if (showedZeroAfterTwoPass) {
-                            stringResource(R.string.entities_zero_moving_subtitle, filteredStatic)
+                        text = if (showedZeroAfterScan) {
+                            stringResource(R.string.entities_zero_moving_subtitle, totalDropped)
                         } else {
                             stringResource(R.string.entities_empty_subtitle)
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    if (isWasmEntityMode && state.lastEntityScanCompleted) {
+                    if (state.showWalkingEntitiesOnly && state.discoveredEntities.isNotEmpty()) {
+                        Surface(
+                            onClick = onToggleShowWalkingOnly,
+                            shape = RoundedCornerShape(8.dp),
+                            color = SignalEmerald.copy(alpha = 0.2f),
+                            border = BorderStroke(1.dp, SignalEmerald),
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .testTag("entities_show_all_stable_fallback_button")
+                        ) {
+                            Box(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = "Show All ${state.discoveredEntities.size} Stable Entities",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = SignalEmerald
+                                )
+                            }
+                        }
+                    } else if (isWasmEntityMode && state.lastEntityScanCompleted) {
                         Surface(
                             onClick = onRescanEntitiesLonger,
                             shape = RoundedCornerShape(8.dp),
@@ -793,7 +868,7 @@ fun EntityInspectionConsoleView(
                 contentPadding = PaddingValues(10.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(state.discoveredEntities, key = { it.selectionKey }) { entity ->
+                items(displayedEntities, key = { it.selectionKey }) { entity ->
                     val isTracked = state.trackedEntityKey == entity.selectionKey
                     EntitySampleCard(
                         entity = entity,
@@ -1047,7 +1122,9 @@ private fun EntitySampleCard(
     onPin: () -> Unit,
     onCopy: () -> Unit
 ) {
+    val isStandingOnMob = entity.isStandingOnMob
     val borderColor = when {
+        isStandingOnMob -> SignalEmerald
         isTracked -> ElectricCyan
         entity.isActiveGameTarget -> SignalEmerald
         entity.isAggro == true -> AlertCoral.copy(alpha = 0.75f)
@@ -1066,12 +1143,13 @@ private fun EntitySampleCard(
     Surface(
         shape = RoundedCornerShape(8.dp),
         color = when {
+            isStandingOnMob -> SignalEmerald.copy(alpha = 0.22f)
             isTracked -> ElectricCyan.copy(alpha = 0.08f)
             entity.isActiveGameTarget -> SignalEmerald.copy(alpha = 0.08f)
             else -> ObsidianSurface
         },
         border = BorderStroke(
-            width = if (isTracked || entity.isActiveGameTarget) 1.5.dp else 1.dp,
+            width = if (isStandingOnMob) 2.dp else if (isTracked || entity.isActiveGameTarget) 1.5.dp else 1.dp,
             color = borderColor
         ),
         modifier = Modifier
@@ -1092,11 +1170,32 @@ private fun EntitySampleCard(
                     text = entity.displayName + if (entity.resolvedName == null && entity.id.isNotBlank()) " #${entity.id}" else "",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
-                    color = if (entity.resolvedName != null) TelemetryViolet else MaterialTheme.colorScheme.onSurface,
+                    color = when {
+                        isStandingOnMob -> SignalEmerald
+                        entity.resolvedName != null -> TelemetryViolet
+                        else -> MaterialTheme.colorScheme.onSurface
+                    },
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
+                if (isStandingOnMob) {
+                    Surface(
+                        color = SignalEmerald,
+                        shape = RoundedCornerShape(4.dp),
+                        modifier = Modifier.testTag("entity_standing_on_mob_${entity.selectionKey}")
+                    ) {
+                        Text(
+                            text = "AT MOB ✓",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = ObsidianBg,
+                            fontSize = 9.sp,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
                 if (entity.isActiveGameTarget) {
                     Surface(
                         color = SignalEmerald.copy(alpha = 0.22f),
@@ -1127,13 +1226,13 @@ private fun EntitySampleCard(
                         )
                     }
                 }
-                if (entity.isConfirmedMoving || entity.selfMoveDelta >= 0.03) {
+                if (entity.isConfirmedMoving || entity.selfMoveDelta >= 0.04) {
                     Surface(
                         color = SignalEmerald.copy(alpha = 0.16f),
                         shape = RoundedCornerShape(4.dp)
                     ) {
                         Text(
-                            text = if (entity.selfMoveDelta >= 0.03) "WALKING" else "MOVED",
+                            text = "WALKING",
                             style = MaterialTheme.typography.labelSmall,
                             fontFamily = JetBrainsMonoFontFamily,
                             fontWeight = FontWeight.Bold,

@@ -616,14 +616,16 @@ object WasmPointerAndEntityScripts {
     }
 
     /**
-     * Step 3 (WASM Mode): Strictly read-only Two-Pass Moving-Entity Scanner over 100% of `window.HEAPF32`.
-     * - Pass 1 scans the entire float heap in non-blocking 1 MB async slices (`setTimeout(resolve, 12)`)
-     *   into compact TypedArrays (no early 2,000-hit cutoff) for all nearby `(X, Y, Z)` floats.
-     * - Dwell window observes two checkpoints (`dwellMs / 2` and `dwellMs`), automatically rejecting
-     *   stationary map clutter (props, trees, terrain, spawn markers) and player/camera clones that
-     *   move in lockstep with the player.
-     * - Collapses physics/render clones of the same mob (preferring structs aligned with the player's
-     *   coordinate offset and memory region) and sorts verified moving mobs strictly closest-to-furthest.
+     * Step 3 (WASM Mode): Strictly read-only Anti-Thrash Spatial Entity Scanner over 100% of `window.HEAPF32`.
+     * - Pass 1 scans 100% of `HEAPF32` in non-blocking 1 MB async slices (`setTimeout(resolve, 12)`)
+     *   into compact TypedArrays (up to 200,000 coords, no premature 2,000-hit cutoff), starting from
+     *   `minRadius = 0.0` so mobs you are standing directly on top of are NEVER excluded.
+     * - 3-Sample Stability Check (`t=0`, `t=half`, `t=dwellMs`, default 360ms):
+     *   KEEPS both standing/idle mobs AND smoothly walking mobs, while automatically REJECTING erratic
+     *   per-frame reused/scratchpad buffers that jump unrealistically (`60u -> 80u -> 65u` in milliseconds)
+     *   or bounce back-and-forth, as well as camera/player clones that mirror player motion.
+     * - Alignment & heap-pool aware spatial deduplication picks the real gameplay struct per mob,
+     *   and sorts all results strictly closest-to-furthest so any mob you stand on top of rises to Row #1.
      */
     fun buildScanWasmNearbyEntitiesScript(
         playerByteAddress: Long,
@@ -631,20 +633,22 @@ object WasmPointerAndEntityScripts {
         playerY: Double,
         playerZ: Double,
         structCoordOffset: Int = 0,
-        minRadius: Double = 1.5,
+        minRadius: Double = 0.0,
         maxRadius: Double = 250.0,
-        maxYDelta: Double = 60.0,
-        dwellMs: Int = 1200
+        maxYDelta: Double = 45.0,
+        dwellMs: Int = 360,
+        movingOnly: Boolean = false
     ): String {
         val safePlayerAddr = playerByteAddress.coerceAtLeast(0L)
         val safePx = if (playerX.isFinite()) playerX.toString() else "0.0"
         val safePy = if (playerY.isFinite()) playerY.toString() else "0.0"
         val safePz = if (playerZ.isFinite()) playerZ.toString() else "0.0"
         val safeStructOff = structCoordOffset.coerceIn(0, 1024)
-        val safeMinR = minRadius.coerceIn(0.5, 50.0)
+        val safeMinR = minRadius.coerceIn(0.0, 50.0)
         val safeMaxR = maxRadius.coerceIn(10.0, 2000.0)
         val safeMaxY = maxYDelta.coerceIn(5.0, 500.0)
-        val safeDwellMs = dwellMs.coerceIn(600, 5000)
+        val safeDwellMs = dwellMs.coerceIn(240, 5000)
+        val movingOnlyLiteral = if (movingOnly) "true" else "false"
 
         return """
         (async function() {
@@ -717,9 +721,10 @@ object WasmPointerAndEntityScripts {
             const MAX_R2 = MAX_R * MAX_R;
             const MAX_Y = Number($safeMaxY);
             const DWELL_MS = $safeDwellMs;
+            const MOVING_ONLY = $movingOnlyLiteral;
             const START_IDX = lenF32 > 4096 ? 256 : 0;
             const CHUNK_FLOATS = 262144; // 1 MB per non-blocking slice
-            const MAX_PASS1_SNAP = 200000; // Compact TypedArrays (~3.2 MB transient, zero premature 2k cutoff)
+            const MAX_PASS1_SNAP = 200000;
 
             const snapIdx = new Int32Array(MAX_PASS1_SNAP);
             const snapX0 = new Float32Array(MAX_PASS1_SNAP);
@@ -727,13 +732,13 @@ object WasmPointerAndEntityScripts {
             const snapZ0 = new Float32Array(MAX_PASS1_SNAP);
             let snapCount = 0;
 
-            __peStatus('RUNNING', 'Pass 1/2: scanning 100% of HEAPF32 for nearby coords…');
+            __peStatus('RUNNING', 'Step 3 WASM: scanning 100% of HEAPF32…');
 
             for (let base = START_IDX; base < lenF32 - 2 && snapCount < MAX_PASS1_SNAP; base += CHUNK_FLOATS) {
               if (mySeq !== __entState.scanSeq) return;
               const end = Math.min(base + CHUNK_FLOATS, lenF32 - 2);
               for (let i = base; i < end && snapCount < MAX_PASS1_SNAP; i++) {
-                // Skip player's own immediate struct vicinity
+                // Skip player's own immediate struct vicinity only (allow mobs right next to / under player)
                 if (playerFloatIdx > 0 && Math.abs(i - playerFloatIdx) <= 24) continue;
 
                 const vx = hf32[i];
@@ -772,137 +777,175 @@ object WasmPointerAndEntityScripts {
 
             if (mySeq !== __entState.scanSeq) return;
 
-            // Dwell Window — Dual Checkpoints (halfDwell + fullDwell) to catch patrolling & turning mobs
+            // 3-Sample Anti-Thrash Stability Check (t=0, t=half, t=dwellMs):
+            // Keeps BOTH standing mobs AND smoothly walking mobs, while dropping erratic
+            // scratchpad/reused-buffer floats (e.g. 60u -> 80u -> 65u in milliseconds).
             const halfDwell = Math.round(DWELL_MS / 2);
-            const remDwell = Math.max(200, DWELL_MS - halfDwell);
+            const remDwell = Math.max(120, DWELL_MS - halfDwell);
             __peStatus(
               'RUNNING',
-              'Pass 2/2: observing ' + snapCount + ' coords for mob motion (' + (DWELL_MS / 1000).toFixed(1) + 's)…'
+              'Step 3 WASM: filtering jittery buffers across ' + snapCount + ' coords…'
             );
 
             await __peYield(halfDwell);
             if (mySeq !== __entState.scanSeq) return;
 
-            const pMid = readLivePlayer(playerAddr0, px0, py0, pz0);
-            const pdxMid = pMid.x - px0;
-            const pdyMid = pMid.y - py0;
-            const pdzMid = pMid.z - pz0;
-            const pMoveMid = Math.sqrt(pdxMid * pdxMid + pdyMid * pdyMid + pdzMid * pdzMid);
+            const p1 = readLivePlayer(playerAddr0, px0, py0, pz0);
+            const pdx1 = p1.x - px0;
+            const pdy1 = p1.y - py0;
+            const pdz1 = p1.z - pz0;
+            const pStep1 = Math.sqrt(pdx1 * pdx1 + pdy1 * pdy1 + pdz1 * pdz1);
 
-            const midIndependentMove = new Float32Array(snapCount);
+            const snapX1 = new Float32Array(snapCount);
+            const snapY1 = new Float32Array(snapCount);
+            const snapZ1 = new Float32Array(snapCount);
             for (let k = 0; k < snapCount; k++) {
               const idx = snapIdx[k];
-              if (idx + 2 >= lenF32) continue;
-              const mx = hf32[idx];
-              const my = hf32[idx + 1];
-              const mz = hf32[idx + 2];
-              if (!Number.isFinite(mx) || !Number.isFinite(my) || !Number.isFinite(mz)) continue;
-              const ex = mx - snapX0[k];
-              const ey = my - snapY0[k];
-              const ez = mz - snapZ0[k];
-              const mDist = Math.sqrt(ex * ex + ey * ey + ez * ez);
-              if (mDist >= 0.03 && mDist <= 80.0) {
-                let isPlayerMirror = false;
-                if (pMoveMid >= 0.03) {
-                  const rdx = ex - pdxMid;
-                  const rdy = ey - pdyMid;
-                  const rdz = ez - pdzMid;
-                  if (Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz) < 0.15) {
-                    isPlayerMirror = true;
-                  }
-                }
-                if (!isPlayerMirror) {
-                  midIndependentMove[k] = mDist;
-                }
+              if (idx + 2 < lenF32) {
+                snapX1[k] = hf32[idx];
+                snapY1[k] = hf32[idx + 1];
+                snapZ1[k] = hf32[idx + 2];
               }
             }
 
             await __peYield(remDwell);
             if (mySeq !== __entState.scanSeq) return;
 
-            const p1 = readLivePlayer(playerAddr0, px0, py0, pz0);
-            const playerAddr = p1.addr;
-            const px = p1.x;
-            const py = p1.y;
-            const pz = p1.z;
-            const pdxFull = px - px0;
-            const pdyFull = py - py0;
-            const pdzFull = pz - pz0;
-            const pMoveFull = Math.sqrt(pdxFull * pdxFull + pdyFull * pdyFull + pdzFull * pdzFull);
+            const p2 = readLivePlayer(playerAddr0, px0, py0, pz0);
+            const playerAddr = p2.addr;
+            const px = p2.x;
+            const py = p2.y;
+            const pz = p2.z;
+            const pdx2 = px - p1.x;
+            const pdy2 = py - p1.y;
+            const pdz2 = pz - p1.z;
+            const pStep2 = Math.sqrt(pdx2 * pdx2 + pdy2 * pdy2 + pdz2 * pdz2);
+            const pTotal = Math.sqrt((px - px0) * (px - px0) + (py - py0) * (py - py0) + (pz - pz0) * (pz - pz0));
 
-            const movingHits = [];
+            // Realistic speed cap (~36 u/s max for a single half-interval, never 20u-in-180ms teleports)
+            const MAX_STEP_PER_HALF = Math.max(6.5, (halfDwell / 180.0) * 6.5);
+            const MAX_VERT_STEP = 4.5;
+            const playerPhase16 = playerAddr > 0 ? (playerAddr & 15) : -1;
+
+            let erraticDroppedCount = 0;
+            let staticFilteredCount = 0;
+            const validHits = [];
+
             for (let k = 0; k < snapCount; k++) {
               const idx = snapIdx[k];
               if (idx + 2 >= lenF32) continue;
-              const vx = hf32[idx];
-              const vy = hf32[idx + 1];
-              const vz = hf32[idx + 2];
-              if (!Number.isFinite(vx) || !Number.isFinite(vy) || !Number.isFinite(vz)) continue;
-              if (Math.abs(vx) < 0.001 && Math.abs(vz) < 0.001) continue;
+              const x0 = snapX0[k], y0 = snapY0[k], z0 = snapZ0[k];
+              const x1 = snapX1[k], y1 = snapY1[k], z1 = snapZ1[k];
+              const x2 = hf32[idx], y2 = hf32[idx + 1], z2 = hf32[idx + 2];
+              if (!Number.isFinite(x1) || !Number.isFinite(y1) || !Number.isFinite(z1) ||
+                  !Number.isFinite(x2) || !Number.isFinite(y2) || !Number.isFinite(z2)) {
+                erraticDroppedCount++;
+                continue;
+              }
+              if (Math.abs(x2) < 0.001 && Math.abs(z2) < 0.001) {
+                erraticDroppedCount++;
+                continue;
+              }
 
-              const ex = vx - snapX0[k];
-              const ey = vy - snapY0[k];
-              const ez = vz - snapZ0[k];
-              const fullMove = Math.sqrt(ex * ex + ey * ey + ez * ez);
-              let validFullMove = 0;
-              if (fullMove >= 0.03 && fullMove <= 80.0) {
-                let isPlayerMirror = false;
-                if (pMoveFull >= 0.03) {
-                  const rdx = ex - pdxFull;
-                  const rdy = ey - pdyFull;
-                  const rdz = ez - pdzFull;
-                  if (Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz) < 0.15) {
-                    isPlayerMirror = true;
-                  }
-                }
-                if (!isPlayerMirror) {
-                  validFullMove = fullMove;
+              const v1x = x1 - x0, v1y = y1 - y0, v1z = z1 - z0;
+              const v2x = x2 - x1, v2y = y2 - y1, v2z = z2 - z1;
+              const step1 = Math.sqrt(v1x * v1x + v1y * v1y + v1z * v1z);
+              const step2 = Math.sqrt(v2x * v2x + v2y * v2y + v2z * v2z);
+              const totalMove = Math.sqrt((x2 - x0) * (x2 - x0) + (y2 - y0) * (y2 - y0) + (z2 - z0) * (z2 - z0));
+
+              // 1) Reject unrealistic per-interval jumps & vertical teleports (scratchpad/reused buffers)
+              if (step1 > MAX_STEP_PER_HALF || step2 > MAX_STEP_PER_HALF ||
+                  Math.abs(v1y) > MAX_VERT_STEP || Math.abs(v2y) > MAX_VERT_STEP) {
+                erraticDroppedCount++;
+                continue;
+              }
+
+              // 2) Reject ping-pong / back-and-forth jitter (e.g. 60u -> 80u -> 65u)
+              const dotXZ = v1x * v2x + v1z * v2z;
+              if (step1 > 0.75 && step2 > 0.75 && dotXZ < -0.25 * step1 * step2) {
+                erraticDroppedCount++;
+                continue;
+              }
+
+              // 3) Reject player-mirrored camera/physics/shadow clones
+              if (pTotal >= 0.12) {
+                const mirror1 = Math.sqrt((v1x - pdx1) * (v1x - pdx1) + (v1y - pdy1) * (v1y - pdy1) + (v1z - pdz1) * (v1z - pdz1));
+                const mirror2 = Math.sqrt((v2x - pdx2) * (v2x - pdx2) + (v2y - pdy2) * (v2y - pdy2) + (v2z - pdz2) * (v2z - pdz2));
+                if ((pStep1 >= 0.05 && mirror1 < 0.12 && (pStep2 < 0.05 || mirror2 < 0.12)) ||
+                    (pStep2 >= 0.05 && mirror2 < 0.12 && (pStep1 < 0.05 || mirror1 < 0.12))) {
+                  erraticDroppedCount++;
+                  continue;
                 }
               }
 
-              const bestMove = Math.max(validFullMove, midIndependentMove[k]);
-              if (bestMove < 0.03 || bestMove > 80.0) continue;
-
-              const dx = vx - px;
-              const dy = vy - py;
-              const dz = vz - pz;
+              const dx = x2 - px;
+              const dy = y2 - py;
+              const dz = z2 - pz;
               if (Math.abs(dy) > MAX_Y) continue;
               const dist2 = dx * dx + dy * dy + dz * dz;
               if (dist2 < MIN_R2 || dist2 > MAX_R2) continue;
+              const dist = Math.sqrt(dist2);
+
+              // Reject exact-zero-distance player clone (but keep mobs standing 0.03u..4.0u next to/under player!)
+              if (dist < 0.03) {
+                erraticDroppedCount++;
+                continue;
+              }
+
+              const isSmoothWalking = (totalMove >= 0.04 && (step1 <= 0.35 || step2 <= 0.35 || dotXZ >= -0.1 * step1 * step2));
+              if (MOVING_ONLY && !isSmoothWalking) {
+                staticFilteredCount++;
+                continue;
+              }
 
               const byteAddr = idx * 4;
               const structBase = (STRUCT_OFF > 0 && byteAddr >= STRUCT_OFF) ? (byteAddr - STRUCT_OFF) : byteAddr;
               const matchesOffsetMod = (STRUCT_OFF > 0 && ((byteAddr - STRUCT_OFF) & 15) === 0);
+              const matchesPlayerPhase = (playerPhase16 >= 0 && (byteAddr & 15) === playerPhase16);
               const heapProximity = playerAddr > 0 ? Math.abs(byteAddr - playerAddr) : byteAddr;
+              const sameHeapPool = (playerAddr > 0 && heapProximity <= 8388608); // within ±8 MB of player struct
 
-              movingHits.push({
+              // Score structural authenticity for spatial clone deduplication (prefer real CMover struct over mesh copy)
+              let structScore = 0;
+              if (matchesOffsetMod) structScore += 400;
+              if (matchesPlayerPhase) structScore += 300;
+              if (sameHeapPool) structScore += 200;
+              if (isSmoothWalking) structScore += 150;
+              if (Math.abs(dy) <= 10.0) structScore += 80;
+
+              validHits.push({
                 heapIndex: idx,
                 byteAddr: byteAddr,
                 structBase: structBase,
                 matchesOffsetMod: matchesOffsetMod,
+                matchesPlayerPhase: matchesPlayerPhase,
                 heapProximity: heapProximity,
-                x: vx,
-                y: vy,
-                z: vz,
+                structScore: structScore,
+                x: x2,
+                y: y2,
+                z: z2,
                 dx: dx,
                 dy: dy,
                 dz: dz,
-                dist: Math.sqrt(dist2),
-                selfMoveDelta: bestMove
+                dist: dist,
+                selfMoveDelta: totalMove,
+                isSmoothWalking: isSmoothWalking
               });
             }
 
-            // Alignment-aware spatial deduplication (collapse physics/render clones within 0.35u of the same mob,
-            // preferring candidates whose address matches player struct alignment & heap pool proximity)
-            movingHits.sort(function(a, b) {
-              if (a.matchesOffsetMod !== b.matchesOffsetMod) return a.matchesOffsetMod ? -1 : 1;
+            // Alignment & heap-pool aware spatial deduplication:
+            // Sort by structural score first so if a mob has both a gameplay struct and a render mesh copy
+            // at the exact same (X,Y,Z), we keep the real gameplay struct.
+            validHits.sort(function(a, b) {
+              if (a.structScore !== b.structScore) return b.structScore - a.structScore;
               if (a.heapProximity !== b.heapProximity) return a.heapProximity - b.heapProximity;
               return a.dist - b.dist;
             });
 
+            // Collapse spatial clones within 0.35u; retain up to 160 distinct candidates before final closest-60 cut
             const deduped = [];
-            for (let i = 0; i < movingHits.length && deduped.length < 60; i++) {
-              const cand = movingHits[i];
+            for (let i = 0; i < validHits.length && deduped.length < 160; i++) {
+              const cand = validHits[i];
               let isClone = false;
               for (let j = 0; j < deduped.length; j++) {
                 const ex = deduped[j];
@@ -919,19 +962,21 @@ object WasmPointerAndEntityScripts {
               }
             }
 
-            // Final presentation order: strictly closest to furthest
+            // Final presentation order: strictly closest to furthest (standing-on-mob <= 4.0u automatically at top!)
             deduped.sort(function(a, b) {
-              if (Math.abs(a.dist - b.dist) > 0.001) return a.dist - b.dist;
+              if (Math.abs(a.dist - b.dist) > 0.05) return a.dist - b.dist;
+              if (a.structScore !== b.structScore) return b.structScore - a.structScore;
               return a.heapIndex - b.heapIndex;
             });
 
+            const finalList = deduped.slice(0, 60);
             const vw = window.innerWidth || 0;
             const vh = window.innerHeight || 0;
             const entities = [];
             const tracked = [];
 
-            for (let i = 0; i < deduped.length; i++) {
-              const e = deduped[i];
+            for (let i = 0; i < finalList.length; i++) {
+              const e = finalList[i];
               const baseIdx = e.structBase >>> 2;
               let candidateId = '';
               if (STRUCT_OFF > 0 && baseIdx >= 0 && baseIdx + 2 < h32.length) {
@@ -943,7 +988,7 @@ object WasmPointerAndEntityScripts {
               const hexCoord = __peFormatHex(e.byteAddr);
               const hexStruct = __peFormatHex(e.structBase);
               const relTag = 'Δ(' + e.dx.toFixed(1) + ', ' + e.dy.toFixed(1) + ', ' + e.dz.toFixed(1) + ')';
-              const entityName = 'Moving Mob #' + (i + 1);
+              const entityName = 'WASM Entity #' + (i + 1);
               const entityPath = 'HEAPF32[' + e.heapIndex + '] @ ' + hexCoord;
               const decoded = __peReadEntitySchema(e.byteAddr, heaps) || {};
               const activeTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
@@ -978,16 +1023,16 @@ object WasmPointerAndEntityScripts {
                 distanceToPlayer: Number(e.dist.toFixed(2)),
                 distanceDelta: null,
                 selfMoveDelta: Number(e.selfMoveDelta.toFixed(3)),
-                isConfirmedMoving: true,
+                isConfirmedMoving: e.isSmoothWalking,
                 screenX: 0,
                 screenY: 0,
                 inViewport: e.dist <= 65.0,
                 sampleKeys: [
                   'WASM_STRUCT',
-                  'MOVING',
+                  e.isSmoothWalking ? 'WALKING' : 'STABLE',
                   'struct=' + hexStruct,
                   relTag,
-                  STRUCT_OFF > 0 ? ('off=+0x' + STRUCT_OFF.toString(16).toUpperCase()) : 'two-pass-vec3'
+                  STRUCT_OFF > 0 ? ('off=+0x' + STRUCT_OFF.toString(16).toUpperCase()) : 'spatial-vec3'
                 ]
               });
               tracked.push({
@@ -1000,7 +1045,13 @@ object WasmPointerAndEntityScripts {
                 prevX: e.x,
                 prevY: e.y,
                 prevZ: e.z,
-                prevDist: e.dist
+                prevVx: 0,
+                prevVz: 0,
+                prevMove: 0,
+                prevDist: e.dist,
+                isSmoothWalking: e.isSmoothWalking,
+                erraticStrikes: 0,
+                dropped: false
               });
             }
 
@@ -1008,15 +1059,15 @@ object WasmPointerAndEntityScripts {
             __entState.structOffset = STRUCT_OFF;
             __entState.tracked = tracked;
 
-            const staticFilteredCount = Math.max(0, snapCount - movingHits.length);
             const durationMs = Number((performance.now() - startMs).toFixed(1));
             __peStatus(
               entities.length > 0 ? 'COMPLETED' : 'IDLE',
-              'Two-Pass WASM: ' + entities.length + ' moving mobs (' + staticFilteredCount + ' static dropped)'
+              'Step 3 WASM: ' + entities.length + ' stable nearby (' + erraticDroppedCount + ' jittery dropped)'
             );
             __peEmit('ENTITY', {
               stage: 'WASM_ENTITIES_DISCOVERED',
               twoPass: true,
+              movingOnly: MOVING_ONLY,
               dwellMs: DWELL_MS,
               durationMs: durationMs,
               heapSourceLabel: heaps.label,
@@ -1024,11 +1075,14 @@ object WasmPointerAndEntityScripts {
               playerCoords: { x: Number(px.toFixed(3)), y: Number(py.toFixed(3)), z: Number(pz.toFixed(3)) },
               structCoordOffset: STRUCT_OFF,
               pass1CandidateCount: snapCount,
-              rawCandidateCount: movingHits.length,
+              rawCandidateCount: validHits.length,
               staticFilteredCount: staticFilteredCount,
+              erraticDroppedCount: erraticDroppedCount,
               viewportWidth: vw,
               viewportHeight: vh,
-              projectionMode: 'WASM Two-Pass Moving Mobs (' + (DWELL_MS / 1000).toFixed(1) + 's)',
+              projectionMode: MOVING_ONLY
+                ? ('WASM Smooth Walkers (' + (DWELL_MS / 1000).toFixed(1) + 's)')
+                : 'WASM Anti-Thrash Spatial (0..250u)',
               arrayPath: heaps.label + ' near ' + __peFormatHex(playerAddr),
               entities: entities
             });
@@ -1047,7 +1101,9 @@ object WasmPointerAndEntityScripts {
     /**
      * Starts a read-only 500ms live position refresh loop for the discovered WASM nearby entities,
      * recomputing world `(X, Y, Z)`, relative `(ΔX, ΔZ)` compass vector, live distance trend (`distanceDelta`),
-     * entity self-movement (`selfMoveDelta`), and sorting strictly closest-to-furthest every tick.
+     * entity self-movement (`selfMoveDelta`), continuously auto-pruning erratic scratchpad buffers that
+     * teleport or ping-pong (`60u -> 80u -> 65u`), and sorting strictly closest-to-furthest every tick
+     * so any mob you stand on top of floats straight to the top of the list.
      */
     fun buildStartWasmEntitiesLiveRefreshScript(): String = """
         (function() {
@@ -1098,6 +1154,7 @@ object WasmPointerAndEntityScripts {
                 const out = [];
                 for (let i = 0; i < __entState.tracked.length; i++) {
                   const t = __entState.tracked[i];
+                  if (t.dropped) continue;
                   const idx = t.heapIndex | 0;
                   if (idx < 0 || idx + 2 >= lenF32) continue;
                   const x = hf32[idx];
@@ -1105,6 +1162,33 @@ object WasmPointerAndEntityScripts {
                   const z = hf32[idx + 2];
                   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
                   if (Math.abs(x) > 500000 || Math.abs(y) > 500000 || Math.abs(z) > 500000) continue;
+
+                  const hasPrev = (typeof t.prevX === 'number');
+                  const vx = hasPrev ? (x - t.prevX) : 0;
+                  const vy = hasPrev ? (y - t.prevY) : 0;
+                  const vz = hasPrev ? (z - t.prevZ) : 0;
+                  const selfMove = hasPrev ? Math.sqrt(vx * vx + vy * vy + vz * vz) : 0;
+
+                  // Continuous Live Anti-Thrash Guard: prune slots that teleport or ping-pong wildly
+                  if (hasPrev) {
+                    if (selfMove > 18.0 || Math.abs(vy) > 10.0) {
+                      t.erraticStrikes = (t.erraticStrikes || 0) + 2;
+                    } else if (selfMove > 2.5 && (t.prevMove || 0) > 2.5) {
+                      const dot = vx * (t.prevVx || 0) + vz * (t.prevVz || 0);
+                      if (dot < -0.35 * selfMove * t.prevMove) {
+                        t.erraticStrikes = (t.erraticStrikes || 0) + 1;
+                      } else if (t.erraticStrikes > 0) {
+                        t.erraticStrikes--;
+                      }
+                    } else if (t.erraticStrikes > 0) {
+                      t.erraticStrikes--;
+                    }
+                    if (t.erraticStrikes >= 2) {
+                      t.dropped = true;
+                      continue;
+                    }
+                  }
+
                   const dx = hasPlayer ? (x - px) : 0;
                   const dy = hasPlayer ? (y - py) : 0;
                   const dz = hasPlayer ? (z - pz) : 0;
@@ -1112,9 +1196,13 @@ object WasmPointerAndEntityScripts {
                   const distDelta = (hasPlayer && typeof t.prevDist === 'number')
                     ? Number((dist - t.prevDist).toFixed(3))
                     : null;
-                  const selfMove = (typeof t.prevX === 'number')
-                    ? Math.sqrt((x - t.prevX) * (x - t.prevX) + (y - t.prevY) * (y - t.prevY) + (z - t.prevZ) * (z - t.prevZ))
-                    : 0;
+
+                  if (selfMove >= 0.04 && selfMove <= 14.0) {
+                    t.isSmoothWalking = true;
+                  }
+                  t.prevVx = vx;
+                  t.prevVz = vz;
+                  t.prevMove = selfMove;
                   t.prevX = x;
                   t.prevY = y;
                   t.prevZ = z;
@@ -1152,13 +1240,13 @@ object WasmPointerAndEntityScripts {
                     distanceToPlayer: Number(dist.toFixed(2)),
                     distanceDelta: distDelta,
                     selfMoveDelta: Number(selfMove.toFixed(3)),
-                    isConfirmedMoving: true,
+                    isConfirmedMoving: !!t.isSmoothWalking,
                     screenX: 0,
                     screenY: 0,
                     inViewport: dist <= 65.0,
                     sampleKeys: [
                       'WASM_STRUCT',
-                      'MOVING',
+                      t.isSmoothWalking ? 'WALKING' : 'STABLE',
                       'struct=' + __peFormatHex(t.structBase),
                       'Δ(' + dx.toFixed(1) + ', ' + dy.toFixed(1) + ', ' + dz.toFixed(1) + ')'
                     ]

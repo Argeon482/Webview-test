@@ -215,6 +215,13 @@ data class DiscoveredEntitySample(
 
     val hasAnyVitals: Boolean
         get() = hp != null || mp != null || fp != null
+
+    val isStandingOnMob: Boolean
+        get() = distanceToPlayer <= STANDING_ON_MOB_RADIUS_UNITS
+
+    companion object {
+        const val STANDING_ON_MOB_RADIUS_UNITS: Double = 4.0
+    }
 }
 
 @Immutable
@@ -682,8 +689,10 @@ data class DiagnosticsUiState(
     val discoveredEntities: List<DiscoveredEntitySample> = emptyList(),
     val lastEntityCount: Int = 0,
     val lastStaticEntitiesFilteredCount: Int = 0,
+    val lastErraticEntitiesDroppedCount: Int = 0,
     val lastEntityScanDwellMs: Int = 0,
     val lastEntityScanCompleted: Boolean = false,
+    val showWalkingEntitiesOnly: Boolean = false,
     val isWasmEntitiesLivePolling: Boolean = false,
     val wasmEntityLiveTickCount: Int = 0,
     val trackedEntityKey: String? = null,

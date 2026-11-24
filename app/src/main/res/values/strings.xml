@@ -181,9 +181,12 @@
     <string name="action_find_target_slot_for_mob">Find Target Slot</string>
     <string name="struct_bar_delta_title">Or Bar / Unknown-Value Delta (No Exact Number Needed)</string>
     <string name="struct_bar_delta_hint">Great for Mob HP bars or scaled Player HP/MP: tap Snap while full, hit mob or cast a skill, tap ↓ Drop, wait idle and tap = Same, then hit again and tap ↓ Drop.</string>
-    <string name="action_retry_longer_entity_scan">Retry Longer Scan (2.5s)</string>
-    <string name="entities_zero_moving_title">No Moving Mobs Detected</string>
-    <string name="entities_zero_moving_subtitle">Two-pass scan filtered out %1$d static map coordinates. Move near wandering monsters or try the 2.5s scan to catch slow-patrolling mobs.</string>
+    <string name="action_retry_longer_entity_scan">Scan Moving Only (1.2s)</string>
+    <string name="entities_zero_moving_title">No Stable Nearby Mobs Found</string>
+    <string name="entities_zero_moving_subtitle">Anti-thrash check filtered out %1$d jittery/static floats. Stand closer to monsters and tap Scan Entities again.</string>
+    <string name="entities_filter_all_stable">All Stable</string>
+    <string name="entities_filter_walking_only">Walking Only</string>
+    <string name="entities_standing_over_badge">STANDING ON MOB ✓</string>
 </resources>
 
 

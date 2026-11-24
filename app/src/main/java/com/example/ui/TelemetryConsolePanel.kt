@@ -88,7 +88,6 @@ import com.example.ProberSubTab
 import com.example.R
 import com.example.SavedSiteProfile
 import com.example.Step2ScanMode
-import com.example.StructDeltaFilterMode
 import com.example.TargetScanFilterMode
 import com.example.WasmStructFieldKind
 import com.example.WasmStructProbeAnchor
@@ -118,8 +117,6 @@ fun TelemetryConsolePanel(
     onRunStep2A: () -> Unit,
     onRunStep2B: () -> Unit,
     onRunStep3: () -> Unit,
-    onRunStep3Longer: () -> Unit,
-    onToggleShowWalkingEntitiesOnly: () -> Unit,
     onExportReport: () -> Unit,
     onShareReport: () -> Unit,
     onExportLogDumpTxt: () -> Unit,
@@ -172,8 +169,8 @@ fun TelemetryConsolePanel(
     onToggleWasmEntitiesLive: () -> Unit,
     onToggleTrackEntity: (String) -> Unit,
     onClearTrackedEntity: () -> Unit,
-    onProbeEntityFromList: (DiscoveredEntitySample) -> Unit,
-    onFindTargetSlotForEntity: (DiscoveredEntitySample) -> Unit,
+    onProbeSpecificEntity: (DiscoveredEntitySample) -> Unit,
+    onFindTargetFromEntity: (entity: DiscoveredEntitySample, forceFresh: Boolean) -> Unit,
     onCaptureSelectedTarget: () -> Unit,
     onFilterSelectedTarget: (TargetScanFilterMode) -> Unit,
     onLockSelectedTargetSlot: (Long) -> Unit,
@@ -186,7 +183,6 @@ fun TelemetryConsolePanel(
     onStructProbeInputChanged: (String) -> Unit,
     onRunStructProbe: () -> Unit,
     onRunStructRefine: () -> Unit,
-    onRunStructDeltaProbe: (StructDeltaFilterMode) -> Unit,
     onRunAutoProbeNames: () -> Unit,
     onRunAggroStructProbe: (isAggroedNow: Boolean, refineExisting: Boolean) -> Unit,
     onBindStructCandidate: (WasmStructProbeCandidate) -> Unit,
@@ -287,8 +283,6 @@ fun TelemetryConsolePanel(
                         EntityInspectionConsoleView(
                             state = state,
                             onRescanEntities = onRunStep3,
-                            onRescanEntitiesLonger = onRunStep3Longer,
-                            onToggleShowWalkingOnly = onToggleShowWalkingEntitiesOnly,
                             onToggleLiveEntities = onToggleWasmEntitiesLive,
                             onOpenTargetFinder = {
                                 onSelectProberSubTab(ProberSubTab.TARGET_FINDER)
@@ -300,8 +294,8 @@ fun TelemetryConsolePanel(
                             },
                             onToggleTrackEntity = onToggleTrackEntity,
                             onClearTrackedEntity = onClearTrackedEntity,
-                            onProbeEntity = onProbeEntityFromList,
-                            onFindTargetSlotForEntity = onFindTargetSlotForEntity,
+                            onProbeEntity = onProbeSpecificEntity,
+                            onFindTargetFromEntity = { entity -> onFindTargetFromEntity(entity, false) },
                             onPinPath = { path, detail -> onPinExternalPath(path, "Step 3", detail) },
                             onCopyPayload = onCopyPayload,
                             modifier = Modifier
@@ -315,6 +309,7 @@ fun TelemetryConsolePanel(
                             state = state,
                             onSelectSubTab = onSelectProberSubTab,
                             onCaptureSelectedTarget = onCaptureSelectedTarget,
+                            onFindTargetFromEntity = onFindTargetFromEntity,
                             onFilterSelectedTarget = onFilterSelectedTarget,
                             onLockSelectedTargetSlot = onLockSelectedTargetSlot,
                             onStopSelectedTargetWatch = onStopSelectedTargetWatch,
@@ -326,7 +321,6 @@ fun TelemetryConsolePanel(
                             onStructProbeInputChanged = onStructProbeInputChanged,
                             onRunStructProbe = onRunStructProbe,
                             onRunStructRefine = onRunStructRefine,
-                            onRunStructDeltaProbe = onRunStructDeltaProbe,
                             onRunAutoProbeNames = onRunAutoProbeNames,
                             onRunAggroStructProbe = onRunAggroStructProbe,
                             onBindStructCandidate = onBindStructCandidate,
@@ -1054,6 +1048,7 @@ private fun ProberTabContainer(
     state: DiagnosticsUiState,
     onSelectSubTab: (ProberSubTab) -> Unit,
     onCaptureSelectedTarget: () -> Unit,
+    onFindTargetFromEntity: (entity: DiscoveredEntitySample, forceFresh: Boolean) -> Unit,
     onFilterSelectedTarget: (TargetScanFilterMode) -> Unit,
     onLockSelectedTargetSlot: (Long) -> Unit,
     onStopSelectedTargetWatch: () -> Unit,
@@ -1065,7 +1060,6 @@ private fun ProberTabContainer(
     onStructProbeInputChanged: (String) -> Unit,
     onRunStructProbe: () -> Unit,
     onRunStructRefine: () -> Unit,
-    onRunStructDeltaProbe: (StructDeltaFilterMode) -> Unit,
     onRunAutoProbeNames: () -> Unit,
     onRunAggroStructProbe: (isAggroedNow: Boolean, refineExisting: Boolean) -> Unit,
     onBindStructCandidate: (WasmStructProbeCandidate) -> Unit,
@@ -1136,13 +1130,17 @@ private fun ProberTabContainer(
             ProberSubTab.TARGET_FINDER -> {
                 TargetScannerWorkspace(
                     targetState = state.targetScanner,
+                    discoveredEntities = state.discoveredEntities,
+                    trackedEntityKey = state.trackedEntityKey,
                     onCaptureMobA = onCaptureSelectedTarget,
+                    onFindTargetFromEntity = onFindTargetFromEntity,
                     onFilterTarget = onFilterSelectedTarget,
                     onLockTargetSlot = onLockSelectedTargetSlot,
                     onStopTargetWatch = onStopSelectedTargetWatch,
                     onResetTargetScan = onResetSelectedTargetScan,
                     onProbeTargetField = onProbeSelectedTargetField,
                     onAssignTargetToEntities = onAssignSelectedTargetToEntities,
+                    onGoToEntities = onGoToEntities,
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
@@ -1169,15 +1167,14 @@ private fun ProberTabContainer(
                     onInputChanged = onStructProbeInputChanged,
                     onRunProbe = onRunStructProbe,
                     onRunRefine = onRunStructRefine,
-                    onRunDeltaProbe = onRunStructDeltaProbe,
                     onRunAutoProbeNames = onRunAutoProbeNames,
                     onRunAggroProbe = onRunAggroStructProbe,
                     onBindCandidate = onBindStructCandidate,
                     onClearField = onClearBoundStructField,
                     onClearAllFields = onClearAllBoundStructFields,
                     onGoToCoords = onGoToCoords,
-                    onGoToEntities = onGoToEntities,
                     onGoToTargetFinder = { onSelectSubTab(ProberSubTab.TARGET_FINDER) },
+                    onGoToEntities = onGoToEntities,
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()

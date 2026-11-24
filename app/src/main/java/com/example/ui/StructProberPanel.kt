@@ -55,7 +55,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.R
-import com.example.StructDeltaFilterMode
 import com.example.WasmStructFieldKind
 import com.example.WasmStructProbeAnchor
 import com.example.WasmStructProbeCandidate
@@ -170,29 +169,27 @@ fun StructProberWorkspace(
     onInputChanged: (String) -> Unit,
     onRunProbe: () -> Unit,
     onRunRefine: () -> Unit,
-    onRunDeltaProbe: (StructDeltaFilterMode) -> Unit,
     onRunAutoProbeNames: () -> Unit,
     onRunAggroProbe: (isAggroedNow: Boolean, refineExisting: Boolean) -> Unit,
     onBindCandidate: (WasmStructProbeCandidate) -> Unit,
     onClearField: (WasmStructFieldKind) -> Unit,
     onClearAllFields: () -> Unit,
     onGoToCoords: () -> Unit,
-    onGoToEntities: () -> Unit,
     onGoToTargetFinder: () -> Unit,
+    onGoToEntities: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val activeField = prober.activeField
     val activeAccent = structFieldAccent(activeField)
     val schema = prober.schema
-    val hasPickedEntityAnchor = prober.pickedEntityCoordAddress > 0L
-    val isPickedEntityAnchor = prober.probeAnchor == WasmStructProbeAnchor.PICKED_ENTITY
-    val isTargetSlotAnchor = prober.probeAnchor == WasmStructProbeAnchor.SELECTED_TARGET
+    val hasEntityAnchor = prober.selectedEntityCoordAddress > 0L
+    val isTargetAnchor = prober.probeAnchor == WasmStructProbeAnchor.SELECTED_TARGET
+    val isEntityAnchor = prober.probeAnchor == WasmStructProbeAnchor.ENTITY
     val activeAnchorReady = when (prober.probeAnchor) {
         WasmStructProbeAnchor.PLAYER -> hasPlayerAnchor
-        WasmStructProbeAnchor.PICKED_ENTITY -> hasPickedEntityAnchor
         WasmStructProbeAnchor.SELECTED_TARGET -> hasSelectedTargetAnchor
+        WasmStructProbeAnchor.ENTITY -> hasEntityAnchor
     }
-    val hasAnyMobAnchor = hasPickedEntityAnchor || hasSelectedTargetAnchor
 
     Column(
         modifier = modifier
@@ -203,7 +200,7 @@ fun StructProberWorkspace(
             .testTag("struct_prober_panel"),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // 1. 3-Way Probe Anchor Switcher (Player / Picked Entity Mob / Target Slot) + Status Banner
+        // 1. 3-Way Probe Anchor Switcher (Player Struct vs Selected Target vs Specific Entity)
         Surface(
             shape = RoundedCornerShape(10.dp),
             color = if (activeAnchorReady) SignalEmerald.copy(alpha = 0.10f) else AssetAmber.copy(alpha = 0.10f),
@@ -232,27 +229,23 @@ fun StructProberWorkspace(
                         modifier = Modifier.weight(1f)
                     )
                     ConsoleSubTabSegmentPill(
-                        label = if (hasPickedEntityAnchor) {
-                            "Mob ✓"
-                        } else {
-                            "Picked Mob"
-                        },
-                        selected = isPickedEntityAnchor,
-                        accent = TelemetryViolet,
-                        testTag = "prober_anchor_picked_entity",
-                        onClick = { onSelectAnchor(WasmStructProbeAnchor.PICKED_ENTITY) },
-                        modifier = Modifier.weight(1f)
-                    )
-                    ConsoleSubTabSegmentPill(
                         label = if (hasSelectedTargetAnchor) {
                             "Target ✓"
                         } else {
-                            "Target Slot"
+                            "Target"
                         },
-                        selected = isTargetSlotAnchor,
+                        selected = isTargetAnchor,
                         accent = ElectricCyan,
                         testTag = "prober_anchor_target",
                         onClick = { onSelectAnchor(WasmStructProbeAnchor.SELECTED_TARGET) },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ConsoleSubTabSegmentPill(
+                        label = if (hasEntityAnchor) "Entity ✓" else "Entity",
+                        selected = isEntityAnchor,
+                        accent = TelemetryViolet,
+                        testTag = "prober_anchor_entity",
+                        onClick = { onSelectAnchor(WasmStructProbeAnchor.ENTITY) },
                         modifier = Modifier.weight(1f)
                     )
                 }
@@ -270,16 +263,16 @@ fun StructProberWorkspace(
                     )
                     Text(
                         text = when {
-                            isPickedEntityAnchor && hasPickedEntityAnchor ->
-                                "Anchored to ${prober.pickedEntityLabel} • Probe Name, HP (value or Bar Snap/Drop), or Aggro."
-                            isPickedEntityAnchor ->
-                                "Pick any monster in the Entities tab and tap 'Probe Mob' to probe its Name, HP, or Aggro directly."
-                            isTargetSlotAnchor && hasSelectedTargetAnchor ->
-                                "Probing Target Slot (${selectedTargetLabel ?: "Mob"}) • $trackedMobCount nearby mobs cross-checked."
-                            isTargetSlotAnchor ->
-                                "No Target Slot locked yet. Pick a mob in Entities -> 'Find Target Slot' or use Target Finder."
+                            isEntityAnchor && hasEntityAnchor ->
+                                "Probing Entity: ${prober.selectedEntityLabel ?: "Chosen Mob"} • $trackedMobCount nearby mobs cross-checked."
+                            isEntityAnchor ->
+                                "No specific entity chosen yet. Tap Probe Entity on any mob card in the Entities tab."
+                            isTargetAnchor && hasSelectedTargetAnchor ->
+                                "Probing Selected Target (${selectedTargetLabel ?: "Mob"}) • $trackedMobCount nearby mobs cross-checked."
+                            isTargetAnchor ->
+                                "No mob target locked yet. Isolate your Selected Target pointer in Target Finder first."
                             hasPlayerAnchor ->
-                                "Probing live Player struct (+1-hop sub-structs) • $trackedMobCount nearby mobs cross-checked."
+                                "Probing live player struct (+1-hop sub-structs) • $trackedMobCount nearby mobs cross-checked."
                             else ->
                                 stringResource(R.string.prober_no_anchor_banner)
                         },
@@ -289,10 +282,10 @@ fun StructProberWorkspace(
                     )
                     if (!activeAnchorReady) {
                         OutlinedButton(
-                            onClick = when (prober.probeAnchor) {
-                                WasmStructProbeAnchor.PICKED_ENTITY -> onGoToEntities
-                                WasmStructProbeAnchor.SELECTED_TARGET -> onGoToTargetFinder
-                                WasmStructProbeAnchor.PLAYER -> onGoToCoords
+                            onClick = when {
+                                isEntityAnchor -> onGoToEntities
+                                isTargetAnchor -> onGoToTargetFinder
+                                else -> onGoToCoords
                             },
                             shape = RoundedCornerShape(8.dp),
                             border = BorderStroke(1.dp, AssetAmber),
@@ -302,10 +295,10 @@ fun StructProberWorkspace(
                                 .testTag("prober_go_to_coords_button")
                         ) {
                             Text(
-                                text = when (prober.probeAnchor) {
-                                    WasmStructProbeAnchor.PICKED_ENTITY -> "Entities"
-                                    WasmStructProbeAnchor.SELECTED_TARGET -> "Target Finder"
-                                    WasmStructProbeAnchor.PLAYER -> stringResource(R.string.action_go_to_coords)
+                                text = when {
+                                    isEntityAnchor -> stringResource(R.string.action_go_to_entities)
+                                    isTargetAnchor -> "Target Finder"
+                                    else -> stringResource(R.string.action_go_to_coords)
                                 },
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold,
@@ -453,7 +446,7 @@ fun StructProberWorkspace(
                     ) {
                         Button(
                             onClick = { onRunAggroProbe(false, hasPriorAggro) },
-                            enabled = !prober.isProbing && hasAnyMobAnchor,
+                            enabled = !prober.isProbing && hasSelectedTargetAnchor,
                             shape = RoundedCornerShape(9.dp),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = SignalEmerald,
@@ -474,7 +467,7 @@ fun StructProberWorkspace(
 
                         Button(
                             onClick = { onRunAggroProbe(true, hasPriorAggro) },
-                            enabled = !prober.isProbing && hasAnyMobAnchor,
+                            enabled = !prober.isProbing && hasSelectedTargetAnchor,
                             shape = RoundedCornerShape(9.dp),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = AlertCoral,
@@ -496,7 +489,7 @@ fun StructProberWorkspace(
                     if (hasPriorAggro) {
                         OutlinedButton(
                             onClick = { onRunAggroProbe(false, false) },
-                            enabled = !prober.isProbing && hasAnyMobAnchor,
+                            enabled = !prober.isProbing && hasSelectedTargetAnchor,
                             shape = RoundedCornerShape(8.dp),
                             border = BorderStroke(1.dp, ObsidianBorder),
                             modifier = Modifier
@@ -686,134 +679,6 @@ fun StructProberWorkspace(
                                         fontWeight = FontWeight.Bold,
                                         color = SignalEmerald
                                     )
-                                }
-                            }
-                        }
-                    }
-
-                    // Bar / Unknown-Value Differential Prober (for Mob HP bars or scaled Player HP/MP/FP)
-                    if (!activeField.isNameField) {
-                        Surface(
-                            color = ObsidianBg,
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.35f)),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(
-                                modifier = Modifier.padding(10.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        text = stringResource(R.string.struct_bar_delta_title),
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = ElectricCyan,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    if (prober.deltaRound > 0) {
-                                        Surface(
-                                            color = ElectricCyan.copy(alpha = 0.18f),
-                                            shape = RoundedCornerShape(5.dp)
-                                        ) {
-                                            Text(
-                                                text = "R${prober.deltaRound}: ${prober.deltaSnapshotCount} left",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                fontFamily = JetBrainsMonoFontFamily,
-                                                fontWeight = FontWeight.Bold,
-                                                color = ElectricCyan,
-                                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                                            )
-                                        }
-                                    }
-                                }
-                                Text(
-                                    text = stringResource(R.string.struct_bar_delta_hint),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                                ) {
-                                    Button(
-                                        onClick = { onRunDeltaProbe(StructDeltaFilterMode.SNAPSHOT) },
-                                        enabled = !prober.isProbing && activeAnchorReady,
-                                        shape = RoundedCornerShape(8.dp),
-                                        colors = ButtonDefaults.buttonColors(
-                                            containerColor = ElectricCyan,
-                                            contentColor = ObsidianBg
-                                        ),
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .heightIn(min = 44.dp)
-                                            .testTag("struct_delta_snap_button")
-                                    ) {
-                                        Text(
-                                            text = "Snap",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
-                                    OutlinedButton(
-                                        onClick = { onRunDeltaProbe(StructDeltaFilterMode.DECREASED) },
-                                        enabled = !prober.isProbing && activeAnchorReady && prober.deltaRound > 0,
-                                        shape = RoundedCornerShape(8.dp),
-                                        border = BorderStroke(1.dp, AlertCoral),
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .heightIn(min = 44.dp)
-                                            .testTag("struct_delta_drop_button")
-                                    ) {
-                                        Text(
-                                            text = "↓ Drop",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = AlertCoral
-                                        )
-                                    }
-                                    OutlinedButton(
-                                        onClick = { onRunDeltaProbe(StructDeltaFilterMode.UNCHANGED) },
-                                        enabled = !prober.isProbing && activeAnchorReady && prober.deltaRound > 0,
-                                        shape = RoundedCornerShape(8.dp),
-                                        border = BorderStroke(1.dp, AssetAmber),
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .heightIn(min = 44.dp)
-                                            .testTag("struct_delta_same_button")
-                                    ) {
-                                        Text(
-                                            text = "= Same",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = AssetAmber
-                                        )
-                                    }
-                                    OutlinedButton(
-                                        onClick = { onRunDeltaProbe(StructDeltaFilterMode.INCREASED) },
-                                        enabled = !prober.isProbing && activeAnchorReady && prober.deltaRound > 0,
-                                        shape = RoundedCornerShape(8.dp),
-                                        border = BorderStroke(1.dp, SignalEmerald),
-                                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .heightIn(min = 44.dp)
-                                            .testTag("struct_delta_rise_button")
-                                    ) {
-                                        Text(
-                                            text = "↑ Rise",
-                                            style = MaterialTheme.typography.labelMedium,
-                                            fontWeight = FontWeight.Bold,
-                                            color = SignalEmerald
-                                        )
-                                    }
                                 }
                             }
                         }

@@ -2,6 +2,7 @@ package com.example.ui
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -26,6 +27,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.TrackChanges
+import androidx.compose.material.icons.filled.ViewInAr
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -35,6 +37,10 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -44,6 +50,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.DiscoveredEntitySample
 import com.example.LiveSelectedTargetSnapshot
 import com.example.R
 import com.example.SelectedTargetCandidate
@@ -75,15 +82,35 @@ import java.util.Locale
 @Composable
 fun TargetScannerWorkspace(
     targetState: WasmTargetScannerState,
+    discoveredEntities: List<DiscoveredEntitySample>,
+    trackedEntityKey: String?,
     onCaptureMobA: () -> Unit,
+    onFindTargetFromEntity: (entity: DiscoveredEntitySample, forceFresh: Boolean) -> Unit,
     onFilterTarget: (TargetScanFilterMode) -> Unit,
     onLockTargetSlot: (Long) -> Unit,
     onStopTargetWatch: () -> Unit,
     onResetTargetScan: () -> Unit,
     onProbeTargetField: (WasmStructFieldKind) -> Unit,
     onAssignTargetToEntities: () -> Unit,
+    onGoToEntities: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val wasmEntities = remember(discoveredEntities) {
+        discoveredEntities.filter { it.effectiveCoordByteAddress > 0L }
+    }
+    var pickedEntityKey by remember(trackedEntityKey, targetState.anchoredEntityCoordAddress, wasmEntities) {
+        val defaultPick = wasmEntities.firstOrNull {
+            targetState.anchoredEntityCoordAddress > 0L &&
+                it.effectiveCoordByteAddress == targetState.anchoredEntityCoordAddress
+        } ?: wasmEntities.firstOrNull {
+            trackedEntityKey != null && it.selectionKey == trackedEntityKey
+        } ?: wasmEntities.firstOrNull()
+        mutableStateOf(defaultPick?.selectionKey)
+    }
+    val pickedEntity = remember(pickedEntityKey, wasmEntities) {
+        wasmEntities.firstOrNull { it.selectionKey == pickedEntityKey } ?: wasmEntities.firstOrNull()
+    }
+
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -104,6 +131,17 @@ fun TargetScannerWorkspace(
                 onAssignToEntities = onAssignTargetToEntities
             )
         }
+
+        // 1B. Fastest Method: Find Player's Selected Target Using a Located & Targeted Entity
+        KnownEntityTargetFinderCard(
+            wasmEntities = wasmEntities,
+            pickedEntity = pickedEntity,
+            targetState = targetState,
+            onPickEntity = { pickedEntityKey = it.selectionKey },
+            onScanFreshForEntity = { ent -> onFindTargetFromEntity(ent, true) },
+            onNarrowToEntity = { ent -> onFindTargetFromEntity(ent, false) },
+            onGoToEntities = onGoToEntities
+        )
 
         // 2. Step 1: Capture Mob A + Reset Card
         Surface(
@@ -651,12 +689,13 @@ private fun TargetSlotCandidateCard(
                 }
 
                 val tagText = buildList {
-                    candidate.matchedEntityName?.let { add("ENTITY MATCH: $it") }
+                    candidate.matchReason?.let { add(it) }
+                    candidate.matchedEntityName?.let { add("ENTITY: $it") }
                     candidate.nearPlayerOffsetBytes?.let { off ->
                         val sign = if (off < 0) "-" else "+"
                         add("Player ${sign}0x${kotlin.math.abs(off).toString(16).uppercase()}")
                     }
-                    candidate.previewName?.let { add("\"$it\"") }
+                    candidate.previewName?.takeIf { it != candidate.matchedEntityName }?.let { add("\"$it\"") }
                     candidate.previewHp?.let { add("HP=$it") }
                     if (candidate.resolvedX != null && candidate.resolvedZ != null) {
                         add("(${String.format(Locale.US, "%.1f", candidate.resolvedX)}, ${String.format(Locale.US, "%.1f", candidate.resolvedZ)})")
@@ -692,6 +731,194 @@ private fun TargetSlotCandidateCard(
                     style = MaterialTheme.typography.labelMedium,
                     fontWeight = FontWeight.Bold
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun KnownEntityTargetFinderCard(
+    wasmEntities: List<DiscoveredEntitySample>,
+    pickedEntity: DiscoveredEntitySample?,
+    targetState: WasmTargetScannerState,
+    onPickEntity: (DiscoveredEntitySample) -> Unit,
+    onScanFreshForEntity: (DiscoveredEntitySample) -> Unit,
+    onNarrowToEntity: (DiscoveredEntitySample) -> Unit,
+    onGoToEntities: () -> Unit
+) {
+    Surface(
+        shape = RoundedCornerShape(10.dp),
+        color = ObsidianSurface,
+        border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.65f)),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("known_entity_target_finder_card")
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.ViewInAr,
+                    contentDescription = null,
+                    tint = AssetAmber,
+                    modifier = Modifier.size(18.dp)
+                )
+                Text(
+                    text = stringResource(R.string.known_entity_target_title),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = AssetAmber,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Text(
+                text = stringResource(R.string.known_entity_target_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            if (wasmEntities.isEmpty()) {
+                OutlinedButton(
+                    onClick = onGoToEntities,
+                    shape = RoundedCornerShape(9.dp),
+                    border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.8f)),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 48.dp)
+                        .testTag("known_entity_go_to_entities_button")
+                ) {
+                    Text(
+                        text = stringResource(R.string.action_go_to_entities),
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = AssetAmber
+                    )
+                }
+            } else {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    wasmEntities.take(15).forEach { entity ->
+                        val selected = pickedEntity?.selectionKey == entity.selectionKey
+                        val distStr = "${String.format(Locale.US, "%.1f", entity.distanceToPlayer)}u"
+                        Surface(
+                            onClick = { onPickEntity(entity) },
+                            shape = RoundedCornerShape(8.dp),
+                            color = if (selected) AssetAmber.copy(alpha = 0.22f) else ObsidianBg,
+                            border = BorderStroke(
+                                width = if (selected) 1.5.dp else 1.dp,
+                                color = if (selected) AssetAmber else ObsidianBorder
+                            ),
+                            modifier = Modifier
+                                .heightIn(min = 40.dp)
+                                .testTag("target_pick_entity_${entity.id}")
+                        ) {
+                            Column(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalArrangement = Arrangement.spacedBy(1.dp)
+                            ) {
+                                Text(
+                                    text = "${entity.displayName} ($distStr)",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (selected) AssetAmber else MaterialTheme.colorScheme.onSurface,
+                                    maxLines = 1
+                                )
+                                Text(
+                                    text = formatHexShort(entity.effectiveCoordByteAddress),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontFamily = JetBrainsMonoFontFamily,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    fontSize = 10.sp
+                                )
+                            }
+                        }
+                    }
+                }
+
+                pickedEntity?.let { ent ->
+                    val canNarrow = !targetState.isScanning && targetState.scanRound > 0 && targetState.totalCandidates > 0
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Button(
+                            onClick = { onScanFreshForEntity(ent) },
+                            enabled = !targetState.isScanning,
+                            shape = RoundedCornerShape(9.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = AssetAmber,
+                                contentColor = ObsidianBg
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp)
+                                .testTag("known_entity_scan_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.GpsFixed,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(5.dp))
+                            Text(
+                                text = stringResource(R.string.action_scan_for_entity_target),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        OutlinedButton(
+                            onClick = { onNarrowToEntity(ent) },
+                            enabled = canNarrow,
+                            shape = RoundedCornerShape(9.dp),
+                            border = BorderStroke(
+                                1.dp,
+                                if (canNarrow) SignalEmerald.copy(alpha = 0.85f) else ObsidianBorder
+                            ),
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = if (canNarrow) SignalEmerald.copy(alpha = 0.14f) else ObsidianBg,
+                                contentColor = SignalEmerald
+                            ),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 10.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp)
+                                .testTag("known_entity_narrow_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.FilterAlt,
+                                contentDescription = null,
+                                tint = if (canNarrow) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(5.dp))
+                            Text(
+                                text = stringResource(R.string.action_narrow_to_entity_target),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (canNarrow) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
             }
         }
     }

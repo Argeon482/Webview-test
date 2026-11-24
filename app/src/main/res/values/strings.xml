@@ -172,22 +172,18 @@
     <string name="action_target_same_type">Same-Type Mob</string>
     <string name="action_assign_target_to_entities">Assign Target to Entity List</string>
     <string name="action_open_target_finder">Target Finder</string>
-    <string name="struct_prober_hint_aggro">Pick a mob from the Entities tab (or lock a Target slot): tap Passive while it is idle, then aggro it in-game and tap Aggroed to isolate the exact Aggro flag or Player-Target pointer.</string>
+    <string name="struct_prober_hint_aggro">With a mob selected &amp; locked in Target Finder: tap Passive while it is idle, then aggro it in-game and tap Aggroed (Refine) to isolate the exact Aggro flag or Player-Target pointer.</string>
     <string name="action_probe_passive">Passive (0)</string>
     <string name="action_probe_aggroed">Aggroed (!=0)</string>
     <string name="entity_location_tracker_badge">READ-ONLY LOCATION TRACKER</string>
-    <string name="entity_location_tracker_note">Walk manually in-game toward this heading to verify distance drops to 0.0u, then tap Probe Mob to search its Name, HP, or Aggro directly.</string>
-    <string name="action_probe_this_mob">Probe Mob</string>
-    <string name="action_find_target_slot_for_mob">Find Target Slot</string>
-    <string name="struct_bar_delta_title">Or Bar / Unknown-Value Delta (No Exact Number Needed)</string>
-    <string name="struct_bar_delta_hint">Great for Mob HP bars or scaled Player HP/MP: tap Snap while full, hit mob or cast a skill, tap ↓ Drop, wait idle and tap = Same, then hit again and tap ↓ Drop.</string>
-    <string name="action_retry_longer_entity_scan">Scan Moving Only (1.2s)</string>
-    <string name="entities_zero_moving_title">No Stable Nearby Mobs Found</string>
-    <string name="entities_zero_moving_subtitle">Anti-thrash check filtered out %1$d jittery/static floats. Stand closer to monsters and tap Scan Entities again.</string>
-    <string name="entities_filter_all_stable">All Stable</string>
-    <string name="entities_filter_walking_only">Walking Only</string>
-    <string name="entities_standing_over_badge">STANDING ON MOB ✓</string>
+    <string name="entity_location_tracker_note">Walk manually in-game toward the heading below — distance drops to 0.0u to verify this entity\'s exact location (no auto-target or auto-move).</string>
+    <string name="action_probe_entity">Probe Entity</string>
+    <string name="action_find_target_from_entity">Find Target Ptr</string>
+    <string name="known_entity_target_title">Find Target From Located Entity (Fastest)</string>
+    <string name="known_entity_target_hint">Target a located mob in-game, then tap Scan For Mob to find every pointer or Entity ID referencing it. Deselect (0) or target a 2nd mob and tap Narrow To Mob to isolate 1 slot.</string>
+    <string name="action_scan_for_entity_target">Scan For Mob</string>
+    <string name="action_narrow_to_entity_target">Narrow To Mob</string>
+    <string name="action_go_to_entities">Pick Entity</string>
 </resources>
-
 
 

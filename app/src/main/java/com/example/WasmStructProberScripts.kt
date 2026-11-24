@@ -261,13 +261,13 @@ object WasmStructProberScripts {
         targetValue: Double,
         existingCandidatesJson: String? = null,
         anchorIsTarget: Boolean = false,
-        useDirectAnchorAddress: Boolean = false
+        exactAnchorOverride: Boolean = false
     ): String {
         val safeAddr = playerByteAddress.coerceAtLeast(0L)
         val safeTarget = if (targetValue.isFinite()) targetValue.toString() else "0"
         val refineJson = existingCandidatesJson?.takeIf { it.isNotBlank() } ?: "null"
         val useLiveTargetExpr = if (anchorIsTarget) "true" else "false"
-        val useDirectExpr = if (useDirectAnchorAddress) "true" else "false"
+        val useExactOverrideExpr = if (exactAnchorOverride) "true" else "false"
         return """
         (function() {
           try {
@@ -286,7 +286,7 @@ object WasmStructProberScripts {
             }
 
             let playerAddr = 0;
-            if ($useDirectExpr && $safeAddr > 0) {
+            if ($useExactOverrideExpr) {
               playerAddr = $safeAddr;
             } else if ($useLiveTargetExpr) {
               const liveTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
@@ -301,11 +301,11 @@ object WasmStructProberScripts {
                 stage: 'WASM_STRUCT_PROBE_RESULTS',
                 fieldKind: '${fieldKind.name}',
                 isRefine: ${existingCandidatesJson != null},
-                error: $useDirectExpr
-                  ? 'Pick a mob from the Entities tab first so its struct can be probed.'
+                error: $useExactOverrideExpr
+                  ? 'Selected entity does not have a valid WASM coordinate address.'
                   : ($useLiveTargetExpr
-                    ? 'No live selected target locked yet. Select a mob from Entities or Target Finder first.'
-                    : 'No live player pointer or locked coordinate address active yet.'),
+                      ? 'No live selected target locked yet. Select a mob and lock its target slot first.'
+                      : 'No live player pointer or locked coordinate address active yet.'),
                 candidates: []
               });
               return;
@@ -400,10 +400,10 @@ object WasmStructProberScripts {
               const h16 = heaps.heap16;
               const hu32 = heaps.heapU32;
 
-              // 1. Direct struct window: [-8192 .. +20480] bytes around anchorAddr
-              const minDirect = Math.max(4, playerAddr - 8192) & ~3;
-              const maxDirect = Math.min(byteLen - 4, playerAddr + 20480) & ~3;
-              for (let a = minDirect; a <= maxDirect && results.length < 160; a += 4) {
+              // 1. Direct struct window: [-4096 .. +12288] bytes around playerCoordAddr
+              const minDirect = Math.max(4, playerAddr - 4096) & ~3;
+              const maxDirect = Math.min(byteLen - 4, playerAddr + 12288) & ~3;
+              for (let a = minDirect; a <= maxDirect && results.length < 48; a += 4) {
                 const rel = a - playerAddr;
                 if (rel >= 0 && rel <= 8) continue; // skip X/Y/Z coordinate floats themselves
                 const idx32 = a >>> 2;
@@ -411,16 +411,16 @@ object WasmStructProberScripts {
                   addCandidate(rel, null, 'INT32', TARGET_INT, a);
                 }
                 const fv = hf32[idx32];
-                if (Number.isFinite(fv) && Math.abs(fv - TARGET) <= 0.6 && Math.abs(fv) > 0.001) {
+                if (Number.isFinite(fv) && Math.abs(fv - TARGET) <= 0.5 && Math.abs(fv) > 0.001) {
                   addCandidate(rel, null, 'FLOAT32', Number(fv.toFixed(2)), a);
                 }
               }
 
-              // Also check INT16 in [-4096 .. +8192] if integer fits in signed 16-bit
-              if (IS_INT_TARGET && TARGET_INT > 0 && TARGET_INT <= 32767 && results.length < 180) {
-                const min16 = Math.max(4, playerAddr - 4096) & ~1;
-                const max16 = Math.min(byteLen - 2, playerAddr + 8192) & ~1;
-                for (let a = min16; a <= max16 && results.length < 200; a += 2) {
+              // Also check INT16 in tighter window [-2048 .. +4096] if integer fits in signed 16-bit
+              if (IS_INT_TARGET && TARGET_INT > 0 && TARGET_INT <= 32767 && results.length < 48) {
+                const min16 = Math.max(4, playerAddr - 2048) & ~1;
+                const max16 = Math.min(byteLen - 2, playerAddr + 4096) & ~1;
+                for (let a = min16; a <= max16 && results.length < 56; a += 2) {
                   const rel = a - playerAddr;
                   if (rel >= 0 && rel <= 10) continue;
                   if ((a & 3) === 0 && h32[a >>> 2] === TARGET_INT) continue; // already reported as INT32
@@ -430,27 +430,24 @@ object WasmStructProberScripts {
                 }
               }
 
-              // 2. Deduplicated 1-hop sub-struct pointer scan: pointers in [-4096 .. +8192] -> inspect [0 .. +1024]
-              const minPtr = Math.max(4, playerAddr - 4096) & ~3;
-              const maxPtr = Math.min(byteLen - 4, playerAddr + 8192) & ~3;
-              const seenPtrs = {};
+              // 2. 1-hop sub-struct pointer scan: pointers in [-2048 .. +4096] -> inspect [0 .. +512]
+              const minPtr = Math.max(4, playerAddr - 2048) & ~3;
+              const maxPtr = Math.min(byteLen - 4, playerAddr + 4096) & ~3;
               let ptrScanned = 0;
-              for (let pa = minPtr; pa <= maxPtr && results.length < 240 && ptrScanned < 1200; pa += 4) {
+              for (let pa = minPtr; pa <= maxPtr && results.length < 64 && ptrScanned < 400; pa += 4) {
                 const ptr = hu32[pa >>> 2] >>> 0;
-                if (ptr < 4096 || (ptr & 3) !== 0 || ptr + 1024 >= byteLen) continue;
+                if (ptr < 4096 || (ptr & 3) !== 0 || ptr + 512 >= byteLen) continue;
                 if (Math.abs(ptr - playerAddr) < 128) continue;
-                if (seenPtrs[ptr]) continue;
-                seenPtrs[ptr] = true;
                 ptrScanned++;
                 const ptrRel = pa - playerAddr;
-                for (let sub = 0; sub <= 1024 && results.length < 240; sub += 4) {
+                for (let sub = 0; sub <= 512 && results.length < 64; sub += 4) {
                   const subAddr = ptr + sub;
                   const idx = subAddr >>> 2;
                   if (IS_INT_TARGET && h32[idx] === TARGET_INT) {
                     addCandidate(ptrRel, sub, 'INT32', TARGET_INT, subAddr);
                   }
                   const fv = hf32[idx];
-                  if (Number.isFinite(fv) && Math.abs(fv - TARGET) <= 0.6 && Math.abs(fv) > 0.001) {
+                  if (Number.isFinite(fv) && Math.abs(fv - TARGET) <= 0.5 && Math.abs(fv) > 0.001) {
                     addCandidate(ptrRel, sub, 'FLOAT32', Number(fv.toFixed(2)), subAddr);
                   }
                 }
@@ -503,12 +500,12 @@ object WasmStructProberScripts {
         playerByteAddress: Long,
         nameQuery: String = "",
         anchorIsTarget: Boolean = false,
-        useDirectAnchorAddress: Boolean = false
+        exactAnchorOverride: Boolean = false
     ): String {
         val safeAddr = playerByteAddress.coerceAtLeast(0L)
         val escapedQuery = quoteJsString(nameQuery.trim())
         val useLiveTargetExpr = if (anchorIsTarget) "true" else "false"
-        val useDirectExpr = if (useDirectAnchorAddress) "true" else "false"
+        val useExactOverrideExpr = if (exactAnchorOverride) "true" else "false"
         return """
         (function() {
           try {
@@ -527,7 +524,7 @@ object WasmStructProberScripts {
             }
 
             let playerAddr = 0;
-            if ($useDirectExpr && $safeAddr > 0) {
+            if ($useExactOverrideExpr) {
               playerAddr = $safeAddr;
             } else if ($useLiveTargetExpr) {
               const liveTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
@@ -538,7 +535,7 @@ object WasmStructProberScripts {
               playerAddr = __spResolveLivePlayerAddr($safeAddr, heaps);
             }
             const trackedMobs = (window.__wvWasmEntities && Array.isArray(window.__wvWasmEntities.tracked))
-              ? window.__wvWasmEntities.tracked.slice(0, 6)
+              ? window.__wvWasmEntities.tracked.slice(0, 5)
               : [];
             if (playerAddr <= 0 && trackedMobs.length === 0) {
               __spEmit('WASM', {
@@ -702,12 +699,12 @@ object WasmStructProberScripts {
         playerByteAddress: Long,
         isAggroedNow: Boolean,
         existingCandidatesJson: String? = null,
-        useDirectAnchorAddress: Boolean = false
+        exactAnchorOverride: Boolean = false
     ): String {
         val safeTargetAddr = targetAnchorByteAddress.coerceAtLeast(0L)
         val safePlayerAddr = playerByteAddress.coerceAtLeast(0L)
         val refineJson = existingCandidatesJson?.takeIf { it.isNotBlank() } ?: "null"
-        val useDirectExpr = if (useDirectAnchorAddress) "true" else "false"
+        val useExactOverrideExpr = if (exactAnchorOverride) "true" else "false"
         return """
         (function() {
           try {
@@ -725,18 +722,18 @@ object WasmStructProberScripts {
               return;
             }
 
-            const liveTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
+            const liveTargetCoord = (!$useExactOverrideExpr && window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
               ? window.__wvTargetScan.lastResolvedCoordAddr
               : 0;
-            const anchorAddr = ($useDirectExpr && $safeTargetAddr > 0)
-              ? $safeTargetAddr
-              : (liveTargetCoord > 0 ? liveTargetCoord : $safeTargetAddr);
+            const anchorAddr = $useExactOverrideExpr ? $safeTargetAddr : (liveTargetCoord > 0 ? liveTargetCoord : $safeTargetAddr);
             if (anchorAddr <= 0) {
               __spEmit('WASM', {
                 stage: 'WASM_STRUCT_PROBE_RESULTS',
                 fieldKind: 'AGGRO',
                 isRefine: ${existingCandidatesJson != null},
-                error: 'Pick a mob from the Entities tab or lock a Selected Target first so Aggro offsets can be probed.',
+                error: $useExactOverrideExpr
+                  ? 'Tap Probe on a specific mob in the Entities tab first.'
+                  : 'Lock a Selected Target mob or tap Probe on a mob in Entities first so Aggro offsets can be probed.',
                 candidates: []
               });
               return;
@@ -861,291 +858,6 @@ object WasmStructProberScripts {
             try {
               if (window.TelemetryBridge) {
                 window.TelemetryBridge.logTelemetry('ERR', 'Struct aggro probe error: ' + String(err));
-              }
-            } catch (_) {}
-          }
-        })();
-        """.trimIndent()
-    }
-
-    /**
-     * Strictly read-only Unknown-Value / Health-Bar Differential Struct Prober.
-     *
-     * Ideal when a mob only shows an HP bar (no exact number displayed) OR when player HP/MP/FP
-     * is stored in a scaled/float/sub-struct format:
-     * 1. [StructDeltaFilterMode.SNAPSHOT]: captures all plausible positive `INT32`, `FLOAT32`,
-     *    and `INT16` fields in `[-8192 .. +16384]` + deduplicated 1-hop sub-structs `[0 .. +1024]`.
-     * 2. [StructDeltaFilterMode.DECREASED] / [INCREASED] / [UNCHANGED] / [CHANGED]:
-     *    narrows the captured fields inside the anchored entity struct across damage, skill use,
-     *    or idle ticks until only the exact HP / MP / FP offset remains.
-     */
-    fun buildStructDeltaProbeScript(
-        fieldKind: WasmStructFieldKind,
-        anchorByteAddress: Long,
-        mode: StructDeltaFilterMode,
-        anchorIsTarget: Boolean = false,
-        useDirectAnchorAddress: Boolean = false
-    ): String {
-        val safeAddr = anchorByteAddress.coerceAtLeast(0L)
-        val useLiveTargetExpr = if (anchorIsTarget) "true" else "false"
-        val useDirectExpr = if (useDirectAnchorAddress) "true" else "false"
-        return """
-        (function() {
-          try {
-            $PROBER_HEAP_HELPERS
-            const startMs = performance.now();
-            const heaps = __spResolveHeaps();
-            if (!heaps) {
-              __spEmit('WASM', {
-                stage: 'WASM_STRUCT_PROBE_RESULTS',
-                fieldKind: '${fieldKind.name}',
-                isDeltaProbe: true,
-                deltaMode: '${mode.wireName}',
-                error: 'Could not locate WASM heap on this page.',
-                candidates: []
-              });
-              return;
-            }
-
-            let anchorAddr = 0;
-            if ($useDirectExpr && $safeAddr > 0) {
-              anchorAddr = $safeAddr;
-            } else if ($useLiveTargetExpr) {
-              const liveTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
-                ? window.__wvTargetScan.lastResolvedCoordAddr
-                : 0;
-              anchorAddr = liveTargetCoord > 0 ? liveTargetCoord : $safeAddr;
-            } else {
-              anchorAddr = __spResolveLivePlayerAddr($safeAddr, heaps);
-            }
-
-            if (anchorAddr <= 0) {
-              __spEmit('WASM', {
-                stage: 'WASM_STRUCT_PROBE_RESULTS',
-                fieldKind: '${fieldKind.name}',
-                isDeltaProbe: true,
-                deltaMode: '${mode.wireName}',
-                error: 'No active player or picked mob anchor yet. Lock coords or pick a mob from Entities first.',
-                candidates: []
-              });
-              return;
-            }
-
-            const MODE = '${mode.wireName}';
-            const deltaState = (window.__wvStructDelta = window.__wvStructDelta || {
-              anchorAddr: 0, fieldKind: '', round: 0, entries: []
-            });
-            const byteLen = heaps.byteLength;
-            const h32 = heaps.heap32;
-            const hf32 = heaps.heapF32;
-            const h16 = heaps.heap16;
-            const hu32 = heaps.heapU32;
-            const trackedMobs = (window.__wvWasmEntities && Array.isArray(window.__wvWasmEntities.tracked))
-              ? window.__wvWasmEntities.tracked.slice(0, 3)
-              : [];
-
-            const sampleMobs = function(desc) {
-              const previews = [];
-              let nonZero = 0;
-              for (let m = 0; m < trackedMobs.length; m++) {
-                const v = __spReadField(trackedMobs[m].byteAddr, desc, heaps);
-                if (v !== null && typeof v === 'number' && Number.isFinite(v)) {
-                  if (v > 0) nonZero++;
-                  previews.push('#' + (m + 1) + '=' + v);
-                }
-              }
-              return { previews: previews, nonZero: nonZero };
-            };
-
-            const findAdjacentMax = function(baseAddr, vt, curNum) {
-              if (baseAddr <= 0) return null;
-              const stepBytes = (vt === 'INT16') ? 2 : 4;
-              const deltas = [stepBytes, -stepBytes, stepBytes * 2];
-              for (let d = 0; d < deltas.length; d++) {
-                const a = baseAddr + deltas[d];
-                if (a <= 0 || a + stepBytes > byteLen) continue;
-                let v = null;
-                if (vt === 'INT32' && (a & 3) === 0) v = h32[a >>> 2];
-                else if (vt === 'FLOAT32' && (a & 3) === 0) {
-                  const f = hf32[a >>> 2];
-                  if (Number.isFinite(f)) v = Math.round(f);
-                } else if (vt === 'INT16' && (a & 1) === 0) v = h16[a >>> 1];
-                if (v !== null && v >= curNum && v > 0 && v <= Math.max(curNum * 20, 5000000)) {
-                  return { deltaBytes: deltas[d], value: v };
-                }
-              }
-              return null;
-            };
-
-            if (MODE === 'SNAPSHOT') {
-              const entries = [];
-              const minDirect = Math.max(4, anchorAddr - 8192) & ~3;
-              const maxDirect = Math.min(byteLen - 4, anchorAddr + 16384) & ~3;
-              for (let a = minDirect; a <= maxDirect; a += 4) {
-                const rel = a - anchorAddr;
-                if (rel >= 0 && rel <= 8) continue;
-                const idx = a >>> 2;
-                const iv = h32[idx];
-                if (iv >= 1 && iv <= 10000000) {
-                  entries.push({ r: rel, s: null, t: 'INT32', v: iv });
-                }
-                const fv = hf32[idx];
-                if (Number.isFinite(fv) && fv >= 1.0 && fv <= 10000000.0) {
-                  entries.push({ r: rel, s: null, t: 'FLOAT32', v: Number(fv.toFixed(2)) });
-                }
-              }
-              const min16 = Math.max(4, anchorAddr - 4096) & ~1;
-              const max16 = Math.min(byteLen - 2, anchorAddr + 8192) & ~1;
-              for (let a = min16; a <= max16; a += 2) {
-                const rel = a - anchorAddr;
-                if (rel >= 0 && rel <= 10) continue;
-                const iv16 = h16[a >>> 1];
-                if (iv16 >= 1 && iv16 <= 32767) {
-                  if ((a & 3) === 0 && h32[a >>> 2] === iv16) continue;
-                  entries.push({ r: rel, s: null, t: 'INT16', v: iv16 });
-                }
-              }
-              // Deduplicated 1-hop sub-struct pointers
-              const minPtr = Math.max(4, anchorAddr - 4096) & ~3;
-              const maxPtr = Math.min(byteLen - 4, anchorAddr + 8192) & ~3;
-              const seenPtrs = {};
-              let ptrCount = 0;
-              for (let pa = minPtr; pa <= maxPtr && ptrCount < 600 && entries.length < 30000; pa += 4) {
-                const ptr = hu32[pa >>> 2] >>> 0;
-                if (ptr < 4096 || (ptr & 3) !== 0 || ptr + 1024 >= byteLen) continue;
-                if (Math.abs(ptr - anchorAddr) < 128 || seenPtrs[ptr]) continue;
-                seenPtrs[ptr] = true;
-                ptrCount++;
-                const ptrRel = pa - anchorAddr;
-                for (let sub = 0; sub <= 1024 && entries.length < 30000; sub += 4) {
-                  const idx = (ptr + sub) >>> 2;
-                  const iv = h32[idx];
-                  if (iv >= 1 && iv <= 10000000) {
-                    entries.push({ r: ptrRel, s: sub, t: 'INT32', v: iv });
-                  }
-                  const fv = hf32[idx];
-                  if (Number.isFinite(fv) && fv >= 1.0 && fv <= 10000000.0) {
-                    entries.push({ r: ptrRel, s: sub, t: 'FLOAT32', v: Number(fv.toFixed(2)) });
-                  }
-                }
-              }
-
-              deltaState.anchorAddr = anchorAddr;
-              deltaState.fieldKind = '${fieldKind.name}';
-              deltaState.round = 1;
-              deltaState.entries = entries;
-
-              const durationMs = Number((performance.now() - startMs).toFixed(1));
-              __spEmit('WASM', {
-                stage: 'WASM_STRUCT_PROBE_RESULTS',
-                fieldKind: '${fieldKind.name}',
-                isDeltaProbe: true,
-                deltaMode: MODE,
-                deltaRound: 1,
-                durationMs: durationMs,
-                playerByteAddress: anchorAddr,
-                totalFound: entries.length,
-                candidates: []
-              });
-              return;
-            }
-
-            // Narrow existing snapshot entries
-            if (!Array.isArray(deltaState.entries) || deltaState.entries.length === 0) {
-              __spEmit('WASM', {
-                stage: 'WASM_STRUCT_PROBE_RESULTS',
-                fieldKind: '${fieldKind.name}',
-                isDeltaProbe: true,
-                deltaMode: MODE,
-                deltaRound: 0,
-                error: 'Tap "Snap" first while the mob/player is at full HP or before casting a skill.',
-                totalFound: 0,
-                candidates: []
-              });
-              return;
-            }
-
-            const nextEntries = [];
-            for (let i = 0; i < deltaState.entries.length; i++) {
-              const e = deltaState.entries[i];
-              const cur = __spReadField(anchorAddr, { relOffsetBytes: e.r, subOffsetBytes: e.s, valueType: e.t }, heaps);
-              if (cur === null || typeof cur !== 'number' || !Number.isFinite(cur)) continue;
-              const prev = e.v;
-              let keep = false;
-              if (MODE === 'DECREASED') {
-                keep = (cur < prev && cur >= 0);
-              } else if (MODE === 'INCREASED') {
-                keep = (cur > prev && cur <= 10000000);
-              } else if (MODE === 'UNCHANGED') {
-                keep = (Math.abs(cur - prev) < 0.001);
-              } else if (MODE === 'CHANGED') {
-                keep = (Math.abs(cur - prev) >= 0.001 && cur >= 0);
-              }
-              if (keep) {
-                nextEntries.push({ r: e.r, s: e.s, t: e.t, v: cur, prev: prev });
-              }
-            }
-
-            deltaState.round = (deltaState.round || 1) + 1;
-            deltaState.entries = nextEntries;
-
-            const ranked = [];
-            const inspectLimit = Math.min(nextEntries.length, 160);
-            for (let i = 0; i < inspectLimit; i++) {
-              const e = nextEntries[i];
-              const tag = e.t === 'INT32' ? 'i32' : (e.t === 'FLOAT32' ? 'f32' : 'i16');
-              const expr = e.s === null
-                ? (__spSignedHex(e.r) + ' [' + tag + ']')
-                : ('*(' + __spSignedHex(e.r) + ')' + __spSignedHex(e.s) + ' [' + tag + ']');
-              const desc = { relOffsetBytes: e.r, subOffsetBytes: e.s, valueType: e.t };
-              const mobInfo = sampleMobs(desc);
-              const directAddr = (e.s === null) ? (anchorAddr + e.r) : 0;
-              const adj = (directAddr > 0) ? findAdjacentMax(directAddr, e.t, Math.round(e.v)) : null;
-              const deltaTxt = (e.prev !== undefined && e.prev !== e.v) ? (String(e.prev) + ' → ' + String(e.v)) : String(e.v);
-              ranked.push({
-                id: (e.s === null ? ('D_' + e.r) : ('P_' + e.r + '_' + e.s)) + '_' + e.t,
-                relOffsetBytes: e.r,
-                subOffsetBytes: e.s,
-                valueType: e.t,
-                expression: expr,
-                playerDisplayValue: deltaTxt,
-                playerNumericValue: e.v,
-                adjacentMaxOffsetBytes: adj ? (e.r + adj.deltaBytes) : null,
-                adjacentMaxValue: adj ? adj.value : null,
-                mobPreviews: mobInfo.previews,
-                nonZeroMobCount: mobInfo.nonZero
-              });
-            }
-
-            ranked.sort(function(a, b) {
-              const aHasMax = a.adjacentMaxValue !== null ? 0 : 1;
-              const bHasMax = b.adjacentMaxValue !== null ? 0 : 1;
-              if (aHasMax !== bHasMax) return aHasMax - bHasMax;
-              if (a.nonZeroMobCount !== b.nonZeroMobCount) return b.nonZeroMobCount - a.nonZeroMobCount;
-              const aDirect = a.subOffsetBytes === null ? 0 : 1;
-              const bDirect = b.subOffsetBytes === null ? 0 : 1;
-              if (aDirect !== bDirect) return aDirect - bDirect;
-              const vtRank = function(v) { return v === 'INT32' ? 0 : (v === 'FLOAT32' ? 1 : 2); };
-              if (vtRank(a.valueType) !== vtRank(b.valueType)) return vtRank(a.valueType) - vtRank(b.valueType);
-              return Math.abs(a.relOffsetBytes) - Math.abs(b.relOffsetBytes);
-            });
-
-            const durationMs = Number((performance.now() - startMs).toFixed(1));
-            __spEmit('WASM', {
-              stage: 'WASM_STRUCT_PROBE_RESULTS',
-              fieldKind: '${fieldKind.name}',
-              isDeltaProbe: true,
-              deltaMode: MODE,
-              deltaRound: deltaState.round,
-              durationMs: durationMs,
-              playerByteAddress: anchorAddr,
-              totalFound: nextEntries.length,
-              candidates: ranked.slice(0, 32)
-            });
-          } catch (err) {
-            try {
-              if (window.TelemetryBridge) {
-                window.TelemetryBridge.logTelemetry('ERR', 'Struct delta probe error: ' + String(err));
               }
             } catch (_) {}
           }

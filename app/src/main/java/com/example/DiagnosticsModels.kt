@@ -200,12 +200,7 @@ data class DiscoveredEntitySample(
     val maxFp: Int? = null,
     val aggroRawValue: Int? = null,
     val isAggro: Boolean? = null,
-    val isActiveGameTarget: Boolean = false,
-    val deltaX: Double? = null,
-    val deltaZ: Double? = null,
-    val distanceDelta: Double? = null,
-    val selfMoveDelta: Double = 0.0,
-    val isConfirmedMoving: Boolean = false
+    val isActiveGameTarget: Boolean = false
 ) {
     val selectionKey: String
         get() = "${path}_${id}"
@@ -216,12 +211,22 @@ data class DiscoveredEntitySample(
     val hasAnyVitals: Boolean
         get() = hp != null || mp != null || fp != null
 
-    val isStandingOnMob: Boolean
-        get() = distanceToPlayer <= STANDING_ON_MOB_RADIUS_UNITS
+    val effectiveCoordByteAddress: Long
+        get() = if (coordByteAddress > 0L) coordByteAddress else if (heapIndex >= 0) heapIndex.toLong() * 4L else 0L
 
-    companion object {
-        const val STANDING_ON_MOB_RADIUS_UNITS: Double = 4.0
-    }
+    val estimatedStructBaseAddress: Long
+        get() {
+            val fromSample = sampleKeys
+                .firstOrNull { it.startsWith("struct=0x", ignoreCase = true) }
+                ?.substringAfter("struct=0x")
+                ?.toLongOrNull(16)
+            if (fromSample != null && fromSample > 0L) return fromSample
+            if (id.startsWith("0x", ignoreCase = true)) {
+                val fromId = id.substring(2).toLongOrNull(16)
+                if (fromId != null && fromId > 0L) return fromId
+            }
+            return effectiveCoordByteAddress
+        }
 }
 
 @Immutable
@@ -547,16 +552,8 @@ data class PlayerVitalsSnapshot(
 
 enum class WasmStructProbeAnchor {
     PLAYER,
-    PICKED_ENTITY,
-    SELECTED_TARGET
-}
-
-enum class StructDeltaFilterMode(val wireName: String, val label: String) {
-    SNAPSHOT("SNAPSHOT", "Snap"),
-    DECREASED("DECREASED", "↓ Drop"),
-    UNCHANGED("UNCHANGED", "= Same"),
-    INCREASED("INCREASED", "↑ Rise"),
-    CHANGED("CHANGED", "≠ Diff")
+    SELECTED_TARGET,
+    ENTITY
 }
 
 enum class TargetScanFilterMode(val wireName: String, val label: String) {
@@ -583,7 +580,9 @@ data class SelectedTargetCandidate(
     val previewName: String? = null,
     val previewHp: Int? = null,
     val previewMaxHp: Int? = null,
-    val previewAggroRaw: Int? = null
+    val previewAggroRaw: Int? = null,
+    val matchReason: String? = null,
+    val entityIdRelOffsetBytes: Int? = null
 )
 
 @Immutable
@@ -622,6 +621,8 @@ data class WasmTargetScannerState(
     val lockedSlotAddress: Long? = null,
     val isWatchingTarget: Boolean = false,
     val liveTarget: LiveSelectedTargetSnapshot? = null,
+    val anchoredEntityCoordAddress: Long = 0L,
+    val anchoredEntityLabel: String? = null,
     val statusMessage: String = ""
 )
 
@@ -629,15 +630,12 @@ data class WasmTargetScannerState(
 data class WasmStructProberState(
     val isExpanded: Boolean = true,
     val probeAnchor: WasmStructProbeAnchor = WasmStructProbeAnchor.PLAYER,
-    val pickedEntityKey: String? = null,
-    val pickedEntityCoordAddress: Long = 0L,
-    val pickedEntityLabel: String = "",
+    val selectedEntityCoordAddress: Long = 0L,
+    val selectedEntityLabel: String? = null,
     val activeField: WasmStructFieldKind = WasmStructFieldKind.HP,
     val queryInput: String = "",
     val isProbing: Boolean = false,
     val probeRound: Int = 0,
-    val deltaSnapshotCount: Int = 0,
-    val deltaRound: Int = 0,
     val candidates: List<WasmStructProbeCandidate> = emptyList(),
     val schema: WasmEntityStructSchema = WasmEntityStructSchema(),
     val statusMessage: String = ""
@@ -688,11 +686,6 @@ data class DiagnosticsUiState(
     val entityViewportHeight: Int = 0,
     val discoveredEntities: List<DiscoveredEntitySample> = emptyList(),
     val lastEntityCount: Int = 0,
-    val lastStaticEntitiesFilteredCount: Int = 0,
-    val lastErraticEntitiesDroppedCount: Int = 0,
-    val lastEntityScanDwellMs: Int = 0,
-    val lastEntityScanCompleted: Boolean = false,
-    val showWalkingEntitiesOnly: Boolean = false,
     val isWasmEntitiesLivePolling: Boolean = false,
     val wasmEntityLiveTickCount: Int = 0,
     val trackedEntityKey: String? = null,

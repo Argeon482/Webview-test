@@ -962,7 +962,7 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `picking an entity from Entities list anchors Struct Prober runs Bar Delta HP probe probes Aggro and launches Reverse Target Slot finder`() {
+    fun `probing specific entity and finding selected target from located entities work end to end`() {
         val ptrStore = SitePointerStore(InMemoryPointerStorage())
         val schemaStore = SiteStructSchemaStore(InMemoryPointerStorage())
         val vm = DiagnosticsViewModel()
@@ -973,150 +973,122 @@ class ExampleRobolectricTest {
         vm.onUrlInputChanged(url)
         vm.onLoadUrlRequested()
 
-        // Seed player pointer and a discovered mob verified by distance in Entities
+        // Seed player pointer
         vm.onTelemetryFromBridge(
             "WASM",
-            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":8.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
+            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":6.5,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
         )
-        vm.onTelemetryFromBridge(
-            "ENTITY",
-            """{"stage":"WASM_ENTITIES_DISCOVERED","arrayPath":"window.HEAPF32 near 0x03E00000","projectionMode":"WASM Spatial HEAPF32","viewportWidth":1080,"viewportHeight":1920,"durationMs":11.0,"entities":[{"name":"WASM Entity #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6970.0,"worldY":100.0,"worldZ":3315.0,"distanceToPlayer":9.5,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","struct=0x03E01000"]}]}"""
-        )
-        val pickedMob = vm.uiState.value.discoveredEntities.first()
 
-        // 1. Tap "Probe Mob" from Entities -> anchors Struct Prober to PICKED_ENTITY
-        vm.onSelectEntityAsProbeAnchor(pickedMob)
+        val entityA = DiscoveredEntitySample(
+            name = "Small Aibatt",
+            id = "0x03E01098",
+            path = "WASM HEAPF32",
+            worldX = 6970.0,
+            worldY = 100.0,
+            worldZ = 3315.0,
+            distanceToPlayer = 9.45,
+            screenX = 500.0,
+            screenY = 300.0,
+            inViewport = true,
+            sampleKeys = listOf("coord=0x03E01098", "struct=0x03E01000"),
+            coordByteAddress = 65015960L
+        )
+        val entityB = DiscoveredEntitySample(
+            name = "Mushpang",
+            id = "0x03E02098",
+            path = "WASM HEAPF32",
+            worldX = 6982.0,
+            worldY = 100.0,
+            worldZ = 3322.0,
+            distanceToPlayer = 23.4,
+            screenX = 560.0,
+            screenY = 320.0,
+            inViewport = true,
+            sampleKeys = listOf("coord=0x03E02098", "struct=0x03E02000"),
+            coordByteAddress = 65020056L
+        )
+
+        assertEquals(65015960L, entityA.effectiveCoordByteAddress)
+        assertEquals(0x03E01000L, entityA.estimatedStructBaseAddress)
+        assertEquals(65020056L, entityB.effectiveCoordByteAddress)
+        assertEquals(0x03E02000L, entityB.estimatedStructBaseAddress)
+
+        // 1. Tap "Probe Entity" on Entity A -> switches to Prober -> Struct anchored strictly to Entity A
+        vm.onProbeSpecificEntity(entityA)
         assertEquals(ConsoleTab.PROBER, vm.uiState.value.activeConsoleTab)
         assertEquals(ProberSubTab.STRUCT_PROBER, vm.uiState.value.activeProberSubTab)
-        assertEquals(WasmStructProbeAnchor.PICKED_ENTITY, vm.uiState.value.structProber.probeAnchor)
-        assertEquals(65015960L, vm.uiState.value.structProber.pickedEntityCoordAddress)
-        assertEquals(WasmStructFieldKind.NAME, vm.uiState.value.structProber.activeField)
+        assertEquals(WasmStructProbeAnchor.ENTITY, vm.uiState.value.structProber.probeAnchor)
+        assertEquals(65015960L, vm.uiState.value.structProber.selectedEntityCoordAddress)
+        assertTrue(vm.uiState.value.structProber.selectedEntityLabel!!.contains("Small Aibatt"))
 
-        // 2. Switch to HP and run Bar / Unknown-Value Delta: Snap -> hit mob -> ↓ Drop -> Bind
-        vm.onSelectStructProbeField(WasmStructFieldKind.HP)
-        vm.runStructDeltaProbe(StructDeltaFilterMode.SNAPSHOT)
-        assertTrue(vm.uiState.value.structProber.isProbing)
-
-        vm.onTelemetryFromBridge(
-            "WASM",
-            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"HP","isRefine":false,"isDeltaProbe":true,"deltaMode":"SNAPSHOT","deltaRound":1,"deltaSnapshotCount":4820,"durationMs":3.4,"totalFound":4820,"candidates":[]}"""
-        )
-        assertFalse(vm.uiState.value.structProber.isProbing)
-        assertEquals(1, vm.uiState.value.structProber.deltaRound)
-        assertEquals(4820, vm.uiState.value.structProber.deltaSnapshotCount)
-
-        vm.runStructDeltaProbe(StructDeltaFilterMode.DECREASED)
-        vm.onTelemetryFromBridge(
-            "WASM",
-            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"HP","isRefine":true,"isDeltaProbe":true,"deltaMode":"DECREASED","deltaRound":2,"deltaSnapshotCount":2,"durationMs":1.1,"totalFound":2,"candidates":[{"id":"D_456_INT32","relOffsetBytes":456,"subOffsetBytes":null,"valueType":"INT32","expression":"+0x1C8 [i32]","playerDisplayValue":"240 (was 280)","playerNumericValue":240,"adjacentMaxOffsetBytes":460,"adjacentMaxValue":280,"mobPreviews":["#1=240"],"nonZeroMobCount":1}]}"""
-        )
-        assertEquals(2, vm.uiState.value.structProber.deltaRound)
-        assertEquals(2, vm.uiState.value.structProber.deltaSnapshotCount)
-        assertEquals(1, vm.uiState.value.structProber.candidates.size)
-
-        vm.onBindStructFieldCandidate(vm.uiState.value.structProber.candidates.first())
-        assertEquals(456, vm.uiState.value.structProber.schema.hp?.relOffsetBytes)
-        assertEquals(460, vm.uiState.value.structProber.schema.maxHp?.relOffsetBytes)
-
-        // 3. Probe Aggro directly on PICKED_ENTITY without needing Selected Target Slot first
+        // Selecting AGGRO preserves the ENTITY anchor rather than switching to SELECTED_TARGET
         vm.onSelectStructProbeField(WasmStructFieldKind.AGGRO)
+        assertEquals(WasmStructProbeAnchor.ENTITY, vm.uiState.value.structProber.probeAnchor)
         vm.runAggroStructProbe(isAggroedNow = false, refineExisting = false)
         assertTrue(vm.uiState.value.structProber.isProbing)
         vm.onTelemetryFromBridge(
             "WASM",
-            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"AGGRO","isRefine":false,"durationMs":0.9,"totalFound":1,"candidates":[{"id":"AG_612_UINT8","relOffsetBytes":612,"subOffsetBytes":null,"valueType":"UINT8","expression":"+0x264 [u8]","playerDisplayValue":"PASSIVE (0)","playerNumericValue":0,"mobPreviews":["#1=0"],"nonZeroMobCount":0}]}"""
+            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"AGGRO","isRefine":false,"durationMs":0.9,"totalFound":1,"candidates":[{"id":"AG_612_UINT8","relOffsetBytes":612,"subOffsetBytes":null,"valueType":"UINT8","expression":"+0x264 [u8]","playerDisplayValue":"PASSIVE (0)","playerNumericValue":0,"mobPreviews":[],"nonZeroMobCount":0}]}"""
         )
         assertFalse(vm.uiState.value.structProber.isProbing)
         assertEquals(1, vm.uiState.value.structProber.candidates.size)
 
-        // 4. Tap "Find Target Slot" for the picked mob -> jumps to Prober → Target and scans HEAPU32
-        vm.onFindTargetSlotForEntity(pickedMob)
+        // Probe HP directly on Entity A
+        vm.onSelectStructProbeField(WasmStructFieldKind.HP)
+        assertEquals(WasmStructProbeAnchor.ENTITY, vm.uiState.value.structProber.probeAnchor)
+        vm.onStructProbeInputChanged("280")
+        vm.runStructFieldProbe(refineExisting = false)
+        assertTrue(vm.uiState.value.structProber.isProbing)
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"HP","isRefine":false,"durationMs":1.2,"totalFound":1,"candidates":[{"id":"D_456_INT32","relOffsetBytes":456,"subOffsetBytes":null,"valueType":"INT32","expression":"+0x1C8 [i32]","playerDisplayValue":"280","playerNumericValue":280,"mobPreviews":[],"nonZeroMobCount":0}]}"""
+        )
+        assertFalse(vm.uiState.value.structProber.isProbing)
+        assertEquals(456, vm.uiState.value.structProber.candidates.first().relOffsetBytes)
+
+        // Probe Name directly on Entity A
+        vm.runAutoProbeEntityNames()
+        assertTrue(vm.uiState.value.structProber.isProbing)
+
+        // 2. Tap "Find Target Ptr" on Entity A -> switches to Prober -> Target and runs KNOWN_ENTITY_SCAN
+        vm.onFindSelectedTargetFromEntity(entityA)
         assertEquals(ConsoleTab.PROBER, vm.uiState.value.activeConsoleTab)
         assertEquals(ProberSubTab.TARGET_FINDER, vm.uiState.value.activeProberSubTab)
         assertTrue(vm.uiState.value.targetScanner.isScanning)
-    }
-
-    @Test
-    fun `two-pass entity scan sorts closest to furthest auto-starts live refresh and computes closer vs farther distance trends`() {
-        val vm = DiagnosticsViewModel()
-
-        // Seed live player pointer
-        vm.onTelemetryFromBridge(
-            "WASM",
-            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":8.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
-        )
-
-        // Trigger standard two-pass scan
-        vm.runStep3ScanEntities()
-        assertEquals(AsyncScanStatus.RUNNING, vm.uiState.value.scanStatus)
-
-        // Receive two-pass result intentionally out-of-order to verify strict closest->furthest sorting + auto-live
-        vm.onTelemetryFromBridge(
-            "ENTITY",
-            """{"stage":"WASM_ENTITIES_DISCOVERED","twoPass":true,"dwellMs":1200,"durationMs":1240.5,"staticFilteredCount":3420,"pass1CandidateCount":3426,"rawCandidateCount":6,"arrayPath":"window.HEAPF32 near 0x03E00000","projectionMode":"WASM Two-Pass Moving Mobs (1.2s)","viewportWidth":1080,"viewportHeight":1920,"entities":[{"name":"Moving Mob #2","id":"0x03E02400","path":"HEAPF32[16255270] @ 0x03E02498","coordByteAddress":65021080,"heapIndex":16255270,"worldX":6996.98,"worldY":100.0,"worldZ":3309.76,"deltaX":35.0,"deltaZ":0.0,"distanceToPlayer":35.0,"selfMoveDelta":2.4,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","MOVING"]},{"name":"Moving Mob #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6975.0,"worldY":100.0,"worldZ":3322.8,"deltaX":13.02,"deltaZ":13.04,"distanceToPlayer":18.5,"selfMoveDelta":1.8,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","MOVING"]}]}"""
-        )
-
-        val afterScan = vm.uiState.value
-        assertTrue(afterScan.isWasmEntitiesLivePolling) // Auto-started on two-pass discovery
-        assertEquals(3420, afterScan.lastStaticEntitiesFilteredCount)
-        assertEquals(1200, afterScan.lastEntityScanDwellMs)
-        assertTrue(afterScan.lastEntityScanCompleted)
-        assertEquals(2, afterScan.discoveredEntities.size)
-        // Strictly closest to furthest
-        assertEquals("0x03E01000", afterScan.discoveredEntities[0].id)
-        assertEquals(18.5, afterScan.discoveredEntities[0].distanceToPlayer, 0.01)
-        assertEquals("0x03E02400", afterScan.discoveredEntities[1].id)
-        assertEquals(35.0, afterScan.discoveredEntities[1].distanceToPlayer, 0.01)
-        assertTrue(afterScan.discoveredEntities[0].isConfirmedMoving)
-
-        // Receive 500ms Live tick: Mob #1 gets closer (18.5 -> 12.1), Mob #2 gets farther (35.0 -> 41.5)
-        vm.onWasmEntitiesUpdatedFromBridge(
-            """{"stage":"WASM_ENTITIES_TICK","tick":2,"entities":[{"name":"Moving Mob #2","id":"0x03E02400","path":"HEAPF32[16255270] @ 0x03E02498","coordByteAddress":65021080,"heapIndex":16255270,"worldX":7003.48,"worldY":100.0,"worldZ":3309.76,"deltaX":41.5,"deltaZ":0.0,"distanceToPlayer":41.5,"selfMoveDelta":0.6,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","MOVING"]},{"name":"Moving Mob #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6970.5,"worldY":100.0,"worldZ":3318.3,"deltaX":8.52,"deltaZ":8.54,"distanceToPlayer":12.1,"selfMoveDelta":0.9,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","MOVING"]}]}"""
-        )
-
-        val afterTick = vm.uiState.value.discoveredEntities
-        assertEquals("0x03E01000", afterTick[0].id)
-        assertTrue(afterTick[0].distanceDelta != null && afterTick[0].distanceDelta!! < -5.0) // ↓ CLOSER
-        assertEquals("0x03E02400", afterTick[1].id)
-        assertTrue(afterTick[1].distanceDelta != null && afterTick[1].distanceDelta!! > 5.0) // ↑ FARTHER
-
-        // Longer 2.5s retry scan action enters RUNNING cleanly
-        vm.runStep3ScanEntitiesLonger()
-        assertEquals(AsyncScanStatus.RUNNING, vm.uiState.value.scanStatus)
-    }
-
-    @Test
-    fun `standing on top of a mob promotes it to row zero with isStandingOnMob true tracks erratic drops and toggles walking filter`() {
-        val vm = DiagnosticsViewModel()
+        assertEquals(65015960L, vm.uiState.value.targetScanner.anchoredEntityCoordAddress)
 
         vm.onTelemetryFromBridge(
             "WASM",
-            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":8.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
+            """{"stage":"WASM_TARGET_SCAN_RESULT","action":"KNOWN_ENTITY_SCAN","fellBackToFresh":false,"entityLabel":"Small Aibatt","entityCoordByteAddress":65015960,"round":1,"durationMs":14.5,"totalCandidates":3,"candidates":[{"slotByteAddress":1270128,"slotHex":"0x00136170","currentValue":881234,"currentHex":"0x000D7252","isPointerLike":false,"nearPlayerOffsetBytes":88,"matchedEntityId":"0x03E01000","matchedEntityName":"Small Aibatt","resolvedCoordAddress":65015960,"resolvedX":6970.0,"resolvedY":100.0,"resolvedZ":3315.0,"previewName":"Small Aibatt","previewHp":280,"previewMaxHp":280,"previewAggroRaw":0,"matchReason":"Entity ID (mob-0x90)","entityIdRelOffsetBytes":-144,"score":1580}]}"""
         )
+        assertFalse(vm.uiState.value.targetScanner.isScanning)
+        assertEquals(1, vm.uiState.value.targetScanner.scanRound)
+        assertEquals(3, vm.uiState.value.targetScanner.totalCandidates)
+        val firstCand = vm.uiState.value.targetScanner.candidates.first()
+        assertEquals("Entity ID (mob-0x90)", firstCand.matchReason)
+        assertEquals(-144, firstCand.entityIdRelOffsetBytes)
 
-        // Initial anti-thrash spatial scan returns 2 stable mobs + reports 412 erratic/jittery floats dropped
+        // 3. Target Entity B in-game and run "Find Target Ptr" on Entity B -> narrows via KNOWN_ENTITY_NARROW
+        vm.onFindSelectedTargetFromEntity(entityB)
+        assertTrue(vm.uiState.value.targetScanner.isScanning)
+        assertEquals(65020056L, vm.uiState.value.targetScanner.anchoredEntityCoordAddress)
         vm.onTelemetryFromBridge(
-            "ENTITY",
-            """{"stage":"WASM_ENTITIES_DISCOVERED","twoPass":true,"movingOnly":false,"dwellMs":360,"durationMs":395.2,"erraticDroppedCount":412,"staticFilteredCount":0,"arrayPath":"window.HEAPF32 near 0x03E00000","projectionMode":"WASM Anti-Thrash Spatial (0..250u)","viewportWidth":1080,"viewportHeight":1920,"entities":[{"name":"WASM Entity #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6970.0,"worldY":100.0,"worldZ":3309.76,"deltaX":8.02,"deltaZ":0.0,"distanceToPlayer":8.02,"selfMoveDelta":0.0,"isConfirmedMoving":false,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","STABLE"]},{"name":"WASM Entity #2","id":"0x03E02400","path":"HEAPF32[16255270] @ 0x03E02498","coordByteAddress":65021080,"heapIndex":16255270,"worldX":6986.98,"worldY":100.0,"worldZ":3309.76,"deltaX":25.0,"deltaZ":0.0,"distanceToPlayer":25.0,"selfMoveDelta":0.8,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","WALKING"]}]}"""
+            "WASM",
+            """{"stage":"WASM_TARGET_SCAN_RESULT","action":"KNOWN_ENTITY_NARROW","fellBackToFresh":false,"entityLabel":"Mushpang","entityCoordByteAddress":65020056,"round":2,"durationMs":1.1,"totalCandidates":1,"candidates":[{"slotByteAddress":1270128,"slotHex":"0x00136170","currentValue":881999,"currentHex":"0x000D754F","isPointerLike":false,"nearPlayerOffsetBytes":88,"matchedEntityId":"0x03E02000","matchedEntityName":"Mushpang","resolvedCoordAddress":65020056,"resolvedX":6982.0,"resolvedY":100.0,"resolvedZ":3322.0,"previewName":"Mushpang","previewHp":350,"previewMaxHp":350,"previewAggroRaw":0,"matchReason":"Entity ID (mob-0x90)","entityIdRelOffsetBytes":-144,"score":2080}]}"""
         )
-        assertEquals(412, vm.uiState.value.lastErraticEntitiesDroppedCount)
-        assertEquals("0x03E01000", vm.uiState.value.discoveredEntities[0].id)
-        assertFalse(vm.uiState.value.discoveredEntities[0].isStandingOnMob)
+        assertFalse(vm.uiState.value.targetScanner.isScanning)
+        assertEquals(2, vm.uiState.value.targetScanner.scanRound)
+        assertEquals(1, vm.uiState.value.targetScanner.totalCandidates)
+        assertEquals(1270128L, vm.uiState.value.targetScanner.candidates.first().slotByteAddress)
 
-        // Player walks right on top of Entity #2 (distance drops to 1.2u <= 4.0u) -> promotes to Row #0 with isStandingOnMob = true!
-        vm.onWasmEntitiesUpdatedFromBridge(
-            """{"stage":"WASM_ENTITIES_TICK","tick":3,"entities":[{"name":"WASM Entity #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6970.0,"worldY":100.0,"worldZ":3309.76,"deltaX":-16.0,"deltaZ":0.0,"distanceToPlayer":16.0,"selfMoveDelta":0.0,"isConfirmedMoving":false,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","STABLE"]},{"name":"WASM Entity #2","id":"0x03E02400","path":"HEAPF32[16255270] @ 0x03E02498","coordByteAddress":65021080,"heapIndex":16255270,"worldX":6986.98,"worldY":100.0,"worldZ":3309.76,"deltaX":1.2,"deltaZ":0.0,"distanceToPlayer":1.2,"selfMoveDelta":0.2,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","WALKING"]}]}"""
-        )
-        val topEntity = vm.uiState.value.discoveredEntities.first()
-        assertEquals("0x03E02400", topEntity.id)
-        assertTrue(topEntity.isStandingOnMob)
-        assertTrue(topEntity.distanceDelta != null && topEntity.distanceDelta!! < -20.0)
-
-        // Toggle All Stable <-> Walking Only filter cleanly
-        assertFalse(vm.uiState.value.showWalkingEntitiesOnly)
-        vm.onToggleShowWalkingEntitiesOnly()
-        assertTrue(vm.uiState.value.showWalkingEntitiesOnly)
-        vm.onToggleShowWalkingEntitiesOnly()
-        assertFalse(vm.uiState.value.showWalkingEntitiesOnly)
+        // 4. Lock the discovered ID-based target slot
+        vm.onLockSelectedTargetSlot(1270128L)
+        assertTrue(vm.uiState.value.targetScanner.isWatchingTarget)
+        assertEquals(1270128L, vm.uiState.value.targetScanner.lockedSlotAddress)
     }
 }
+
+
+
+
+

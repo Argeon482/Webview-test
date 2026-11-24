@@ -347,117 +347,84 @@ class ExampleUnitTest {
   }
 
   @Test
-  fun pickedEntityDeltaProberAndReverseTargetSlotScriptsAreNonBlockingAndStrictlyReadOnly() {
-    val snapScript = WasmStructProberScripts.buildStructDeltaProbeScript(
-      fieldKind = WasmStructFieldKind.HP,
-      anchorByteAddress = 65015960L,
-      mode = StructDeltaFilterMode.SNAPSHOT,
-      anchorIsTarget = false,
-      useDirectAnchorAddress = true
-    )
-    val dropScript = WasmStructProberScripts.buildStructDeltaProbeScript(
-      fieldKind = WasmStructFieldKind.HP,
-      anchorByteAddress = 65015960L,
-      mode = StructDeltaFilterMode.DECREASED,
-      anchorIsTarget = false,
-      useDirectAnchorAddress = true
-    )
-    val sameScript = WasmStructProberScripts.buildStructDeltaProbeScript(
-      fieldKind = WasmStructFieldKind.HP,
-      anchorByteAddress = 65015960L,
-      mode = StructDeltaFilterMode.UNCHANGED,
-      anchorIsTarget = false,
-      useDirectAnchorAddress = true
-    )
-    val riseScript = WasmStructProberScripts.buildStructDeltaProbeScript(
-      fieldKind = WasmStructFieldKind.HP,
-      anchorByteAddress = 65015960L,
-      mode = StructDeltaFilterMode.INCREASED,
-      anchorIsTarget = false,
-      useDirectAnchorAddress = true
-    )
-    val reverseTargetScript = WasmSelectedTargetScripts.buildFindTargetSlotForEntityScript(
+  fun knownEntityTargetFinderAndExactEntityProberScriptsAreNonBlockingAndStrictlyReadOnly() {
+    val freshKnownEntityScript = WasmSelectedTargetScripts.buildFindTargetFromKnownEntityScript(
       entityCoordByteAddress = 65015960L,
+      entityStructByteAddress = 65015808L,
       playerByteAddress = 65011712L,
-      entityLabel = "Small Aibatt"
+      entityLabel = "Small Aibatt",
+      refineExisting = false
+    )
+    val narrowKnownEntityScript = WasmSelectedTargetScripts.buildFindTargetFromKnownEntityScript(
+      entityCoordByteAddress = 65020056L,
+      entityStructByteAddress = 65019904L,
+      playerByteAddress = 65011712L,
+      entityLabel = "Mushpang",
+      refineExisting = true
+    )
+    val lockIdSlotScript = WasmSelectedTargetScripts.buildLockTargetSlotScript(
+      slotByteAddress = 1270128L,
+      playerByteAddress = 65011712L,
+      entityIdRelOffsetBytes = -144
+    )
+    val exactStatProbeScript = WasmStructProberScripts.buildProbeStatOffsetsScript(
+      fieldKind = WasmStructFieldKind.HP,
+      playerByteAddress = 65015960L,
+      targetValue = 280.0,
+      anchorIsTarget = false,
+      exactAnchorOverride = true
+    )
+    val exactNameProbeScript = WasmStructProberScripts.buildProbeNameOffsetsScript(
+      playerByteAddress = 65015960L,
+      nameQuery = "Aibatt",
+      anchorIsTarget = false,
+      exactAnchorOverride = true
+    )
+    val exactAggroProbeScript = WasmStructProberScripts.buildProbeAggroOffsetsScript(
+      targetAnchorByteAddress = 65015960L,
+      playerByteAddress = 65011712L,
+      isAggroedNow = true,
+      exactAnchorOverride = true
     )
 
-    assertTrue(snapScript.contains("isDeltaProbe: true"))
-    assertTrue(snapScript.contains("deltaMode: 'SNAPSHOT'"))
-    assertTrue(snapScript.contains("65015960"))
-    assertTrue(dropScript.contains("deltaMode: 'DECREASED'"))
-    assertTrue(sameScript.contains("deltaMode: 'UNCHANGED'"))
-    assertTrue(riseScript.contains("deltaMode: 'INCREASED'"))
+    // Non-blocking 1 MB slices + direct pointer & Entity-ID matching + 2-entity narrowing fallback
+    assertTrue(freshKnownEntityScript.contains("(async function()"))
+    assertTrue(freshKnownEntityScript.contains("const CHUNK = 262144;"))
+    assertTrue(freshKnownEntityScript.contains("await __tsYield(12)"))
+    assertTrue(freshKnownEntityScript.contains("KNOWN_ENTITY_SCAN"))
+    assertTrue(freshKnownEntityScript.contains("entityIdRelMap"))
+    assertTrue(freshKnownEntityScript.contains("Exact Entity Struct Ptr"))
+    assertTrue(freshKnownEntityScript.contains("Entity ID (mob"))
+    assertTrue(narrowKnownEntityScript.contains("const canNarrow = true &&"))
+    assertTrue(narrowKnownEntityScript.contains("KNOWN_ENTITY_NARROW"))
+    assertTrue(narrowKnownEntityScript.contains("fellBackToFresh = true"))
+    assertTrue(lockIdSlotScript.contains("__tsState.entityIdRelOffset = -144;"))
 
-    assertTrue(reverseTargetScript.contains("(async function()"))
-    assertTrue(reverseTargetScript.contains("ENTITY_REVERSE_FIND"))
-    assertTrue(reverseTargetScript.contains("65015960"))
-    assertTrue(reverseTargetScript.contains("Small Aibatt"))
+    // Exact entity anchor override uses entity address directly without player/target override
+    assertTrue(exactStatProbeScript.contains("if (true)"))
+    assertTrue(exactStatProbeScript.contains("playerAddr = 65015960;"))
+    assertTrue(exactNameProbeScript.contains("if (true)"))
+    assertTrue(exactNameProbeScript.contains("playerAddr = 65015960;"))
+    assertTrue(exactAggroProbeScript.contains("const anchorAddr = true ? 65015960"))
 
     // Strictly read-only: zero writes to WASM linear memory and zero synthetic input events
     val heapWriteRegex = Regex("""(hf32|hu32|h32|h16|u8|heapF32|heapU32|heap32|heap16|heapU8|HEAPF32|HEAPU32|HEAP32|HEAPU8)\[[^\]]+]\s*=(?!=)""")
     val syntheticInputRegex = Regex("""(dispatchEvent|MouseEvent|PointerEvent|TouchEvent|KeyboardEvent)""")
-    listOf(snapScript, dropScript, sameScript, riseScript, reverseTargetScript).forEach { script ->
+    listOf(
+      freshKnownEntityScript,
+      narrowKnownEntityScript,
+      lockIdSlotScript,
+      exactStatProbeScript,
+      exactNameProbeScript,
+      exactAggroProbeScript
+    ).forEach { script ->
       assertFalse("Must not write to WASM heap", heapWriteRegex.containsMatchIn(script))
       assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
     }
-  }
-
-  @Test
-  fun antiThrashEntityScannerRejectsErraticScratchpadsKeepsStandingAndWalkingMobsAndIsReadOnly() {
-    val scanDefault = WasmPointerAndEntityScripts.buildScanWasmNearbyEntitiesScript(
-      playerByteAddress = 65011712L,
-      playerX = 6961.98,
-      playerY = 100.0,
-      playerZ = 3309.76,
-      structCoordOffset = 152
-    )
-    val scanMovingOnly = WasmPointerAndEntityScripts.buildScanWasmNearbyEntitiesScript(
-      playerByteAddress = 65011712L,
-      playerX = 6961.98,
-      playerY = 100.0,
-      playerZ = 3309.76,
-      structCoordOffset = 152,
-      dwellMs = 1200,
-      movingOnly = true
-    )
-    val liveTick = WasmPointerAndEntityScripts.buildStartWasmEntitiesLiveRefreshScript()
-
-    // Full-heap TypedArrays (no 2,000-hit cutoff) & 0.0u minRadius so standing-on-mob is included
-    assertTrue(scanDefault.contains("const MAX_PASS1_SNAP = 200000;"))
-    assertFalse(scanDefault.contains("MAX_RAW_HITS = 2000"))
-    assertTrue(scanDefault.contains("const MIN_R = Number(0.0);"))
-    assertTrue(scanDefault.contains("const MOVING_ONLY = false;"))
-    assertTrue(scanMovingOnly.contains("const MOVING_ONLY = true;"))
-    assertTrue(scanMovingOnly.contains("const DWELL_MS = 1200;"))
-
-    // 3-sample anti-thrash & ping-pong bounce rejection + player-clone subtraction + live erratic auto-pruning
-    assertTrue(scanDefault.contains("MAX_STEP_PER_HALF"))
-    assertTrue(scanDefault.contains("dotXZ < -0.25 * step1 * step2"))
-    assertTrue(scanDefault.contains("erraticDroppedCount"))
-    assertTrue(scanDefault.contains("structScore"))
-    assertTrue(scanDefault.contains("deltaX:"))
-    assertTrue(scanDefault.contains("deltaZ:"))
-    assertTrue(liveTick.contains("erraticStrikes"))
-    assertTrue(liveTick.contains("t.dropped = true"))
-    assertTrue(liveTick.contains("distanceDelta: distDelta"))
-
-    // Strictly read-only: zero writes to WASM linear memory and zero synthetic input events
-    val heapWriteRegex = Regex("""(hf32|hu32|h32|h16|u8|heapF32|heapU32|heap32|heap16|heapU8|HEAPF32|HEAPU32|HEAP32|HEAPU8)\[[^\]]+]\s*=(?!=)""")
-    val syntheticInputRegex = Regex("""(dispatchEvent|MouseEvent|PointerEvent|TouchEvent|KeyboardEvent)""")
-    listOf(scanDefault, scanMovingOnly, liveTick).forEach { script ->
-      assertFalse("Must not write to WASM heap", heapWriteRegex.containsMatchIn(script))
-      assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
-    }
-
-    // 8-point compass direction arrow helper
-    assertEquals("↑ N", com.example.ui.formatCompassArrowLabel(0.0, 10.0))
-    assertEquals("↗ NE", com.example.ui.formatCompassArrowLabel(10.0, 10.0))
-    assertEquals("→ E", com.example.ui.formatCompassArrowLabel(10.0, 0.0))
-    assertEquals("↘ SE", com.example.ui.formatCompassArrowLabel(10.0, -10.0))
-    assertEquals("↓ S", com.example.ui.formatCompassArrowLabel(0.0, -10.0))
-    assertEquals("↙ SW", com.example.ui.formatCompassArrowLabel(-10.0, -10.0))
-    assertEquals("← W", com.example.ui.formatCompassArrowLabel(-10.0, 0.0))
-    assertEquals("↖ NW", com.example.ui.formatCompassArrowLabel(-10.0, 10.0))
   }
 }
+
+
+
+
+

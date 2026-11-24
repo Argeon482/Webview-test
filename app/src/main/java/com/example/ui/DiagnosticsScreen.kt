@@ -511,8 +511,6 @@ private fun WiredTelemetryConsolePanel(
         onRunStep2A = viewModel::runStep2ACaptureBaseline,
         onRunStep2B = viewModel::runStep2BComputeDelta,
         onRunStep3 = viewModel::runStep3ScanEntities,
-        onRunStep3Longer = viewModel::runStep3ScanEntitiesLonger,
-        onToggleShowWalkingEntitiesOnly = viewModel::onToggleShowWalkingEntitiesOnly,
         onExportReport = {
             viewModel.requestExportReport(
                 context = context,
@@ -580,8 +578,10 @@ private fun WiredTelemetryConsolePanel(
         onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
         onToggleTrackEntity = viewModel::onToggleTrackEntityForLocationVerify,
         onClearTrackedEntity = viewModel::onClearTrackedEntity,
-        onProbeEntityFromList = viewModel::onSelectEntityAsProbeAnchor,
-        onFindTargetSlotForEntity = viewModel::onFindTargetSlotForEntity,
+        onProbeSpecificEntity = viewModel::onProbeSpecificEntity,
+        onFindTargetFromEntity = { entity, forceFresh ->
+            viewModel.onFindSelectedTargetFromEntity(entity = entity, forceFresh = forceFresh)
+        },
         onCaptureSelectedTarget = viewModel::onCaptureSelectedTarget,
         onFilterSelectedTarget = viewModel::onFilterSelectedTarget,
         onLockSelectedTargetSlot = viewModel::onLockSelectedTargetSlot,
@@ -599,10 +599,6 @@ private fun WiredTelemetryConsolePanel(
         onRunStructRefine = {
             onClearFocus()
             viewModel.runStructFieldProbe(refineExisting = true)
-        },
-        onRunStructDeltaProbe = { mode ->
-            onClearFocus()
-            viewModel.runStructDeltaProbe(mode)
         },
         onRunAutoProbeNames = {
             onClearFocus()

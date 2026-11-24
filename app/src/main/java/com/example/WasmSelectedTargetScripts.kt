@@ -267,6 +267,46 @@ object WasmSelectedTargetScripts {
             }
           }
 
+          // 1B. Check Entity-ID match against tracked entities (supports games that store target OBJID instead of raw pointer)
+          if (targetVal >= 64 && targetVal <= 0x0FFFFFFF && tracked.length > 0) {
+            const knownIdOff = (window.__wvTargetScan && typeof window.__wvTargetScan.entityIdRelOffset === 'number')
+              ? window.__wvTargetScan.entityIdRelOffset
+              : null;
+            for (let i = 0; i < tracked.length; i++) {
+              const t = tracked[i];
+              if (!t || !t.byteAddr || t.byteAddr <= 0) continue;
+              let matched = false;
+              if (knownIdOff !== null) {
+                const checkA = t.byteAddr + knownIdOff;
+                if (checkA > 0 && (checkA & 3) === 0 && (checkA >>> 2) < heaps.heapU32.length) {
+                  if ((heaps.heapU32[checkA >>> 2] >>> 0) === targetVal) matched = true;
+                }
+              } else {
+                const startA = Math.max(4, t.byteAddr - 256) & ~3;
+                const endA = Math.min(heaps.byteLength - 4, t.byteAddr + 64) & ~3;
+                for (let a = startA; a <= endA; a += 4) {
+                  if (a >= t.byteAddr && a <= t.byteAddr + 8) continue;
+                  if ((heaps.heapU32[a >>> 2] >>> 0) === targetVal) {
+                    matched = true;
+                    break;
+                  }
+                }
+              }
+              if (matched) {
+                const fIdx = t.byteAddr >>> 2;
+                const x = (fIdx + 2 < heaps.heapF32.length) ? heaps.heapF32[fIdx] : null;
+                const y = (fIdx + 2 < heaps.heapF32.length) ? heaps.heapF32[fIdx + 1] : null;
+                const z = (fIdx + 2 < heaps.heapF32.length) ? heaps.heapF32[fIdx + 2] : null;
+                return {
+                  matchedEntityId: t.id || null,
+                  matchedEntityName: t.name || null,
+                  coordAddr: t.byteAddr,
+                  x: x, y: y, z: z
+                };
+              }
+            }
+          }
+
           // 2. If targetVal is a plausible heap pointer, locate nearby world Vec3 inside [targetVal - 256 .. targetVal + 768]
           if (targetVal >= 4096 && (targetVal & 3) === 0 && targetVal + 12 < heaps.byteLength && playerInfo.hasCoords) {
             const hf32 = heaps.heapF32;
@@ -305,6 +345,7 @@ object WasmSelectedTargetScripts {
           prevValues: null,
           prevCount: 0,
           lockedSlotAddr: 0,
+          entityIdRelOffset: null,
           pollId: null,
           tick: 0,
           lastResolvedAddr: 0,
@@ -353,7 +394,7 @@ object WasmSelectedTargetScripts {
               if (tracked[i].byteAddr > maxEnt) maxEnt = tracked[i].byteAddr;
             }
 
-            __tsStatus('RUNNING', 'Target Finder: scanning full HEAPU32 for target pointer slots…');
+            __tsStatus('RUNNING', 'Target Finder: capturing candidate pointer slots (Mob A)…');
 
             const MAX_SLOTS = 900000;
             const capIdx = new Int32Array(MAX_SLOTS);
@@ -363,49 +404,25 @@ object WasmSelectedTargetScripts {
             const CHUNK = 262144; // 1 MB per slice
             const START_IDX = len > 4096 ? 64 : 0;
             const playerMin = playerAddr > 4096 ? (playerAddr - 4096) : 0;
-            const playerMax = playerAddr > 0 ? Math.min(byteLen - 4, playerAddr + 16384) : 0;
-            const STATIC_LIMIT_BYTES = Math.min(byteLen, 12 * 1024 * 1024);
+            const playerMax = playerAddr > 0 ? Math.min(byteLen - 4, playerAddr + 12288) : 0;
 
-            // Always inspect 100% of HEAPU32: capture (a) ANY pointer pointing near a tracked entity,
-            // (b) slots near player struct, and (c) static/global pointer slots without premature cutoff.
-            const hasTracked = tracked.length > 0;
-            for (let base = START_IDX; base < len; base += CHUNK) {
+            for (let base = START_IDX; base < len && count < MAX_SLOTS; base += CHUNK) {
               if (mySeq !== __tsState.scanSeq) return;
               const end = Math.min(base + CHUNK, len);
-              for (let i = base; i < end; i++) {
+              for (let i = base; i < end && count < MAX_SLOTS; i++) {
                 const v = hu32[i] >>> 0;
                 if (v === 0) continue;
                 const slotAddr = i * 4;
                 const isPtr = (v >= 4096 && v < byteLen && (v & 3) === 0);
-                let matchesTracked = false;
-                if (isPtr && hasTracked && v >= (minEnt > 1024 ? minEnt - 1024 : 0) && v <= maxEnt + 256) {
-                  for (let e = 0; e < tracked.length; e++) {
-                    const diff = tracked[e].byteAddr - v;
-                    if (diff >= -128 && diff <= 1024) {
-                      // Skip self-pointers inside the entity's own struct
-                      if (Math.abs(slotAddr - tracked[e].byteAddr) > 1024) {
-                        matchesTracked = true;
-                        break;
-                      }
-                    }
-                  }
-                }
                 const nearPlayer = (playerAddr > 0 && slotAddr >= playerMin && slotAddr <= playerMax);
-                const inStatic = (slotAddr < STATIC_LIMIT_BYTES);
-
-                if (matchesTracked || nearPlayer) {
-                  if (count < MAX_SLOTS) {
-                    capIdx[count] = i;
-                    capVal[count] = v;
-                    count++;
-                  }
-                } else if (isPtr && inStatic && count < MAX_SLOTS - 50000) {
+                // Keep valid heap pointers anywhere in memory + plausible small entity IDs inside player struct
+                if (isPtr || (nearPlayer && v > 0 && v < 100000000)) {
                   capIdx[count] = i;
                   capVal[count] = v;
                   count++;
                 }
               }
-              if (end < len) {
+              if (end < len && count < MAX_SLOTS) {
                 await __tsYield(12);
               }
             }
@@ -627,15 +644,296 @@ object WasmSelectedTargetScripts {
     }
 
     /**
+     * Known-Entity Selected Target Finder (Strictly Read-Only):
+     * Uses a specific mob already located via the Entities list (`entityCoordByteAddress` &
+     * `entityStructByteAddress`) that the player currently has targeted in-game to directly find
+     * every `HEAPU32` slot holding either:
+     *  1. A pointer into that mob's struct (`[minBase - 2048 .. maxBase + 256]`), OR
+     *  2. A matching Entity ID (`uint32` in `[64 .. 0x0FFFFFFF]`) read from that mob's header and
+     *     referenced near the Player struct (`±8KB`) or in static/global memory (`<4MB`).
+     *
+     * When [refineExisting] is `true` and a prior scan already holds candidate slots, first narrows
+     * existing slots to those now referencing this newly targeted entity (2-entity intersection).
+     * Automatically falls back to a fresh scan for this entity if zero prior slots overlap.
+     */
+    fun buildFindTargetFromKnownEntityScript(
+        entityCoordByteAddress: Long,
+        entityStructByteAddress: Long,
+        playerByteAddress: Long,
+        entityLabel: String,
+        refineExisting: Boolean = false
+    ): String {
+        val safeCoord = entityCoordByteAddress.coerceAtLeast(0L)
+        val safeStruct = entityStructByteAddress.coerceAtLeast(0L)
+        val safePlayer = playerByteAddress.coerceAtLeast(0L)
+        val escapedLabel = quoteJsString(entityLabel.ifBlank { "Entity" })
+        val refineExpr = if (refineExisting) "true" else "false"
+        return """
+        (async function() {
+          try {
+            $TARGET_HEAP_HELPERS
+            const heaps = __tsResolveHeaps();
+            if (!heaps || $safeCoord <= 0) {
+              __tsEmit('WASM', {
+                stage: 'WASM_TARGET_SCAN_RESULT',
+                action: 'KNOWN_ENTITY_SCAN',
+                round: __tsState.round || 0,
+                error: 'Could not locate WASM heap or valid entity coordinate address.',
+                totalCandidates: 0,
+                candidates: []
+              });
+              return;
+            }
+
+            const mySeq = ++__tsState.scanSeq;
+            const startMs = performance.now();
+            const hu32 = heaps.heapU32;
+            const len = hu32.length;
+            const byteLen = heaps.byteLength;
+            const playerInfo = __tsResolveLivePlayer($safePlayer, heaps);
+            const playerAddr = playerInfo.addr;
+            const coordAddr = $safeCoord;
+            const structOff = (window.__wvWasmEntities && window.__wvWasmEntities.structOffset)
+              ? (window.__wvWasmEntities.structOffset | 0)
+              : 0;
+            const inferredBase = (structOff > 0 && coordAddr > structOff) ? (coordAddr - structOff) : coordAddr;
+            const structAddr = ($safeStruct > 0 && $safeStruct < byteLen) ? $safeStruct : inferredBase;
+
+            const lowAnchor = Math.min(structAddr, coordAddr);
+            const highAnchor = Math.max(structAddr, coordAddr);
+            const ptrMin = Math.max(4096, lowAnchor - 2048);
+            const ptrMax = Math.min(byteLen - 4, highAnchor + 256);
+            const selfMin = Math.max(0, lowAnchor - 2048);
+            const selfMax = Math.min(byteLen, highAnchor + 4096);
+
+            // Read candidate Entity IDs from this located entity's header [-512 .. +128]
+            const entityIdRelMap = {};
+            const idStart = Math.max(4, lowAnchor - 512) & ~3;
+            const idEnd = Math.min(byteLen - 4, highAnchor + 128) & ~3;
+            for (let a = idStart; a <= idEnd; a += 4) {
+              if (a >= coordAddr && a <= coordAddr + 8) continue;
+              const v = hu32[a >>> 2] >>> 0;
+              if (v >= 64 && v <= 0x0FFFFFFF) {
+                const looksLikePtr = (v >= 4096 && v < byteLen && (v & 3) === 0);
+                if (!looksLikePtr && entityIdRelMap[v] === undefined) {
+                  entityIdRelMap[v] = (a - coordAddr);
+                }
+              }
+            }
+
+            const isPointerToEntity = function(v) {
+              return (v >= ptrMin && v <= ptrMax && (v & 3) === 0);
+            };
+
+            let matchedIndices = [];
+            let matchedValues = [];
+            let matchedReasons = [];
+            let matchedIdOffsets = [];
+            let usedAction = 'KNOWN_ENTITY_SCAN';
+            let fellBackToFresh = false;
+
+            const canNarrow = $refineExpr && __tsState.slotIndices && __tsState.prevCount > 0;
+            if (canNarrow) {
+              const prevIdx = __tsState.slotIndices;
+              const prevVal = __tsState.prevValues;
+              const prevCount = __tsState.prevCount;
+              for (let i = 0; i < prevCount; i++) {
+                const slotIdx = prevIdx[i];
+                if (slotIdx < 0 || slotIdx >= len) continue;
+                const slotAddr = slotIdx * 4;
+                if (slotAddr >= selfMin && slotAddr <= selfMax) continue;
+                const oldV = prevVal[i] >>> 0;
+                const curV = hu32[slotIdx] >>> 0;
+                if (curV === 0 || curV === 0xFFFFFFFF || curV === oldV) continue;
+
+                if (isPointerToEntity(curV)) {
+                  const delta = curV - structAddr;
+                  const reason = (curV === structAddr)
+                    ? 'Exact Entity Struct Ptr'
+                    : ((curV === coordAddr) ? 'Exact Entity Coord Ptr' : ('Entity Ptr (' + (delta >= 0 ? '+0x' : '-0x') + Math.abs(delta).toString(16).toUpperCase() + ')'));
+                  matchedIndices.push(slotIdx);
+                  matchedValues.push(curV);
+                  matchedReasons.push(reason);
+                  matchedIdOffsets.push(null);
+                } else if (entityIdRelMap[curV] !== undefined) {
+                  const relOff = entityIdRelMap[curV];
+                  const signHex = (relOff >= 0 ? '+0x' : '-0x') + Math.abs(relOff).toString(16).toUpperCase();
+                  matchedIndices.push(slotIdx);
+                  matchedValues.push(curV);
+                  matchedReasons.push('Entity ID (mob' + signHex + ')');
+                  matchedIdOffsets.push(relOff);
+                }
+              }
+              if (matchedIndices.length > 0) {
+                usedAction = 'KNOWN_ENTITY_NARROW';
+              } else {
+                fellBackToFresh = true;
+              }
+            }
+
+            if (matchedIndices.length === 0) {
+              // Fresh non-blocking 1 MB sliced read-only scan anchored to this exact entity
+              const MAX_RAW = 4096;
+              const idOccurrences = {};
+              const rawIdHits = [];
+              const CHUNK = 262144;
+              const START_IDX = len > 4096 ? 256 : 0;
+
+              for (let base = START_IDX; base < len; base += CHUNK) {
+                if (mySeq !== __tsState.scanSeq) return;
+                const end = Math.min(base + CHUNK, len);
+                for (let idx = base; idx < end; idx++) {
+                  const slotAddr = idx * 4;
+                  if (slotAddr >= selfMin && slotAddr <= selfMax) continue;
+                  const v = hu32[idx] >>> 0;
+                  if (v === 0 || v === 0xFFFFFFFF) continue;
+
+                  if (isPointerToEntity(v)) {
+                    if (matchedIndices.length < MAX_RAW) {
+                      const delta = v - structAddr;
+                      const reason = (v === structAddr)
+                        ? 'Exact Entity Struct Ptr'
+                        : ((v === coordAddr) ? 'Exact Entity Coord Ptr' : ('Entity Ptr (' + (delta >= 0 ? '+0x' : '-0x') + Math.abs(delta).toString(16).toUpperCase() + ')'));
+                      matchedIndices.push(slotIdxOrIdx(idx));
+                      matchedValues.push(v);
+                      matchedReasons.push(reason);
+                      matchedIdOffsets.push(null);
+                    }
+                  } else if (entityIdRelMap[v] !== undefined) {
+                    const nearPlayer = (playerAddr > 0 && Math.abs(slotAddr - playerAddr) <= 8192);
+                    const isStatic = (slotAddr < 4 * 1024 * 1024);
+                    if (nearPlayer || isStatic) {
+                      idOccurrences[v] = (idOccurrences[v] || 0) + 1;
+                      if (idOccurrences[v] <= 12 && rawIdHits.length < 1024) {
+                        rawIdHits.push({ idx: idx, v: v, relOff: entityIdRelMap[v] });
+                      }
+                    }
+                  }
+                }
+                if (end < len) {
+                  await __tsYield(12);
+                }
+              }
+
+              if (mySeq !== __tsState.scanSeq) return;
+
+              // Append non-noisy Entity-ID hits (values appearing <= 10 times in static/player regions)
+              for (let k = 0; k < rawIdHits.length; k++) {
+                const h = rawIdHits[k];
+                if ((idOccurrences[h.v] || 0) <= 10 && matchedIndices.length < MAX_RAW) {
+                  const signHex = (h.relOff >= 0 ? '+0x' : '-0x') + Math.abs(h.relOff).toString(16).toUpperCase();
+                  matchedIndices.push(h.idx);
+                  matchedValues.push(h.v);
+                  matchedReasons.push('Entity ID (mob' + signHex + ')');
+                  matchedIdOffsets.push(h.relOff);
+                }
+              }
+            }
+
+            function slotIdxOrIdx(x) { return x; }
+
+            const totalFound = matchedIndices.length;
+            const nextIdx = new Int32Array(totalFound);
+            const nextVal = new Uint32Array(totalFound);
+            for (let i = 0; i < totalFound; i++) {
+              nextIdx[i] = matchedIndices[i];
+              nextVal[i] = matchedValues[i];
+            }
+
+            __tsState.round = (usedAction === 'KNOWN_ENTITY_NARROW') ? ((__tsState.round || 1) + 1) : 1;
+            __tsState.slotIndices = nextIdx;
+            __tsState.prevValues = nextVal;
+            __tsState.prevCount = totalFound;
+
+            const decoded = __tsReadSchema(coordAddr, heaps);
+            const fIdx = coordAddr >>> 2;
+            const ex = (fIdx + 2 < heaps.heapF32.length) ? Number(heaps.heapF32[fIdx].toFixed(3)) : null;
+            const ey = (fIdx + 2 < heaps.heapF32.length) ? Number(heaps.heapF32[fIdx + 1].toFixed(3)) : null;
+            const ez = (fIdx + 2 < heaps.heapF32.length) ? Number(heaps.heapF32[fIdx + 2].toFixed(3)) : null;
+
+            const scored = [];
+            for (let i = 0; i < totalFound; i++) {
+              const slotAddr = matchedIndices[i] * 4;
+              const curV = matchedValues[i] >>> 0;
+              const reason = matchedReasons[i];
+              const idRelOff = matchedIdOffsets[i];
+              const isPtr = (idRelOff === null);
+              const nearOff = (playerAddr > 0 && Math.abs(slotAddr - playerAddr) <= 16384) ? (slotAddr - playerAddr) : null;
+
+              let score = 0;
+              if (curV === structAddr) score += 1600;
+              else if (curV === coordAddr) score += 1500;
+              else if (isPtr) score += 900;
+              else score += 550;
+
+              if (nearOff !== null) score += 750;
+              if (slotAddr < 4 * 1024 * 1024) score += 280;
+              if (usedAction === 'KNOWN_ENTITY_NARROW') score += 500;
+
+              scored.push({
+                score: score,
+                slotByteAddress: slotAddr,
+                slotHex: __tsFormatHex(slotAddr),
+                currentValue: curV,
+                currentHex: __tsFormatHex(curV),
+                isPointerLike: isPtr,
+                nearPlayerOffsetBytes: nearOff,
+                matchedEntityId: __tsFormatHex(structAddr),
+                matchedEntityName: $escapedLabel,
+                resolvedCoordAddress: coordAddr,
+                resolvedX: ex,
+                resolvedY: ey,
+                resolvedZ: ez,
+                previewName: decoded.name || $escapedLabel,
+                previewHp: (typeof decoded.hp === 'number') ? decoded.hp : null,
+                previewMaxHp: (typeof decoded.maxHp === 'number') ? decoded.maxHp : null,
+                previewAggroRaw: (typeof decoded.aggro === 'number') ? decoded.aggro : null,
+                matchReason: reason,
+                entityIdRelOffsetBytes: idRelOff
+              });
+            }
+
+            scored.sort(function(a, b) {
+              if (b.score !== a.score) return b.score - a.score;
+              return a.slotByteAddress - b.slotByteAddress;
+            });
+
+            const durationMs = Number((performance.now() - startMs).toFixed(1));
+            __tsStatus('COMPLETED', 'Entity Target Finder: ' + totalFound + ' slot(s) (' + durationMs + 'ms)');
+            __tsEmit('WASM', {
+              stage: 'WASM_TARGET_SCAN_RESULT',
+              action: usedAction,
+              fellBackToFresh: fellBackToFresh,
+              entityLabel: $escapedLabel,
+              entityCoordByteAddress: coordAddr,
+              round: __tsState.round,
+              durationMs: durationMs,
+              totalCandidates: totalFound,
+              candidates: scored.slice(0, 32)
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.logTelemetry('ERR', 'Known-entity target scan error: ' + String(err));
+              }
+            } catch (_) {}
+          }
+        })();
+        """.trimIndent()
+    }
+
+    /**
      * Locks onto a discovered selected-target memory slot and starts a strictly read-only 200ms
      * live watcher that decodes the currently targeted mob's address, coordinates, Name, HP, and Aggro status.
      */
     fun buildLockTargetSlotScript(
         slotByteAddress: Long,
-        playerByteAddress: Long
+        playerByteAddress: Long,
+        entityIdRelOffsetBytes: Int? = null
     ): String {
         val safeSlot = slotByteAddress.coerceAtLeast(0L)
         val safePlayer = playerByteAddress.coerceAtLeast(0L)
+        val idOffsetExpr = entityIdRelOffsetBytes?.toString() ?: "null"
         return """
         (function() {
           try {
@@ -645,6 +943,7 @@ object WasmSelectedTargetScripts {
               __tsState.pollId = null;
             }
             __tsState.lockedSlotAddr = $safeSlot;
+            __tsState.entityIdRelOffset = $idOffsetExpr;
             __tsState.tick = 0;
 
             const pushTargetTick = function() {
@@ -760,147 +1059,6 @@ object WasmSelectedTargetScripts {
         """.trimIndent()
     }
 
-    /**
-     * Known-Entity Reverse-Pointer Target Slot Finder (strictly read-only):
-     * When the user locates a specific mob in the Entities tab by walking up to it and selects
-     * that mob in-game, this scans 100% of `HEAPU32` in non-blocking 1 MB slices to find every
-     * pointer slot currently holding an address inside `[entityCoordByteAddress - 1024 .. +128]`.
-     * Immediately populates `__tsState` so the user can Watch Live or press Deselected (0) once.
-     */
-    fun buildFindTargetSlotForEntityScript(
-        entityCoordByteAddress: Long,
-        playerByteAddress: Long,
-        entityLabel: String
-    ): String {
-        val safeEnt = entityCoordByteAddress.coerceAtLeast(0L)
-        val safePlayer = playerByteAddress.coerceAtLeast(0L)
-        val escapedLabel = quoteJsString(entityLabel.ifBlank { "Picked Mob" })
-        return """
-        (async function() {
-          try {
-            $TARGET_HEAP_HELPERS
-            const heaps = __tsResolveHeaps();
-            if (!heaps || $safeEnt <= 0) {
-              __tsEmit('WASM', {
-                stage: 'WASM_TARGET_SCAN_RESULT',
-                action: 'ENTITY_REVERSE_FIND',
-                round: 0,
-                error: 'Pick an entity with a valid WASM coordinate address first.',
-                totalCandidates: 0,
-                candidates: []
-              });
-              return;
-            }
-
-            const mySeq = ++__tsState.scanSeq;
-            const startMs = performance.now();
-            const hu32 = heaps.heapU32;
-            const len = hu32.length;
-            const entCoord = $safeEnt >>> 0;
-            const minPtr = entCoord > 1024 ? (entCoord - 1024) : 4096;
-            const maxPtr = entCoord + 128;
-            const playerInfo = __tsResolveLivePlayer($safePlayer, heaps);
-            const playerAddr = playerInfo.addr;
-            const decoded = __tsReadSchema(entCoord, heaps);
-
-            __tsStatus('RUNNING', 'Finding target slots pointing to ' + $escapedLabel + '…');
-
-            const matches = [];
-            const CHUNK = 262144; // 1 MB slices across 100% of HEAPU32
-            for (let base = 64; base < len; base += CHUNK) {
-              if (mySeq !== __tsState.scanSeq) return;
-              const end = Math.min(base + CHUNK, len);
-              for (let i = base; i < end; i++) {
-                const v = hu32[i] >>> 0;
-                if (v < minPtr || v > maxPtr || (v & 3) !== 0) continue;
-                const slotAddr = i * 4;
-                // Exclude self-pointers stored inside the mob's own struct
-                if (Math.abs(slotAddr - entCoord) <= 1024) continue;
-                matches.push({ idx: i, slotAddr: slotAddr, val: v });
-                if (matches.length >= 4096) break;
-              }
-              if (matches.length >= 4096) break;
-              if (end < len) {
-                await __tsYield(12);
-              }
-            }
-
-            if (mySeq !== __tsState.scanSeq) return;
-
-            const n = matches.length;
-            const nextIdx = new Int32Array(n);
-            const nextVal = new Uint32Array(n);
-            const scored = [];
-            const fIdx = entCoord >>> 2;
-            const ex = (fIdx + 2 < heaps.heapF32.length) ? Number(heaps.heapF32[fIdx].toFixed(3)) : null;
-            const ey = (fIdx + 2 < heaps.heapF32.length) ? Number(heaps.heapF32[fIdx + 1].toFixed(3)) : null;
-            const ez = (fIdx + 2 < heaps.heapF32.length) ? Number(heaps.heapF32[fIdx + 2].toFixed(3)) : null;
-
-            for (let k = 0; k < n; k++) {
-              const m = matches[k];
-              nextIdx[k] = m.idx;
-              nextVal[k] = m.val;
-              const nearOff = (playerAddr > 0 && Math.abs(m.slotAddr - playerAddr) <= 16384)
-                ? (m.slotAddr - playerAddr)
-                : null;
-              let score = 1000;
-              if (nearOff !== null) score += 600;
-              if (m.slotAddr < 8 * 1024 * 1024) score += 250; // global/static slot
-              if (m.val === entCoord || (entCoord - m.val) === (window.__wvWasmEntities ? (window.__wvWasmEntities.structOffset || 0) : 0)) {
-                score += 200;
-              }
-              scored.push({
-                score: score,
-                slotByteAddress: m.slotAddr,
-                slotHex: __tsFormatHex(m.slotAddr),
-                currentValue: m.val,
-                currentHex: __tsFormatHex(m.val),
-                isPointerLike: true,
-                nearPlayerOffsetBytes: nearOff,
-                matchedEntityId: __tsFormatHex(m.val),
-                matchedEntityName: $escapedLabel,
-                resolvedCoordAddress: entCoord,
-                resolvedX: ex,
-                resolvedY: ey,
-                resolvedZ: ez,
-                previewName: decoded.name || $escapedLabel,
-                previewHp: (typeof decoded.hp === 'number') ? decoded.hp : null,
-                previewMaxHp: (typeof decoded.maxHp === 'number') ? decoded.maxHp : null,
-                previewAggroRaw: (typeof decoded.aggro === 'number') ? decoded.aggro : null
-              });
-            }
-
-            scored.sort(function(a, b) {
-              if (b.score !== a.score) return b.score - a.score;
-              return a.slotByteAddress - b.slotByteAddress;
-            });
-
-            __tsState.round = 1;
-            __tsState.slotIndices = nextIdx;
-            __tsState.prevValues = nextVal;
-            __tsState.prevCount = n;
-
-            const durationMs = Number((performance.now() - startMs).toFixed(1));
-            __tsStatus('COMPLETED', 'Reverse Target Find: ' + n + ' slot(s) point to ' + $escapedLabel + ' (' + durationMs + 'ms)');
-            __tsEmit('WASM', {
-              stage: 'WASM_TARGET_SCAN_RESULT',
-              action: 'ENTITY_REVERSE_FIND',
-              round: 1,
-              durationMs: durationMs,
-              totalCandidates: n,
-              candidates: scored.slice(0, 32)
-            });
-          } catch (err) {
-            try {
-              if (window.TelemetryBridge) {
-                window.TelemetryBridge.logTelemetry('ERR', 'Entity reverse target find error: ' + String(err));
-              }
-            } catch (_) {}
-          }
-        })();
-        """.trimIndent()
-    }
-
     fun buildStopTargetWatchScript(): String = """
         (function() {
           try {
@@ -926,6 +1084,7 @@ object WasmSelectedTargetScripts {
               window.__wvTargetScan.prevValues = null;
               window.__wvTargetScan.prevCount = 0;
               window.__wvTargetScan.lockedSlotAddr = 0;
+              window.__wvTargetScan.entityIdRelOffset = null;
               window.__wvTargetScan.lastResolvedAddr = 0;
               window.__wvTargetScan.lastResolvedCoordAddr = 0;
             }

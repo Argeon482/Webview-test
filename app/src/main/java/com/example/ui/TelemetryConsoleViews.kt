@@ -27,6 +27,8 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.GpsFixed
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -36,12 +38,14 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.ViewInAr
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
@@ -503,15 +507,13 @@ private fun StagingCandidateCard(
 fun EntityInspectionConsoleView(
     state: DiagnosticsUiState,
     onRescanEntities: () -> Unit,
-    onRescanEntitiesLonger: () -> Unit,
-    onToggleShowWalkingOnly: () -> Unit,
     onToggleLiveEntities: () -> Unit,
     onOpenTargetFinder: () -> Unit,
     onOpenProber: () -> Unit,
     onToggleTrackEntity: (String) -> Unit,
     onClearTrackedEntity: () -> Unit,
     onProbeEntity: (DiscoveredEntitySample) -> Unit,
-    onFindTargetSlotForEntity: (DiscoveredEntitySample) -> Unit,
+    onFindTargetFromEntity: (DiscoveredEntitySample) -> Unit,
     onPinPath: (path: String, detail: String) -> Unit,
     onCopyPayload: (String) -> Unit,
     modifier: Modifier = Modifier
@@ -520,22 +522,6 @@ fun EntityInspectionConsoleView(
         state.discoveredEntities.any { it.sampleKeys.contains("WASM_STRUCT") } ||
         state.hasLiveWasmPlayerAnchor ||
         state.structProber.schema.hasAnyBound
-
-    val displayedEntities = remember(state.discoveredEntities, state.showWalkingEntitiesOnly) {
-        val base = if (state.showWalkingEntitiesOnly) {
-            state.discoveredEntities.filter { it.isConfirmedMoving || it.isStandingOnMob || it.isActiveGameTarget }
-        } else {
-            state.discoveredEntities
-        }
-        base.sortedWith(
-            compareByDescending<DiscoveredEntitySample> { it.isStandingOnMob }
-                .thenBy { it.distanceToPlayer }
-        )
-    }
-
-    val standingOnMobTop = remember(displayedEntities) {
-        displayedEntities.firstOrNull { it.isStandingOnMob }
-    }
 
     val trackedEntity = remember(state.discoveredEntities, state.trackedEntityKey) {
         state.trackedEntityKey?.let { key ->
@@ -570,12 +556,7 @@ fun EntityInspectionConsoleView(
                         overflow = TextOverflow.Ellipsis
                     )
                     val meta = buildString {
-                        append("${displayedEntities.size} shown")
-                        if (state.lastErraticEntitiesDroppedCount > 0) {
-                            append(" • ${state.lastErraticEntitiesDroppedCount} jittery dropped")
-                        } else if (state.lastStaticEntitiesFilteredCount > 0) {
-                            append(" • ${state.lastStaticEntitiesFilteredCount} static dropped")
-                        }
+                        append("${state.discoveredEntities.size} detected")
                         if (state.isWasmEntitiesLivePolling) append(" • LIVE #${state.wasmEntityLiveTickCount}")
                         if (state.structProber.schema.hasAnyBound) {
                             append(" • ${state.structProber.schema.boundCount} offsets")
@@ -713,35 +694,6 @@ fun EntityInspectionConsoleView(
                         }
                     }
                 }
-                if (isWasmEntityMode) {
-                    Surface(
-                        onClick = onToggleShowWalkingOnly,
-                        shape = RoundedCornerShape(8.dp),
-                        color = if (state.showWalkingEntitiesOnly) SignalEmerald.copy(alpha = 0.22f) else ObsidianBg,
-                        border = BorderStroke(
-                            1.dp,
-                            if (state.showWalkingEntitiesOnly) SignalEmerald else ObsidianBorder
-                        ),
-                        modifier = Modifier
-                            .heightIn(min = 48.dp)
-                            .testTag("entities_filter_walking_toggle")
-                    ) {
-                        Box(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = stringResource(
-                                    if (state.showWalkingEntitiesOnly) R.string.entities_filter_walking_only
-                                    else R.string.entities_filter_all_stable
-                                ),
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = if (state.showWalkingEntitiesOnly) SignalEmerald else MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
             }
         }
 
@@ -751,23 +703,14 @@ fun EntityInspectionConsoleView(
                 entity = trackedEntity,
                 playerCoords = state.livePlayerCoords,
                 onProbeEntity = { onProbeEntity(trackedEntity) },
-                onFindTargetSlot = { onFindTargetSlotForEntity(trackedEntity) },
+                onFindTargetFromEntity = { onFindTargetFromEntity(trackedEntity) },
                 onDismiss = onClearTrackedEntity
-            )
-        } else if (standingOnMobTop != null) {
-            // Auto-illuminated quick card whenever the player is standing right on top of a mob (<= 4.0u)
-            ReadOnlyEntityLocationTrackerCard(
-                entity = standingOnMobTop,
-                playerCoords = state.livePlayerCoords,
-                onProbeEntity = { onProbeEntity(standingOnMobTop) },
-                onFindTargetSlot = { onFindTargetSlotForEntity(standingOnMobTop) },
-                onDismiss = { onToggleTrackEntity(standingOnMobTop.selectionKey) }
             )
         }
 
         HorizontalDivider(color = ObsidianBorder, thickness = 1.dp)
 
-        if (displayedEntities.isEmpty()) {
+        if (state.discoveredEntities.isEmpty()) {
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -777,7 +720,7 @@ fun EntityInspectionConsoleView(
             ) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.ViewInAr,
@@ -785,78 +728,16 @@ fun EntityInspectionConsoleView(
                         tint = TelemetryViolet.copy(alpha = 0.8f),
                         modifier = Modifier.size(28.dp)
                     )
-                    val totalDropped = state.lastErraticEntitiesDroppedCount + state.lastStaticEntitiesFilteredCount
-                    val showedZeroAfterScan = state.lastEntityScanCompleted && totalDropped > 0
                     Text(
-                        text = stringResource(
-                            if (showedZeroAfterScan) R.string.entities_zero_moving_title
-                            else R.string.entities_empty_title
-                        ),
+                        text = stringResource(R.string.entities_empty_title),
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = if (showedZeroAfterScan) {
-                            stringResource(R.string.entities_zero_moving_subtitle, totalDropped)
-                        } else {
-                            stringResource(R.string.entities_empty_subtitle)
-                        },
+                        text = stringResource(R.string.entities_empty_subtitle),
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
-                    if (state.showWalkingEntitiesOnly && state.discoveredEntities.isNotEmpty()) {
-                        Surface(
-                            onClick = onToggleShowWalkingOnly,
-                            shape = RoundedCornerShape(8.dp),
-                            color = SignalEmerald.copy(alpha = 0.2f),
-                            border = BorderStroke(1.dp, SignalEmerald),
-                            modifier = Modifier
-                                .heightIn(min = 48.dp)
-                                .testTag("entities_show_all_stable_fallback_button")
-                        ) {
-                            Box(
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Text(
-                                    text = "Show All ${state.discoveredEntities.size} Stable Entities",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold,
-                                    color = SignalEmerald
-                                )
-                            }
-                        }
-                    } else if (isWasmEntityMode && state.lastEntityScanCompleted) {
-                        Surface(
-                            onClick = onRescanEntitiesLonger,
-                            shape = RoundedCornerShape(8.dp),
-                            color = TelemetryViolet.copy(alpha = 0.22f),
-                            border = BorderStroke(1.dp, TelemetryViolet),
-                            modifier = Modifier
-                                .heightIn(min = 48.dp)
-                                .testTag("retry_longer_entity_scan_button")
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Refresh,
-                                    contentDescription = null,
-                                    tint = TelemetryViolet,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    text = stringResource(R.string.action_retry_longer_entity_scan),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold,
-                                    color = TelemetryViolet
-                                )
-                            }
-                        }
-                    }
                 }
             }
         } else {
@@ -868,14 +749,14 @@ fun EntityInspectionConsoleView(
                 contentPadding = PaddingValues(10.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(displayedEntities, key = { it.selectionKey }) { entity ->
+                items(state.discoveredEntities, key = { it.selectionKey }) { entity ->
                     val isTracked = state.trackedEntityKey == entity.selectionKey
                     EntitySampleCard(
                         entity = entity,
-                        playerCoords = state.livePlayerCoords,
                         isTracked = isTracked,
                         onToggleTrack = { onToggleTrackEntity(entity.selectionKey) },
                         onProbeEntity = { onProbeEntity(entity) },
+                        onFindTargetFromEntity = { onFindTargetFromEntity(entity) },
                         onPin = {
                             onPinPath(
                                 entity.path,
@@ -913,7 +794,7 @@ private fun ReadOnlyEntityLocationTrackerCard(
     entity: DiscoveredEntitySample,
     playerCoords: PlayerCoordinates?,
     onProbeEntity: () -> Unit,
-    onFindTargetSlot: () -> Unit,
+    onFindTargetFromEntity: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val dx = if (playerCoords != null) entity.worldX - playerCoords.x else null
@@ -942,7 +823,7 @@ private fun ReadOnlyEntityLocationTrackerCard(
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+            verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -964,28 +845,16 @@ private fun ReadOnlyEntityLocationTrackerCard(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
-                val trackerDelta = entity.distanceDelta
-                val trackerArrow = when {
-                    trackerDelta != null && trackerDelta <= -0.08 -> " ↓"
-                    trackerDelta != null && trackerDelta >= 0.08 -> " ↑"
-                    else -> ""
-                }
-                val trackerBadgeColor = when {
-                    isAtMob -> SignalEmerald
-                    trackerDelta != null && trackerDelta <= -0.08 -> SignalEmerald
-                    trackerDelta != null && trackerDelta >= 0.08 -> AlertCoral
-                    else -> ElectricCyan
-                }
                 Surface(
-                    color = trackerBadgeColor.copy(alpha = 0.22f),
+                    color = (if (isAtMob) SignalEmerald else ElectricCyan).copy(alpha = 0.22f),
                     shape = RoundedCornerShape(5.dp)
                 ) {
                     Text(
-                        text = if (isAtMob) "AT MOB ✓ (${fmt2(liveDist)}u)" else "${fmt2(liveDist)}u$trackerArrow • $headingText",
+                        text = if (isAtMob) "AT MOB ✓ (${fmt2(liveDist)}u)" else "${fmt2(liveDist)}u • $headingText",
                         style = MaterialTheme.typography.labelSmall,
                         fontFamily = JetBrainsMonoFontFamily,
                         fontWeight = FontWeight.Bold,
-                        color = trackerBadgeColor,
+                        color = if (isAtMob) SignalEmerald else ElectricCyan,
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
                 }
@@ -1020,70 +889,68 @@ private fun ReadOnlyEntityLocationTrackerCard(
                 fontSize = 10.sp
             )
 
-            if (entity.coordByteAddress > 0L) {
+            if (entity.effectiveCoordByteAddress > 0L) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 4.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Surface(
+                    OutlinedButton(
                         onClick = onProbeEntity,
                         shape = RoundedCornerShape(8.dp),
-                        color = TelemetryViolet,
+                        border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.8f)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = TelemetryViolet.copy(alpha = 0.16f),
+                            contentColor = TelemetryViolet
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 44.dp)
-                            .testTag("tracker_probe_mob_button")
+                            .testTag("tracker_probe_entity_button")
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Search,
-                                contentDescription = null,
-                                tint = ObsidianBg,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(Modifier.width(5.dp))
-                            Text(
-                                text = stringResource(R.string.action_probe_this_mob),
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = ObsidianBg
-                            )
-                        }
+                        Icon(
+                            imageVector = Icons.Default.Memory,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            text = stringResource(R.string.action_probe_entity),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
-
-                    Surface(
-                        onClick = onFindTargetSlot,
+                    OutlinedButton(
+                        onClick = onFindTargetFromEntity,
                         shape = RoundedCornerShape(8.dp),
-                        color = AssetAmber.copy(alpha = 0.2f),
-                        border = BorderStroke(1.dp, AssetAmber),
+                        border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.85f)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = AssetAmber.copy(alpha = 0.16f),
+                            contentColor = AssetAmber
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
                         modifier = Modifier
                             .weight(1f)
                             .heightIn(min = 44.dp)
-                            .testTag("tracker_find_target_slot_button")
+                            .testTag("tracker_find_target_button")
                     ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Radar,
-                                contentDescription = null,
-                                tint = AssetAmber,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(Modifier.width(5.dp))
-                            Text(
-                                text = stringResource(R.string.action_find_target_slot_for_mob),
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = AssetAmber
-                            )
-                        }
+                        Icon(
+                            imageVector = Icons.Default.GpsFixed,
+                            contentDescription = null,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            text = stringResource(R.string.action_find_target_from_entity),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                 }
             }
@@ -1091,18 +958,10 @@ private fun ReadOnlyEntityLocationTrackerCard(
     }
 }
 
-internal fun formatCompassArrowLabel(dx: Double, dz: Double): String {
-    val angleRad = kotlin.math.atan2(dx, dz)
-    val deg = ((Math.toDegrees(angleRad) % 360.0) + 360.0) % 360.0
-    val dirs = listOf("↑ N", "↗ NE", "→ E", "↘ SE", "↓ S", "↙ SW", "← W", "↖ NW")
-    val idx = (((deg + 22.5) % 360.0) / 45.0).toInt().coerceIn(0, 7)
-    return dirs[idx]
-}
-
 private fun formatCompassHeading(dx: Double, dz: Double): String {
     val angleRad = kotlin.math.atan2(dx, dz)
     val deg = ((Math.toDegrees(angleRad) % 360.0) + 360.0) % 360.0
-    val dirs = listOf("↑ N", "↗ NE", "→ E", "↘ SE", "↓ S", "↙ SW", "← W", "↖ NW")
+    val dirs = listOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
     val idx = (((deg + 22.5) % 360.0) / 45.0).toInt().coerceIn(0, 7)
     return "${dirs[idx]} ${deg.toInt()}°"
 }
@@ -1115,41 +974,29 @@ private fun fmtSigned2(value: Double): String {
 @Composable
 private fun EntitySampleCard(
     entity: DiscoveredEntitySample,
-    playerCoords: PlayerCoordinates?,
     isTracked: Boolean,
     onToggleTrack: () -> Unit,
     onProbeEntity: () -> Unit,
+    onFindTargetFromEntity: () -> Unit,
     onPin: () -> Unit,
     onCopy: () -> Unit
 ) {
-    val isStandingOnMob = entity.isStandingOnMob
     val borderColor = when {
-        isStandingOnMob -> SignalEmerald
         isTracked -> ElectricCyan
         entity.isActiveGameTarget -> SignalEmerald
         entity.isAggro == true -> AlertCoral.copy(alpha = 0.75f)
         entity.inViewport -> TelemetryViolet.copy(alpha = 0.6f)
         else -> ObsidianBorder
     }
-    val dx = entity.deltaX ?: playerCoords?.let { entity.worldX - it.x }
-    val dz = entity.deltaZ ?: playerCoords?.let { entity.worldZ - it.z }
-    val compassChipText = if (dx != null && dz != null && (kotlin.math.abs(dx) > 0.01 || kotlin.math.abs(dz) > 0.01)) {
-        formatCompassArrowLabel(dx, dz)
-    } else null
-    val distDelta = entity.distanceDelta
-    val isApproaching = distDelta != null && distDelta <= -0.08
-    val isReceding = distDelta != null && distDelta >= 0.08
-
     Surface(
         shape = RoundedCornerShape(8.dp),
         color = when {
-            isStandingOnMob -> SignalEmerald.copy(alpha = 0.22f)
             isTracked -> ElectricCyan.copy(alpha = 0.08f)
             entity.isActiveGameTarget -> SignalEmerald.copy(alpha = 0.08f)
             else -> ObsidianSurface
         },
         border = BorderStroke(
-            width = if (isStandingOnMob) 2.dp else if (isTracked || entity.isActiveGameTarget) 1.5.dp else 1.dp,
+            width = if (isTracked || entity.isActiveGameTarget) 1.5.dp else 1.dp,
             color = borderColor
         ),
         modifier = Modifier
@@ -1170,32 +1017,11 @@ private fun EntitySampleCard(
                     text = entity.displayName + if (entity.resolvedName == null && entity.id.isNotBlank()) " #${entity.id}" else "",
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
-                    color = when {
-                        isStandingOnMob -> SignalEmerald
-                        entity.resolvedName != null -> TelemetryViolet
-                        else -> MaterialTheme.colorScheme.onSurface
-                    },
+                    color = if (entity.resolvedName != null) TelemetryViolet else MaterialTheme.colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
-                if (isStandingOnMob) {
-                    Surface(
-                        color = SignalEmerald,
-                        shape = RoundedCornerShape(4.dp),
-                        modifier = Modifier.testTag("entity_standing_on_mob_${entity.selectionKey}")
-                    ) {
-                        Text(
-                            text = "AT MOB ✓",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            fontWeight = FontWeight.ExtraBold,
-                            color = ObsidianBg,
-                            fontSize = 9.sp,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
-                    }
-                }
                 if (entity.isActiveGameTarget) {
                     Surface(
                         color = SignalEmerald.copy(alpha = 0.22f),
@@ -1226,91 +1052,19 @@ private fun EntitySampleCard(
                         )
                     }
                 }
-                if (entity.isConfirmedMoving || entity.selfMoveDelta >= 0.04) {
-                    Surface(
-                        color = SignalEmerald.copy(alpha = 0.16f),
-                        shape = RoundedCornerShape(4.dp)
-                    ) {
-                        Text(
-                            text = "WALKING",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            fontWeight = FontWeight.Bold,
-                            color = SignalEmerald,
-                            fontSize = 9.sp,
-                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
-                        )
-                    }
-                }
-            }
-
-            // Navigation strip: 8-point compass direction + live distance + closer/farther arrow
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                if (compassChipText != null) {
-                    Surface(
-                        color = ElectricCyan.copy(alpha = 0.18f),
-                        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.55f)),
-                        shape = RoundedCornerShape(5.dp),
-                        modifier = Modifier.testTag("entity_compass_${entity.selectionKey}")
-                    ) {
-                        Text(
-                            text = compassChipText,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            fontWeight = FontWeight.Bold,
-                            color = ElectricCyan,
-                            fontSize = 10.sp,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
-                    }
-                }
-
                 Surface(
-                    color = ElectricCyan.copy(alpha = 0.12f),
-                    shape = RoundedCornerShape(5.dp)
+                    color = ElectricCyan.copy(alpha = 0.16f),
+                    shape = RoundedCornerShape(4.dp)
                 ) {
                     Text(
                         text = "${fmt2(entity.distanceToPlayer)}u",
                         style = MaterialTheme.typography.labelSmall,
                         fontFamily = JetBrainsMonoFontFamily,
                         fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onSurface,
-                        fontSize = 10.sp,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        color = ElectricCyan,
+                        fontSize = 9.sp,
+                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
                     )
-                }
-
-                if (distDelta != null) {
-                    val trendColor = when {
-                        isApproaching -> SignalEmerald
-                        isReceding -> AlertCoral
-                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                    }
-                    val trendText = when {
-                        isApproaching -> "↓ CLOSER ${String.format(Locale.US, "%.1f", distDelta)}u"
-                        isReceding -> "↑ FARTHER +${String.format(Locale.US, "%.1f", distDelta)}u"
-                        else -> "• STEADY"
-                    }
-                    Surface(
-                        color = trendColor.copy(alpha = if (isApproaching || isReceding) 0.2f else 0.1f),
-                        border = BorderStroke(1.dp, trendColor.copy(alpha = if (isApproaching || isReceding) 0.6f else 0.25f)),
-                        shape = RoundedCornerShape(5.dp),
-                        modifier = Modifier.testTag("entity_trend_${entity.selectionKey}")
-                    ) {
-                        Text(
-                            text = trendText,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = JetBrainsMonoFontFamily,
-                            fontWeight = FontWeight.Bold,
-                            color = trendColor,
-                            fontSize = 10.sp,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
-                    }
                 }
             }
 
@@ -1397,30 +1151,6 @@ private fun EntitySampleCard(
                     )
                 }
 
-                if (entity.coordByteAddress > 0L) {
-                    Surface(
-                        onClick = onProbeEntity,
-                        shape = RoundedCornerShape(7.dp),
-                        color = TelemetryViolet.copy(alpha = 0.22f),
-                        border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.7f)),
-                        modifier = Modifier
-                            .heightIn(min = 38.dp)
-                            .testTag("entity_probe_pill_${entity.selectionKey}")
-                    ) {
-                        Box(
-                            contentAlignment = Alignment.Center,
-                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
-                        ) {
-                            Text(
-                                text = "Probe",
-                                style = MaterialTheme.typography.labelSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = TelemetryViolet
-                            )
-                        }
-                    }
-                }
-
                 IconButton(
                     onClick = onPin,
                     modifier = Modifier.size(38.dp)
@@ -1443,6 +1173,73 @@ private fun EntitySampleCard(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(16.dp)
                     )
+                }
+            }
+
+            // Dedicated per-entity Probe & Find Target actions (48dp touch targets)
+            if (entity.effectiveCoordByteAddress > 0L) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedButton(
+                        onClick = onProbeEntity,
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.75f)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = TelemetryViolet.copy(alpha = 0.14f),
+                            contentColor = TelemetryViolet
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 48.dp)
+                            .testTag("entity_probe_${entity.path}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Memory,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            text = stringResource(R.string.action_probe_entity),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = onFindTargetFromEntity,
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, AssetAmber.copy(alpha = 0.8f)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = AssetAmber.copy(alpha = 0.14f),
+                            contentColor = AssetAmber
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 48.dp)
+                            .testTag("entity_find_target_${entity.path}")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.GpsFixed,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            text = stringResource(R.string.action_find_target_from_entity),
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
         }

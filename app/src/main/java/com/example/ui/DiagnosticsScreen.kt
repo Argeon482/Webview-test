@@ -578,6 +578,8 @@ private fun WiredTelemetryConsolePanel(
         onToggleWasmEntitiesLive = viewModel::onToggleWasmEntitiesLiveRefresh,
         onToggleTrackEntity = viewModel::onToggleTrackEntityForLocationVerify,
         onClearTrackedEntity = viewModel::onClearTrackedEntity,
+        onProbeEntityFromList = viewModel::onSelectEntityAsProbeAnchor,
+        onFindTargetSlotForEntity = viewModel::onFindTargetSlotForEntity,
         onCaptureSelectedTarget = viewModel::onCaptureSelectedTarget,
         onFilterSelectedTarget = viewModel::onFilterSelectedTarget,
         onLockSelectedTargetSlot = viewModel::onLockSelectedTargetSlot,
@@ -595,6 +597,10 @@ private fun WiredTelemetryConsolePanel(
         onRunStructRefine = {
             onClearFocus()
             viewModel.runStructFieldProbe(refineExisting = true)
+        },
+        onRunStructDeltaProbe = { mode ->
+            onClearFocus()
+            viewModel.runStructDeltaProbe(mode)
         },
         onRunAutoProbeNames = {
             onClearFocus()

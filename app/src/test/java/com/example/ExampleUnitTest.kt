@@ -345,8 +345,61 @@ class ExampleUnitTest {
       assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
     }
   }
+
+  @Test
+  fun pickedEntityDeltaProberAndReverseTargetSlotScriptsAreNonBlockingAndStrictlyReadOnly() {
+    val snapScript = WasmStructProberScripts.buildStructDeltaProbeScript(
+      fieldKind = WasmStructFieldKind.HP,
+      anchorByteAddress = 65015960L,
+      mode = StructDeltaFilterMode.SNAPSHOT,
+      anchorIsTarget = false,
+      useDirectAnchorAddress = true
+    )
+    val dropScript = WasmStructProberScripts.buildStructDeltaProbeScript(
+      fieldKind = WasmStructFieldKind.HP,
+      anchorByteAddress = 65015960L,
+      mode = StructDeltaFilterMode.DECREASED,
+      anchorIsTarget = false,
+      useDirectAnchorAddress = true
+    )
+    val sameScript = WasmStructProberScripts.buildStructDeltaProbeScript(
+      fieldKind = WasmStructFieldKind.HP,
+      anchorByteAddress = 65015960L,
+      mode = StructDeltaFilterMode.UNCHANGED,
+      anchorIsTarget = false,
+      useDirectAnchorAddress = true
+    )
+    val riseScript = WasmStructProberScripts.buildStructDeltaProbeScript(
+      fieldKind = WasmStructFieldKind.HP,
+      anchorByteAddress = 65015960L,
+      mode = StructDeltaFilterMode.INCREASED,
+      anchorIsTarget = false,
+      useDirectAnchorAddress = true
+    )
+    val reverseTargetScript = WasmSelectedTargetScripts.buildFindTargetSlotForEntityScript(
+      entityCoordByteAddress = 65015960L,
+      playerByteAddress = 65011712L,
+      entityLabel = "Small Aibatt"
+    )
+
+    assertTrue(snapScript.contains("isDeltaProbe: true"))
+    assertTrue(snapScript.contains("deltaMode: 'SNAPSHOT'"))
+    assertTrue(snapScript.contains("65015960"))
+    assertTrue(dropScript.contains("deltaMode: 'DECREASED'"))
+    assertTrue(sameScript.contains("deltaMode: 'UNCHANGED'"))
+    assertTrue(riseScript.contains("deltaMode: 'INCREASED'"))
+
+    assertTrue(reverseTargetScript.contains("(async function()"))
+    assertTrue(reverseTargetScript.contains("ENTITY_REVERSE_FIND"))
+    assertTrue(reverseTargetScript.contains("65015960"))
+    assertTrue(reverseTargetScript.contains("Small Aibatt"))
+
+    // Strictly read-only: zero writes to WASM linear memory and zero synthetic input events
+    val heapWriteRegex = Regex("""(hf32|hu32|h32|h16|u8|heapF32|heapU32|heap32|heap16|heapU8|HEAPF32|HEAPU32|HEAP32|HEAPU8)\[[^\]]+]\s*=(?!=)""")
+    val syntheticInputRegex = Regex("""(dispatchEvent|MouseEvent|PointerEvent|TouchEvent|KeyboardEvent)""")
+    listOf(snapScript, dropScript, sameScript, riseScript, reverseTargetScript).forEach { script ->
+      assertFalse("Must not write to WASM heap", heapWriteRegex.containsMatchIn(script))
+      assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
+    }
+  }
 }
-
-
-
-

@@ -535,7 +535,16 @@ data class PlayerVitalsSnapshot(
 
 enum class WasmStructProbeAnchor {
     PLAYER,
+    PICKED_ENTITY,
     SELECTED_TARGET
+}
+
+enum class StructDeltaFilterMode(val wireName: String, val label: String) {
+    SNAPSHOT("SNAPSHOT", "Snap"),
+    DECREASED("DECREASED", "↓ Drop"),
+    UNCHANGED("UNCHANGED", "= Same"),
+    INCREASED("INCREASED", "↑ Rise"),
+    CHANGED("CHANGED", "≠ Diff")
 }
 
 enum class TargetScanFilterMode(val wireName: String, val label: String) {
@@ -608,10 +617,15 @@ data class WasmTargetScannerState(
 data class WasmStructProberState(
     val isExpanded: Boolean = true,
     val probeAnchor: WasmStructProbeAnchor = WasmStructProbeAnchor.PLAYER,
+    val pickedEntityKey: String? = null,
+    val pickedEntityCoordAddress: Long = 0L,
+    val pickedEntityLabel: String = "",
     val activeField: WasmStructFieldKind = WasmStructFieldKind.HP,
     val queryInput: String = "",
     val isProbing: Boolean = false,
     val probeRound: Int = 0,
+    val deltaSnapshotCount: Int = 0,
+    val deltaRound: Int = 0,
     val candidates: List<WasmStructProbeCandidate> = emptyList(),
     val schema: WasmEntityStructSchema = WasmEntityStructSchema(),
     val statusMessage: String = ""

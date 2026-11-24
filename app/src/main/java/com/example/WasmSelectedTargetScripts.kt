@@ -353,7 +353,7 @@ object WasmSelectedTargetScripts {
               if (tracked[i].byteAddr > maxEnt) maxEnt = tracked[i].byteAddr;
             }
 
-            __tsStatus('RUNNING', 'Target Finder: capturing candidate pointer slots (Mob A)…');
+            __tsStatus('RUNNING', 'Target Finder: scanning full HEAPU32 for target pointer slots…');
 
             const MAX_SLOTS = 900000;
             const capIdx = new Int32Array(MAX_SLOTS);
@@ -363,25 +363,49 @@ object WasmSelectedTargetScripts {
             const CHUNK = 262144; // 1 MB per slice
             const START_IDX = len > 4096 ? 64 : 0;
             const playerMin = playerAddr > 4096 ? (playerAddr - 4096) : 0;
-            const playerMax = playerAddr > 0 ? Math.min(byteLen - 4, playerAddr + 12288) : 0;
+            const playerMax = playerAddr > 0 ? Math.min(byteLen - 4, playerAddr + 16384) : 0;
+            const STATIC_LIMIT_BYTES = Math.min(byteLen, 12 * 1024 * 1024);
 
-            for (let base = START_IDX; base < len && count < MAX_SLOTS; base += CHUNK) {
+            // Always inspect 100% of HEAPU32: capture (a) ANY pointer pointing near a tracked entity,
+            // (b) slots near player struct, and (c) static/global pointer slots without premature cutoff.
+            const hasTracked = tracked.length > 0;
+            for (let base = START_IDX; base < len; base += CHUNK) {
               if (mySeq !== __tsState.scanSeq) return;
               const end = Math.min(base + CHUNK, len);
-              for (let i = base; i < end && count < MAX_SLOTS; i++) {
+              for (let i = base; i < end; i++) {
                 const v = hu32[i] >>> 0;
                 if (v === 0) continue;
                 const slotAddr = i * 4;
                 const isPtr = (v >= 4096 && v < byteLen && (v & 3) === 0);
+                let matchesTracked = false;
+                if (isPtr && hasTracked && v >= (minEnt > 1024 ? minEnt - 1024 : 0) && v <= maxEnt + 256) {
+                  for (let e = 0; e < tracked.length; e++) {
+                    const diff = tracked[e].byteAddr - v;
+                    if (diff >= -128 && diff <= 1024) {
+                      // Skip self-pointers inside the entity's own struct
+                      if (Math.abs(slotAddr - tracked[e].byteAddr) > 1024) {
+                        matchesTracked = true;
+                        break;
+                      }
+                    }
+                  }
+                }
                 const nearPlayer = (playerAddr > 0 && slotAddr >= playerMin && slotAddr <= playerMax);
-                // Keep valid heap pointers anywhere in memory + plausible small entity IDs inside player struct
-                if (isPtr || (nearPlayer && v > 0 && v < 100000000)) {
+                const inStatic = (slotAddr < STATIC_LIMIT_BYTES);
+
+                if (matchesTracked || nearPlayer) {
+                  if (count < MAX_SLOTS) {
+                    capIdx[count] = i;
+                    capVal[count] = v;
+                    count++;
+                  }
+                } else if (isPtr && inStatic && count < MAX_SLOTS - 50000) {
                   capIdx[count] = i;
                   capVal[count] = v;
                   count++;
                 }
               }
-              if (end < len && count < MAX_SLOTS) {
+              if (end < len) {
                 await __tsYield(12);
               }
             }
@@ -732,6 +756,147 @@ object WasmSelectedTargetScripts {
               });
             }
           } catch (_) {}
+        })();
+        """.trimIndent()
+    }
+
+    /**
+     * Known-Entity Reverse-Pointer Target Slot Finder (strictly read-only):
+     * When the user locates a specific mob in the Entities tab by walking up to it and selects
+     * that mob in-game, this scans 100% of `HEAPU32` in non-blocking 1 MB slices to find every
+     * pointer slot currently holding an address inside `[entityCoordByteAddress - 1024 .. +128]`.
+     * Immediately populates `__tsState` so the user can Watch Live or press Deselected (0) once.
+     */
+    fun buildFindTargetSlotForEntityScript(
+        entityCoordByteAddress: Long,
+        playerByteAddress: Long,
+        entityLabel: String
+    ): String {
+        val safeEnt = entityCoordByteAddress.coerceAtLeast(0L)
+        val safePlayer = playerByteAddress.coerceAtLeast(0L)
+        val escapedLabel = quoteJsString(entityLabel.ifBlank { "Picked Mob" })
+        return """
+        (async function() {
+          try {
+            $TARGET_HEAP_HELPERS
+            const heaps = __tsResolveHeaps();
+            if (!heaps || $safeEnt <= 0) {
+              __tsEmit('WASM', {
+                stage: 'WASM_TARGET_SCAN_RESULT',
+                action: 'ENTITY_REVERSE_FIND',
+                round: 0,
+                error: 'Pick an entity with a valid WASM coordinate address first.',
+                totalCandidates: 0,
+                candidates: []
+              });
+              return;
+            }
+
+            const mySeq = ++__tsState.scanSeq;
+            const startMs = performance.now();
+            const hu32 = heaps.heapU32;
+            const len = hu32.length;
+            const entCoord = $safeEnt >>> 0;
+            const minPtr = entCoord > 1024 ? (entCoord - 1024) : 4096;
+            const maxPtr = entCoord + 128;
+            const playerInfo = __tsResolveLivePlayer($safePlayer, heaps);
+            const playerAddr = playerInfo.addr;
+            const decoded = __tsReadSchema(entCoord, heaps);
+
+            __tsStatus('RUNNING', 'Finding target slots pointing to ' + $escapedLabel + '…');
+
+            const matches = [];
+            const CHUNK = 262144; // 1 MB slices across 100% of HEAPU32
+            for (let base = 64; base < len; base += CHUNK) {
+              if (mySeq !== __tsState.scanSeq) return;
+              const end = Math.min(base + CHUNK, len);
+              for (let i = base; i < end; i++) {
+                const v = hu32[i] >>> 0;
+                if (v < minPtr || v > maxPtr || (v & 3) !== 0) continue;
+                const slotAddr = i * 4;
+                // Exclude self-pointers stored inside the mob's own struct
+                if (Math.abs(slotAddr - entCoord) <= 1024) continue;
+                matches.push({ idx: i, slotAddr: slotAddr, val: v });
+                if (matches.length >= 4096) break;
+              }
+              if (matches.length >= 4096) break;
+              if (end < len) {
+                await __tsYield(12);
+              }
+            }
+
+            if (mySeq !== __tsState.scanSeq) return;
+
+            const n = matches.length;
+            const nextIdx = new Int32Array(n);
+            const nextVal = new Uint32Array(n);
+            const scored = [];
+            const fIdx = entCoord >>> 2;
+            const ex = (fIdx + 2 < heaps.heapF32.length) ? Number(heaps.heapF32[fIdx].toFixed(3)) : null;
+            const ey = (fIdx + 2 < heaps.heapF32.length) ? Number(heaps.heapF32[fIdx + 1].toFixed(3)) : null;
+            const ez = (fIdx + 2 < heaps.heapF32.length) ? Number(heaps.heapF32[fIdx + 2].toFixed(3)) : null;
+
+            for (let k = 0; k < n; k++) {
+              const m = matches[k];
+              nextIdx[k] = m.idx;
+              nextVal[k] = m.val;
+              const nearOff = (playerAddr > 0 && Math.abs(m.slotAddr - playerAddr) <= 16384)
+                ? (m.slotAddr - playerAddr)
+                : null;
+              let score = 1000;
+              if (nearOff !== null) score += 600;
+              if (m.slotAddr < 8 * 1024 * 1024) score += 250; // global/static slot
+              if (m.val === entCoord || (entCoord - m.val) === (window.__wvWasmEntities ? (window.__wvWasmEntities.structOffset || 0) : 0)) {
+                score += 200;
+              }
+              scored.push({
+                score: score,
+                slotByteAddress: m.slotAddr,
+                slotHex: __tsFormatHex(m.slotAddr),
+                currentValue: m.val,
+                currentHex: __tsFormatHex(m.val),
+                isPointerLike: true,
+                nearPlayerOffsetBytes: nearOff,
+                matchedEntityId: __tsFormatHex(m.val),
+                matchedEntityName: $escapedLabel,
+                resolvedCoordAddress: entCoord,
+                resolvedX: ex,
+                resolvedY: ey,
+                resolvedZ: ez,
+                previewName: decoded.name || $escapedLabel,
+                previewHp: (typeof decoded.hp === 'number') ? decoded.hp : null,
+                previewMaxHp: (typeof decoded.maxHp === 'number') ? decoded.maxHp : null,
+                previewAggroRaw: (typeof decoded.aggro === 'number') ? decoded.aggro : null
+              });
+            }
+
+            scored.sort(function(a, b) {
+              if (b.score !== a.score) return b.score - a.score;
+              return a.slotByteAddress - b.slotByteAddress;
+            });
+
+            __tsState.round = 1;
+            __tsState.slotIndices = nextIdx;
+            __tsState.prevValues = nextVal;
+            __tsState.prevCount = n;
+
+            const durationMs = Number((performance.now() - startMs).toFixed(1));
+            __tsStatus('COMPLETED', 'Reverse Target Find: ' + n + ' slot(s) point to ' + $escapedLabel + ' (' + durationMs + 'ms)');
+            __tsEmit('WASM', {
+              stage: 'WASM_TARGET_SCAN_RESULT',
+              action: 'ENTITY_REVERSE_FIND',
+              round: 1,
+              durationMs: durationMs,
+              totalCandidates: n,
+              candidates: scored.slice(0, 32)
+            });
+          } catch (err) {
+            try {
+              if (window.TelemetryBridge) {
+                window.TelemetryBridge.logTelemetry('ERR', 'Entity reverse target find error: ' + String(err));
+              }
+            } catch (_) {}
+          }
         })();
         """.trimIndent()
     }

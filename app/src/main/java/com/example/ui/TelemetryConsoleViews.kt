@@ -508,6 +508,8 @@ fun EntityInspectionConsoleView(
     onOpenProber: () -> Unit,
     onToggleTrackEntity: (String) -> Unit,
     onClearTrackedEntity: () -> Unit,
+    onProbeEntity: (DiscoveredEntitySample) -> Unit,
+    onFindTargetSlotForEntity: (DiscoveredEntitySample) -> Unit,
     onPinPath: (path: String, detail: String) -> Unit,
     onCopyPayload: (String) -> Unit,
     modifier: Modifier = Modifier
@@ -696,6 +698,8 @@ fun EntityInspectionConsoleView(
             ReadOnlyEntityLocationTrackerCard(
                 entity = trackedEntity,
                 playerCoords = state.livePlayerCoords,
+                onProbeEntity = { onProbeEntity(trackedEntity) },
+                onFindTargetSlot = { onFindTargetSlotForEntity(trackedEntity) },
                 onDismiss = onClearTrackedEntity
             )
         }
@@ -747,6 +751,7 @@ fun EntityInspectionConsoleView(
                         entity = entity,
                         isTracked = isTracked,
                         onToggleTrack = { onToggleTrackEntity(entity.selectionKey) },
+                        onProbeEntity = { onProbeEntity(entity) },
                         onPin = {
                             onPinPath(
                                 entity.path,
@@ -783,6 +788,8 @@ fun EntityInspectionConsoleView(
 private fun ReadOnlyEntityLocationTrackerCard(
     entity: DiscoveredEntitySample,
     playerCoords: PlayerCoordinates?,
+    onProbeEntity: () -> Unit,
+    onFindTargetSlot: () -> Unit,
     onDismiss: () -> Unit
 ) {
     val dx = if (playerCoords != null) entity.worldX - playerCoords.x else null
@@ -811,7 +818,7 @@ private fun ReadOnlyEntityLocationTrackerCard(
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp)
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -876,6 +883,74 @@ private fun ReadOnlyEntityLocationTrackerCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 fontSize = 10.sp
             )
+
+            if (entity.coordByteAddress > 0L) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Surface(
+                        onClick = onProbeEntity,
+                        shape = RoundedCornerShape(8.dp),
+                        color = TelemetryViolet,
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 44.dp)
+                            .testTag("tracker_probe_mob_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Search,
+                                contentDescription = null,
+                                tint = ObsidianBg,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(5.dp))
+                            Text(
+                                text = stringResource(R.string.action_probe_this_mob),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = ObsidianBg
+                            )
+                        }
+                    }
+
+                    Surface(
+                        onClick = onFindTargetSlot,
+                        shape = RoundedCornerShape(8.dp),
+                        color = AssetAmber.copy(alpha = 0.2f),
+                        border = BorderStroke(1.dp, AssetAmber),
+                        modifier = Modifier
+                            .weight(1f)
+                            .heightIn(min = 44.dp)
+                            .testTag("tracker_find_target_slot_button")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Radar,
+                                contentDescription = null,
+                                tint = AssetAmber,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(Modifier.width(5.dp))
+                            Text(
+                                text = stringResource(R.string.action_find_target_slot_for_mob),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = AssetAmber
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -898,6 +973,7 @@ private fun EntitySampleCard(
     entity: DiscoveredEntitySample,
     isTracked: Boolean,
     onToggleTrack: () -> Unit,
+    onProbeEntity: () -> Unit,
     onPin: () -> Unit,
     onCopy: () -> Unit
 ) {
@@ -1069,6 +1145,30 @@ private fun EntitySampleCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                }
+
+                if (entity.coordByteAddress > 0L) {
+                    Surface(
+                        onClick = onProbeEntity,
+                        shape = RoundedCornerShape(7.dp),
+                        color = TelemetryViolet.copy(alpha = 0.22f),
+                        border = BorderStroke(1.dp, TelemetryViolet.copy(alpha = 0.7f)),
+                        modifier = Modifier
+                            .heightIn(min = 38.dp)
+                            .testTag("entity_probe_pill_${entity.selectionKey}")
+                    ) {
+                        Box(
+                            contentAlignment = Alignment.Center,
+                            modifier = Modifier.padding(horizontal = 9.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                text = "Probe",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = TelemetryViolet
+                            )
+                        }
+                    }
                 }
 
                 IconButton(

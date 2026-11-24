@@ -960,8 +960,79 @@ class ExampleRobolectricTest {
         vm.onClearTrackedEntity()
         assertNull(vm.uiState.value.trackedEntityKey)
     }
+
+    @Test
+    fun `picking an entity from Entities list anchors Struct Prober runs Bar Delta HP probe probes Aggro and launches Reverse Target Slot finder`() {
+        val ptrStore = SitePointerStore(InMemoryPointerStorage())
+        val schemaStore = SiteStructSchemaStore(InMemoryPointerStorage())
+        val vm = DiagnosticsViewModel()
+        vm.setSitePointerStoreForTesting(ptrStore)
+        vm.setSiteStructSchemaStoreForTesting(schemaStore)
+
+        val url = "https://universe.flyff.com/play"
+        vm.onUrlInputChanged(url)
+        vm.onLoadUrlRequested()
+
+        // Seed player pointer and a discovered mob verified by distance in Entities
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":8.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
+        )
+        vm.onTelemetryFromBridge(
+            "ENTITY",
+            """{"stage":"WASM_ENTITIES_DISCOVERED","arrayPath":"window.HEAPF32 near 0x03E00000","projectionMode":"WASM Spatial HEAPF32","viewportWidth":1080,"viewportHeight":1920,"durationMs":11.0,"entities":[{"name":"WASM Entity #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6970.0,"worldY":100.0,"worldZ":3315.0,"distanceToPlayer":9.5,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","struct=0x03E01000"]}]}"""
+        )
+        val pickedMob = vm.uiState.value.discoveredEntities.first()
+
+        // 1. Tap "Probe Mob" from Entities -> anchors Struct Prober to PICKED_ENTITY
+        vm.onSelectEntityAsProbeAnchor(pickedMob)
+        assertEquals(ConsoleTab.PROBER, vm.uiState.value.activeConsoleTab)
+        assertEquals(ProberSubTab.STRUCT_PROBER, vm.uiState.value.activeProberSubTab)
+        assertEquals(WasmStructProbeAnchor.PICKED_ENTITY, vm.uiState.value.structProber.probeAnchor)
+        assertEquals(65015960L, vm.uiState.value.structProber.pickedEntityCoordAddress)
+        assertEquals(WasmStructFieldKind.NAME, vm.uiState.value.structProber.activeField)
+
+        // 2. Switch to HP and run Bar / Unknown-Value Delta: Snap -> hit mob -> ↓ Drop -> Bind
+        vm.onSelectStructProbeField(WasmStructFieldKind.HP)
+        vm.runStructDeltaProbe(StructDeltaFilterMode.SNAPSHOT)
+        assertTrue(vm.uiState.value.structProber.isProbing)
+
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"HP","isRefine":false,"isDeltaProbe":true,"deltaMode":"SNAPSHOT","deltaRound":1,"deltaSnapshotCount":4820,"durationMs":3.4,"totalFound":4820,"candidates":[]}"""
+        )
+        assertFalse(vm.uiState.value.structProber.isProbing)
+        assertEquals(1, vm.uiState.value.structProber.deltaRound)
+        assertEquals(4820, vm.uiState.value.structProber.deltaSnapshotCount)
+
+        vm.runStructDeltaProbe(StructDeltaFilterMode.DECREASED)
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"HP","isRefine":true,"isDeltaProbe":true,"deltaMode":"DECREASED","deltaRound":2,"deltaSnapshotCount":2,"durationMs":1.1,"totalFound":2,"candidates":[{"id":"D_456_INT32","relOffsetBytes":456,"subOffsetBytes":null,"valueType":"INT32","expression":"+0x1C8 [i32]","playerDisplayValue":"240 (was 280)","playerNumericValue":240,"adjacentMaxOffsetBytes":460,"adjacentMaxValue":280,"mobPreviews":["#1=240"],"nonZeroMobCount":1}]}"""
+        )
+        assertEquals(2, vm.uiState.value.structProber.deltaRound)
+        assertEquals(2, vm.uiState.value.structProber.deltaSnapshotCount)
+        assertEquals(1, vm.uiState.value.structProber.candidates.size)
+
+        vm.onBindStructFieldCandidate(vm.uiState.value.structProber.candidates.first())
+        assertEquals(456, vm.uiState.value.structProber.schema.hp?.relOffsetBytes)
+        assertEquals(460, vm.uiState.value.structProber.schema.maxHp?.relOffsetBytes)
+
+        // 3. Probe Aggro directly on PICKED_ENTITY without needing Selected Target Slot first
+        vm.onSelectStructProbeField(WasmStructFieldKind.AGGRO)
+        vm.runAggroStructProbe(isAggroedNow = false, refineExisting = false)
+        assertTrue(vm.uiState.value.structProber.isProbing)
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_STRUCT_PROBE_RESULTS","fieldKind":"AGGRO","isRefine":false,"durationMs":0.9,"totalFound":1,"candidates":[{"id":"AG_612_UINT8","relOffsetBytes":612,"subOffsetBytes":null,"valueType":"UINT8","expression":"+0x264 [u8]","playerDisplayValue":"PASSIVE (0)","playerNumericValue":0,"mobPreviews":["#1=0"],"nonZeroMobCount":0}]}"""
+        )
+        assertFalse(vm.uiState.value.structProber.isProbing)
+        assertEquals(1, vm.uiState.value.structProber.candidates.size)
+
+        // 4. Tap "Find Target Slot" for the picked mob -> jumps to Prober → Target and scans HEAPU32
+        vm.onFindTargetSlotForEntity(pickedMob)
+        assertEquals(ConsoleTab.PROBER, vm.uiState.value.activeConsoleTab)
+        assertEquals(ProberSubTab.TARGET_FINDER, vm.uiState.value.activeProberSubTab)
+        assertTrue(vm.uiState.value.targetScanner.isScanning)
+    }
 }
-
-
-
-

@@ -172,11 +172,16 @@
     <string name="action_target_same_type">Same-Type Mob</string>
     <string name="action_assign_target_to_entities">Assign Target to Entity List</string>
     <string name="action_open_target_finder">Target Finder</string>
-    <string name="struct_prober_hint_aggro">With a mob selected &amp; locked in Target Finder: tap Passive while it is idle, then aggro it in-game and tap Aggroed (Refine) to isolate the exact Aggro flag or Player-Target pointer.</string>
+    <string name="struct_prober_hint_aggro">Pick a mob from the Entities tab (or lock a Target slot): tap Passive while it is idle, then aggro it in-game and tap Aggroed to isolate the exact Aggro flag or Player-Target pointer.</string>
     <string name="action_probe_passive">Passive (0)</string>
     <string name="action_probe_aggroed">Aggroed (!=0)</string>
     <string name="entity_location_tracker_badge">READ-ONLY LOCATION TRACKER</string>
-    <string name="entity_location_tracker_note">Walk manually in-game toward the heading below — distance drops to 0.0u to verify this entity\'s exact location (no auto-target or auto-move).</string>
+    <string name="entity_location_tracker_note">Walk manually in-game toward this heading to verify distance drops to 0.0u, then tap Probe Mob to search its Name, HP, or Aggro directly.</string>
+    <string name="action_probe_this_mob">Probe Mob</string>
+    <string name="action_find_target_slot_for_mob">Find Target Slot</string>
+    <string name="struct_bar_delta_title">Or Bar / Unknown-Value Delta (No Exact Number Needed)</string>
+    <string name="struct_bar_delta_hint">Great for Mob HP bars or scaled Player HP/MP: tap Snap while full, hit mob or cast a skill, tap ↓ Drop, wait idle and tap = Same, then hit again and tap ↓ Drop.</string>
 </resources>
+
 
 

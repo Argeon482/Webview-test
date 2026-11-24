@@ -797,6 +797,89 @@ class DiagnosticsViewModel : ViewModel() {
         _uiState.update { it.copy(trackedEntityKey = null) }
     }
 
+    /**
+     * Picks any entity directly from the Entities list as the active Struct Prober anchor
+     * so the user can immediately probe that exact mob's Name, HP (exact or HP-bar delta), MP, FP,
+     * and Aggro status without needing to isolate a global Selected Target pointer first.
+     */
+    fun onSelectEntityAsProbeAnchor(entity: DiscoveredEntitySample) {
+        val coordAddr = entity.coordByteAddress
+        if (coordAddr <= 0L) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("This entity has no WASM coordinate address to probe."))
+            return
+        }
+        val hexAddr = formatHexAddress(coordAddr)
+        val label = entity.resolvedName?.takeIf { it.isNotBlank() }
+            ?: entity.name.takeIf { it.isNotBlank() }
+            ?: hexAddr
+        _uiState.update { state ->
+            val preferredField = if (state.structProber.schema.name == null) {
+                WasmStructFieldKind.NAME
+            } else {
+                WasmStructFieldKind.HP
+            }
+            state.copy(
+                trackedEntityKey = entity.selectionKey,
+                activeConsoleTab = ConsoleTab.PROBER,
+                activeProberSubTab = ProberSubTab.STRUCT_PROBER,
+                consoleSplitFraction = if (state.consoleSplitFraction < 0.25f) 0.48f else state.consoleSplitFraction,
+                structProber = state.structProber.copy(
+                    probeAnchor = WasmStructProbeAnchor.PICKED_ENTITY,
+                    pickedEntityKey = entity.selectionKey,
+                    pickedEntityCoordAddress = coordAddr,
+                    pickedEntityLabel = "$label ($hexAddr)",
+                    activeField = preferredField,
+                    queryInput = "",
+                    candidates = emptyList(),
+                    probeRound = 0,
+                    deltaSnapshotCount = 0,
+                    deltaRound = 0,
+                    statusMessage = "Anchored to $label @ $hexAddr — probe Name, HP (value or Bar Snap/Drop), or Aggro!"
+                )
+            )
+        }
+        appendLog(LogCategory.WASM, "Struct Prober anchored to Entity $label @ $hexAddr", entity.path)
+    }
+
+    /**
+     * Strictly read-only reverse-pointer search: when the user locates a mob in the Entities list
+     * and selects it in-game, scans 100% of HEAPU32 for every slot pointing directly to that mob's struct.
+     */
+    fun onFindTargetSlotForEntity(entity: DiscoveredEntitySample) {
+        val coordAddr = entity.coordByteAddress
+        if (coordAddr <= 0L) {
+            _effects.tryEmit(DiagnosticsEffect.ShowToast("This entity has no WASM address for reverse target lookup."))
+            return
+        }
+        val state = _uiState.value
+        val playerAddr = resolveActivePlayerCoordByteAddress(state)
+        val hexAddr = formatHexAddress(coordAddr)
+        val label = entity.resolvedName?.takeIf { it.isNotBlank() } ?: entity.name.ifBlank { hexAddr }
+        _uiState.update { current ->
+            current.copy(
+                trackedEntityKey = entity.selectionKey,
+                activeConsoleTab = ConsoleTab.PROBER,
+                activeProberSubTab = ProberSubTab.TARGET_FINDER,
+                consoleSplitFraction = if (current.consoleSplitFraction < 0.25f) 0.48f else current.consoleSplitFraction,
+                scanStatus = AsyncScanStatus.RUNNING,
+                scanStatusDetail = "Reverse-finding target slot for $label…",
+                targetScanner = current.targetScanner.copy(
+                    isScanning = true,
+                    statusMessage = "Scanning 100% of HEAPU32 for pointers to $label ($hexAddr)…"
+                )
+            )
+        }
+        _effects.tryEmit(
+            DiagnosticsEffect.EvaluateJs(
+                WasmSelectedTargetScripts.buildFindTargetSlotForEntityScript(
+                    entityCoordByteAddress = coordAddr,
+                    playerByteAddress = playerAddr,
+                    entityLabel = label
+                )
+            )
+        )
+    }
+
     // Read-Only Selected Target Differential Scanner (Mob A -> Diff Mob / Same Mob / Deselected 0 / Same-Type)
     fun onCaptureSelectedTarget() {
         val playerAddr = resolveActivePlayerCoordByteAddress(_uiState.value)
@@ -1098,6 +1181,8 @@ class DiagnosticsViewModel : ViewModel() {
                     probeAnchor = anchor,
                     candidates = emptyList(),
                     probeRound = 0,
+                    deltaSnapshotCount = 0,
+                    deltaRound = 0,
                     statusMessage = ""
                 )
             )
@@ -1108,18 +1193,27 @@ class DiagnosticsViewModel : ViewModel() {
         _uiState.update { state ->
             val switchedCategory = state.structProber.activeField.isNameField != field.isNameField ||
                 state.structProber.activeField.isAggroField != field.isAggroField
-            val nextAnchor = if (field.isAggroField && state.targetScanner.liveTarget?.hasTarget == true) {
-                WasmStructProbeAnchor.SELECTED_TARGET
+            val nextAnchor = if (field.isAggroField) {
+                when {
+                    state.structProber.probeAnchor == WasmStructProbeAnchor.PICKED_ENTITY &&
+                        state.structProber.pickedEntityCoordAddress > 0L -> WasmStructProbeAnchor.PICKED_ENTITY
+                    state.targetScanner.liveTarget?.hasTarget == true -> WasmStructProbeAnchor.SELECTED_TARGET
+                    state.structProber.pickedEntityCoordAddress > 0L -> WasmStructProbeAnchor.PICKED_ENTITY
+                    else -> state.structProber.probeAnchor
+                }
             } else {
                 state.structProber.probeAnchor
             }
+            val fieldChanged = state.structProber.activeField != field
             state.copy(
                 structProber = state.structProber.copy(
                     probeAnchor = nextAnchor,
                     activeField = field,
                     queryInput = if (switchedCategory) "" else state.structProber.queryInput,
-                    candidates = if (state.structProber.activeField != field) emptyList() else state.structProber.candidates,
-                    probeRound = if (state.structProber.activeField != field) 0 else state.structProber.probeRound,
+                    candidates = if (fieldChanged) emptyList() else state.structProber.candidates,
+                    probeRound = if (fieldChanged) 0 else state.structProber.probeRound,
+                    deltaSnapshotCount = if (fieldChanged) 0 else state.structProber.deltaSnapshotCount,
+                    deltaRound = if (fieldChanged) 0 else state.structProber.deltaRound,
                     statusMessage = ""
                 )
             )
@@ -1152,22 +1246,58 @@ class DiagnosticsViewModel : ViewModel() {
         return fd.lockedCoords?.xByteAddress ?: 0L
     }
 
-    private fun resolveActiveStructProbeAnchorAddress(state: DiagnosticsUiState): Pair<Long, Boolean> {
-        return if (state.structProber.probeAnchor == WasmStructProbeAnchor.SELECTED_TARGET) {
-            val targetAddr = state.targetScanner.liveTarget?.takeIf { it.hasTarget }?.effectiveAnchorAddress ?: 0L
-            targetAddr to true
-        } else {
-            resolveActivePlayerCoordByteAddress(state) to false
+    private data class ResolvedProbeAnchor(
+        val byteAddress: Long,
+        val isTargetSlot: Boolean,
+        val useDirectAddress: Boolean,
+        val label: String
+    )
+
+    private fun resolveActiveStructProbeAnchor(state: DiagnosticsUiState): ResolvedProbeAnchor {
+        return when (state.structProber.probeAnchor) {
+            WasmStructProbeAnchor.PICKED_ENTITY -> {
+                val pickedAddr = state.structProber.pickedEntityCoordAddress
+                val label = state.structProber.pickedEntityLabel.ifBlank { "picked mob" }
+                ResolvedProbeAnchor(
+                    byteAddress = pickedAddr,
+                    isTargetSlot = false,
+                    useDirectAddress = true,
+                    label = label
+                )
+            }
+            WasmStructProbeAnchor.SELECTED_TARGET -> {
+                val targetAddr = state.targetScanner.liveTarget?.takeIf { it.hasTarget }?.effectiveAnchorAddress ?: 0L
+                ResolvedProbeAnchor(
+                    byteAddress = targetAddr,
+                    isTargetSlot = true,
+                    useDirectAddress = false,
+                    label = state.targetScanner.liveTarget?.resolvedName ?: "selected target"
+                )
+            }
+            WasmStructProbeAnchor.PLAYER -> {
+                ResolvedProbeAnchor(
+                    byteAddress = resolveActivePlayerCoordByteAddress(state),
+                    isTargetSlot = false,
+                    useDirectAddress = false,
+                    label = "player"
+                )
+            }
         }
     }
 
     fun runAggroStructProbe(isAggroedNow: Boolean, refineExisting: Boolean = false) {
         val state = _uiState.value
         val prober = state.structProber
-        val targetAddr = state.targetScanner.liveTarget?.takeIf { it.hasTarget }?.effectiveAnchorAddress ?: 0L
+        val usePicked = (prober.probeAnchor == WasmStructProbeAnchor.PICKED_ENTITY && prober.pickedEntityCoordAddress > 0L) ||
+            (state.targetScanner.liveTarget?.hasTarget != true && prober.pickedEntityCoordAddress > 0L)
+        val targetAddr = if (usePicked) {
+            prober.pickedEntityCoordAddress
+        } else {
+            state.targetScanner.liveTarget?.takeIf { it.hasTarget }?.effectiveAnchorAddress ?: 0L
+        }
         val playerAddr = resolveActivePlayerCoordByteAddress(state)
         if (targetAddr <= 0L) {
-            val msg = "Lock a Selected Target mob in Target Finder first so Aggro status can be probed."
+            val msg = "Pick a mob from the Entities tab or lock a Selected Target first so Aggro can be probed."
             _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
             _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
             return
@@ -1188,16 +1318,17 @@ class DiagnosticsViewModel : ViewModel() {
         }
 
         val stateLabel = if (isAggroedNow) "AGGROED (attacking)" else "PASSIVE (idle)"
+        val anchorName = if (usePicked) prober.pickedEntityLabel.ifBlank { formatHexAddress(targetAddr) } else formatHexAddress(targetAddr)
         _uiState.update { current ->
             current.copy(
                 structProber = current.structProber.copy(
-                    probeAnchor = WasmStructProbeAnchor.SELECTED_TARGET,
+                    probeAnchor = if (usePicked) WasmStructProbeAnchor.PICKED_ENTITY else WasmStructProbeAnchor.SELECTED_TARGET,
                     activeField = WasmStructFieldKind.AGGRO,
                     isProbing = true,
                     statusMessage = if (existingJson != null) {
                         "Refining ${prober.candidates.size} Aggro candidate(s) while mob is $stateLabel…"
                     } else {
-                        "Probing Selected Target (${formatHexAddress(targetAddr)}) while mob is $stateLabel…"
+                        "Probing $anchorName while mob is $stateLabel…"
                     }
                 )
             )
@@ -1209,7 +1340,63 @@ class DiagnosticsViewModel : ViewModel() {
                     targetAnchorByteAddress = targetAddr,
                     playerByteAddress = playerAddr,
                     isAggroedNow = isAggroedNow,
-                    existingCandidatesJson = existingJson
+                    existingCandidatesJson = existingJson,
+                    useDirectAnchorAddress = usePicked
+                )
+            )
+        )
+    }
+
+    /**
+     * Strictly read-only Unknown-Value / Health-Bar Differential Probe inside the active entity
+     * or player struct (`Snap` -> hit mob / cast skill -> `↓ Drop` -> `= Same` -> `↓ Drop`).
+     */
+    fun runStructDeltaProbe(mode: StructDeltaFilterMode) {
+        val state = _uiState.value
+        val prober = state.structProber
+        val field = prober.activeField
+        if (field.isNameField || field.isAggroField) return
+
+        val anchor = resolveActiveStructProbeAnchor(state)
+        if (anchor.byteAddress <= 0L) {
+            val msg = when (prober.probeAnchor) {
+                WasmStructProbeAnchor.PICKED_ENTITY -> "Pick a mob from the Entities tab first."
+                WasmStructProbeAnchor.SELECTED_TARGET -> "Lock a Selected Target or pick a mob from Entities first."
+                WasmStructProbeAnchor.PLAYER -> "Lock coordinates or stream a verified live player pointer first."
+            }
+            _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+
+        if (mode != StructDeltaFilterMode.SNAPSHOT && prober.deltaRound <= 0) {
+            val msg = "Tap 'Snap' first before filtering ${mode.label}."
+            _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
+            _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
+            return
+        }
+
+        _uiState.update { current ->
+            current.copy(
+                structProber = current.structProber.copy(
+                    isProbing = true,
+                    statusMessage = if (mode == StructDeltaFilterMode.SNAPSHOT) {
+                        "Capturing ${field.shortLabel} snapshot inside ${anchor.label} (${formatHexAddress(anchor.byteAddress)})…"
+                    } else {
+                        "Filtering ${current.structProber.deltaSnapshotCount} ${field.shortLabel} value(s) for ${mode.label}…"
+                    }
+                )
+            )
+        }
+
+        _effects.tryEmit(
+            DiagnosticsEffect.EvaluateJs(
+                WasmStructProberScripts.buildStructDeltaProbeScript(
+                    fieldKind = field,
+                    anchorByteAddress = anchor.byteAddress,
+                    mode = mode,
+                    anchorIsTarget = anchor.isTargetSlot,
+                    useDirectAnchorAddress = anchor.useDirectAddress
                 )
             )
         )
@@ -1219,7 +1406,7 @@ class DiagnosticsViewModel : ViewModel() {
         val state = _uiState.value
         val prober = state.structProber
         val field = prober.activeField
-        val (anchorAddr, isTargetAnchor) = resolveActiveStructProbeAnchorAddress(state)
+        val anchor = resolveActiveStructProbeAnchor(state)
 
         if (field.isAggroField) {
             runAggroStructProbe(isAggroedNow = true, refineExisting = refineExisting)
@@ -1228,18 +1415,17 @@ class DiagnosticsViewModel : ViewModel() {
 
         if (field.isNameField) {
             runNameStructProbeInternal(
-                anchorAddr = anchorAddr,
-                anchorIsTarget = isTargetAnchor,
+                anchor = anchor,
                 query = prober.queryInput.trim()
             )
             return
         }
 
-        if (anchorAddr <= 0L) {
-            val msg = if (isTargetAnchor) {
-                "Lock a Selected Target mob in Target Finder first."
-            } else {
-                "Lock coordinates or stream a verified live player pointer first."
+        if (anchor.byteAddress <= 0L) {
+            val msg = when (prober.probeAnchor) {
+                WasmStructProbeAnchor.PICKED_ENTITY -> "Pick a mob from the Entities tab first."
+                WasmStructProbeAnchor.SELECTED_TARGET -> "Lock a Selected Target or pick a mob from Entities first."
+                WasmStructProbeAnchor.PLAYER -> "Lock coordinates or stream a verified live player pointer first."
             }
             _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
             _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
@@ -1248,7 +1434,7 @@ class DiagnosticsViewModel : ViewModel() {
 
         val targetVal = prober.queryInput.trim().toDoubleOrNull()
         if (targetVal == null || !targetVal.isFinite()) {
-            val msg = "Enter current ${field.shortLabel} value (e.g. 4338) first."
+            val msg = "Enter current ${field.shortLabel} value (e.g. 4338) or use Bar Snap / ↓ Drop below."
             _uiState.update { it.copy(structProber = it.structProber.copy(statusMessage = msg)) }
             _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
             return
@@ -1268,7 +1454,6 @@ class DiagnosticsViewModel : ViewModel() {
             null
         }
 
-        val anchorLabel = if (isTargetAnchor) "selected mob" else "player"
         _uiState.update { current ->
             current.copy(
                 structProber = current.structProber.copy(
@@ -1276,7 +1461,7 @@ class DiagnosticsViewModel : ViewModel() {
                     statusMessage = if (existingJson != null) {
                         "Refining ${prober.candidates.size} ${field.shortLabel} candidate(s) for $targetVal…"
                     } else {
-                        "Probing $anchorLabel struct around ${formatHexAddress(anchorAddr)} for ${field.shortLabel}=$targetVal…"
+                        "Probing ${anchor.label} around ${formatHexAddress(anchor.byteAddress)} for ${field.shortLabel}=$targetVal…"
                     }
                 )
             )
@@ -1286,10 +1471,11 @@ class DiagnosticsViewModel : ViewModel() {
             DiagnosticsEffect.EvaluateJs(
                 WasmStructProberScripts.buildProbeStatOffsetsScript(
                     fieldKind = field,
-                    playerByteAddress = anchorAddr,
+                    playerByteAddress = anchor.byteAddress,
                     targetValue = targetVal,
                     existingCandidatesJson = existingJson,
-                    anchorIsTarget = isTargetAnchor
+                    anchorIsTarget = anchor.isTargetSlot,
+                    useDirectAnchorAddress = anchor.useDirectAddress
                 )
             )
         )
@@ -1297,40 +1483,38 @@ class DiagnosticsViewModel : ViewModel() {
 
     fun runAutoProbeEntityNames() {
         val state = _uiState.value
-        val (anchorAddr, isTargetAnchor) = resolveActiveStructProbeAnchorAddress(state)
+        val anchor = resolveActiveStructProbeAnchor(state)
         _uiState.update { current ->
             current.copy(
                 structProber = current.structProber.copy(
                     activeField = WasmStructFieldKind.NAME,
                     isProbing = true,
-                    statusMessage = "Auto-probing inline UTF-8, char*, and std::string fields…"
+                    statusMessage = "Auto-probing inline UTF-8, char*, and std::string fields on ${anchor.label}…"
                 )
             )
         }
-        runNameStructProbeInternal(anchorAddr = anchorAddr, anchorIsTarget = isTargetAnchor, query = "")
+        runNameStructProbeInternal(anchor = anchor, query = "")
     }
 
     private fun runNameStructProbeInternal(
-        anchorAddr: Long,
-        anchorIsTarget: Boolean,
+        anchor: ResolvedProbeAnchor,
         query: String
     ) {
-        if (anchorAddr <= 0L && _uiState.value.discoveredEntities.isEmpty()) {
-            val msg = "Activate a live player/target pointer or scan nearby entities first."
+        if (anchor.byteAddress <= 0L && _uiState.value.discoveredEntities.isEmpty()) {
+            val msg = "Activate a player pointer, pick a mob from Entities, or scan nearby entities first."
             _uiState.update { it.copy(structProber = it.structProber.copy(isProbing = false, statusMessage = msg)) }
             _effects.tryEmit(DiagnosticsEffect.ShowToast(msg))
             return
         }
-        val anchorLabel = if (anchorIsTarget) "selected mob & nearby mobs" else "player & nearby mobs"
         _uiState.update { current ->
             current.copy(
                 structProber = current.structProber.copy(
                     activeField = WasmStructFieldKind.NAME,
                     isProbing = true,
                     statusMessage = if (query.isNotBlank()) {
-                        "Searching $anchorLabel for \"$query\"…"
+                        "Searching ${anchor.label} & nearby mobs for \"$query\"…"
                     } else {
-                        "Auto-probing inline UTF-8, char*, and std::string fields on $anchorLabel…"
+                        "Auto-probing inline UTF-8, char*, and std::string fields on ${anchor.label}…"
                     }
                 )
             )
@@ -1338,9 +1522,10 @@ class DiagnosticsViewModel : ViewModel() {
         _effects.tryEmit(
             DiagnosticsEffect.EvaluateJs(
                 WasmStructProberScripts.buildProbeNameOffsetsScript(
-                    playerByteAddress = anchorAddr,
+                    playerByteAddress = anchor.byteAddress,
                     nameQuery = query,
-                    anchorIsTarget = anchorIsTarget
+                    anchorIsTarget = anchor.isTargetSlot,
+                    useDirectAnchorAddress = anchor.useDirectAddress
                 )
             )
         )
@@ -3477,6 +3662,9 @@ class DiagnosticsViewModel : ViewModel() {
             "WASM_STRUCT_PROBE_RESULTS" -> {
                 val fieldKind = WasmStructFieldKind.fromRaw(json.optString("fieldKind", "HP"))
                 val isRefine = json.optBoolean("isRefine", false)
+                val isDeltaProbe = json.optBoolean("isDeltaProbe", false)
+                val deltaMode = json.optString("deltaMode", "")
+                val deltaRound = json.optInt("deltaRound", 0)
                 val errorMsg = json.optString("error", "")
                 if (errorMsg.isNotBlank()) {
                     _uiState.update { state ->
@@ -3494,12 +3682,20 @@ class DiagnosticsViewModel : ViewModel() {
                     val totalFound = json.optInt("totalFound", 0)
                     val parsed = parseStructProbeCandidates(json.optJSONArray("candidates"))
                     val msg = when {
+                        isDeltaProbe && deltaMode == "SNAPSHOT" ->
+                            "Captured $totalFound ${fieldKind.shortLabel} values (${durationMs}ms). Now hit the mob / spend MP & tap '↓ Drop'!"
+                        isDeltaProbe && totalFound == 0 ->
+                            "0 values survived $deltaMode (${durationMs}ms). Tap 'Snap' to start a fresh bar capture."
+                        isDeltaProbe && parsed.size == 1 ->
+                            "Exact ${fieldKind.shortLabel} isolated via $deltaMode: ${parsed.first().expression} (${parsed.first().playerDisplayValue}) — tap Bind!"
+                        isDeltaProbe ->
+                            "$totalFound ${fieldKind.shortLabel} value(s) left after $deltaMode (${durationMs}ms) — wait & tap '= Same', or hit again & tap '↓ Drop'."
                         parsed.isEmpty() && fieldKind.isNameField ->
-                            "0 name fields matched (${durationMs}ms). Try Auto-Probe without a filter or scan nearby entities first."
+                            "0 name fields matched (${durationMs}ms). Try Auto-Probe without a filter or pick a mob from Entities."
                         parsed.isEmpty() && fieldKind.isAggroField ->
-                            "0 aggro flag/pointer offsets matched (${durationMs}ms). Ensure target mob is locked and try Passive -> Aggroed refine."
+                            "0 aggro flag/pointer offsets matched (${durationMs}ms). Try Passive -> Aggroed refine on your picked mob."
                         parsed.isEmpty() ->
-                            "0 ${fieldKind.shortLabel} matches in struct window (${durationMs}ms). Verify exact stat value."
+                            "0 exact ${fieldKind.shortLabel} matches (${durationMs}ms). Try Bar / Unknown Delta ('Snap' -> '↓ Drop') below!"
                         parsed.size == 1 ->
                             "Exact ${fieldKind.shortLabel} candidate isolated: ${parsed.first().expression} (${durationMs}ms) — tap Bind!"
                         fieldKind.isAggroField ->
@@ -3514,7 +3710,9 @@ class DiagnosticsViewModel : ViewModel() {
                             structProber = state.structProber.copy(
                                 activeField = fieldKind,
                                 isProbing = false,
-                                probeRound = if (isRefine) state.structProber.probeRound + 1 else 1,
+                                probeRound = if (isDeltaProbe) state.structProber.probeRound else (if (isRefine) state.structProber.probeRound + 1 else 1),
+                                deltaSnapshotCount = if (isDeltaProbe) totalFound else state.structProber.deltaSnapshotCount,
+                                deltaRound = if (isDeltaProbe) deltaRound else state.structProber.deltaRound,
                                 candidates = parsed,
                                 statusMessage = msg
                             )

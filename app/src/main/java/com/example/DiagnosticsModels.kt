@@ -200,7 +200,12 @@ data class DiscoveredEntitySample(
     val maxFp: Int? = null,
     val aggroRawValue: Int? = null,
     val isAggro: Boolean? = null,
-    val isActiveGameTarget: Boolean = false
+    val isActiveGameTarget: Boolean = false,
+    val deltaX: Double? = null,
+    val deltaZ: Double? = null,
+    val distanceDelta: Double? = null,
+    val selfMoveDelta: Double = 0.0,
+    val isConfirmedMoving: Boolean = false
 ) {
     val selectionKey: String
         get() = "${path}_${id}"
@@ -676,6 +681,9 @@ data class DiagnosticsUiState(
     val entityViewportHeight: Int = 0,
     val discoveredEntities: List<DiscoveredEntitySample> = emptyList(),
     val lastEntityCount: Int = 0,
+    val lastStaticEntitiesFilteredCount: Int = 0,
+    val lastEntityScanDwellMs: Int = 0,
+    val lastEntityScanCompleted: Boolean = false,
     val isWasmEntitiesLivePolling: Boolean = false,
     val wasmEntityLiveTickCount: Int = 0,
     val trackedEntityKey: String? = null,

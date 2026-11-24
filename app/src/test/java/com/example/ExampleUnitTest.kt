@@ -402,4 +402,60 @@ class ExampleUnitTest {
       assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
     }
   }
+
+  @Test
+  fun twoPassMovingEntityScannerUsesTypedArraysRejectsStaticAndPlayerClonesAndIsReadOnly() {
+    val scan1200 = WasmPointerAndEntityScripts.buildScanWasmNearbyEntitiesScript(
+      playerByteAddress = 65011712L,
+      playerX = 6961.98,
+      playerY = 100.0,
+      playerZ = 3309.76,
+      structCoordOffset = 152,
+      dwellMs = 1200
+    )
+    val scan2500 = WasmPointerAndEntityScripts.buildScanWasmNearbyEntitiesScript(
+      playerByteAddress = 65011712L,
+      playerX = 6961.98,
+      playerY = 100.0,
+      playerZ = 3309.76,
+      structCoordOffset = 152,
+      dwellMs = 2500
+    )
+    val liveTick = WasmPointerAndEntityScripts.buildStartWasmEntitiesLiveRefreshScript()
+
+    // Pass 1 full-heap TypedArrays (no 2,000-hit early cutoff)
+    assertTrue(scan1200.contains("const MAX_PASS1_SNAP = 200000;"))
+    assertFalse(scan1200.contains("MAX_RAW_HITS = 2000"))
+    assertTrue(scan1200.contains("new Int32Array(MAX_PASS1_SNAP)"))
+    assertTrue(scan1200.contains("new Float32Array(MAX_PASS1_SNAP)"))
+
+    // Dual-checkpoint movement dwell + player-mirror clone rejection + closest-to-furthest sort
+    assertTrue(scan1200.contains("const DWELL_MS = 1200;"))
+    assertTrue(scan2500.contains("const DWELL_MS = 2500;"))
+    assertTrue(scan1200.contains("isPlayerMirror"))
+    assertTrue(scan1200.contains("staticFilteredCount"))
+    assertTrue(scan1200.contains("twoPass: true"))
+    assertTrue(scan1200.contains("deltaX:"))
+    assertTrue(scan1200.contains("deltaZ:"))
+    assertTrue(liveTick.contains("distanceDelta: distDelta"))
+    assertTrue(liveTick.contains("selfMoveDelta:"))
+
+    // Strictly read-only: zero writes to WASM linear memory and zero synthetic input events
+    val heapWriteRegex = Regex("""(hf32|hu32|h32|h16|u8|heapF32|heapU32|heap32|heap16|heapU8|HEAPF32|HEAPU32|HEAP32|HEAPU8)\[[^\]]+]\s*=(?!=)""")
+    val syntheticInputRegex = Regex("""(dispatchEvent|MouseEvent|PointerEvent|TouchEvent|KeyboardEvent)""")
+    listOf(scan1200, scan2500, liveTick).forEach { script ->
+      assertFalse("Must not write to WASM heap", heapWriteRegex.containsMatchIn(script))
+      assertFalse("Must not inject synthetic input", syntheticInputRegex.containsMatchIn(script))
+    }
+
+    // 8-point compass direction arrow helper
+    assertEquals("↑ N", com.example.ui.formatCompassArrowLabel(0.0, 10.0))
+    assertEquals("↗ NE", com.example.ui.formatCompassArrowLabel(10.0, 10.0))
+    assertEquals("→ E", com.example.ui.formatCompassArrowLabel(10.0, 0.0))
+    assertEquals("↘ SE", com.example.ui.formatCompassArrowLabel(10.0, -10.0))
+    assertEquals("↓ S", com.example.ui.formatCompassArrowLabel(0.0, -10.0))
+    assertEquals("↙ SW", com.example.ui.formatCompassArrowLabel(-10.0, -10.0))
+    assertEquals("← W", com.example.ui.formatCompassArrowLabel(-10.0, 0.0))
+    assertEquals("↖ NW", com.example.ui.formatCompassArrowLabel(-10.0, 10.0))
+  }
 }

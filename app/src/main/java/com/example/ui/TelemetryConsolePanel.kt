@@ -118,6 +118,7 @@ fun TelemetryConsolePanel(
     onRunStep2A: () -> Unit,
     onRunStep2B: () -> Unit,
     onRunStep3: () -> Unit,
+    onRunStep3Longer: () -> Unit,
     onExportReport: () -> Unit,
     onShareReport: () -> Unit,
     onExportLogDumpTxt: () -> Unit,
@@ -285,6 +286,7 @@ fun TelemetryConsolePanel(
                         EntityInspectionConsoleView(
                             state = state,
                             onRescanEntities = onRunStep3,
+                            onRescanEntitiesLonger = onRunStep3Longer,
                             onToggleLiveEntities = onToggleWasmEntitiesLive,
                             onOpenTargetFinder = {
                                 onSelectProberSubTab(ProberSubTab.TARGET_FINDER)

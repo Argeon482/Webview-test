@@ -616,11 +616,14 @@ object WasmPointerAndEntityScripts {
     }
 
     /**
-     * Step 3 (WASM Mode): Read-only, non-blocking 1 MB sliced scanner over `window.HEAPF32`
-     * that finds nearby entity `(X, Y, Z)` coordinate structs within `[minRadius, maxRadius]`
-     * of the player's live WASM coordinate address, deduplicates mirrored matrix/physics copies,
-     * reads struct metadata if a coordinate offset is known, and stores discovered entity
-     * indices for optional 500ms live entity tracking.
+     * Step 3 (WASM Mode): Strictly read-only Two-Pass Moving-Entity Scanner over 100% of `window.HEAPF32`.
+     * - Pass 1 scans the entire float heap in non-blocking 1 MB async slices (`setTimeout(resolve, 12)`)
+     *   into compact TypedArrays (no early 2,000-hit cutoff) for all nearby `(X, Y, Z)` floats.
+     * - Dwell window observes two checkpoints (`dwellMs / 2` and `dwellMs`), automatically rejecting
+     *   stationary map clutter (props, trees, terrain, spawn markers) and player/camera clones that
+     *   move in lockstep with the player.
+     * - Collapses physics/render clones of the same mob (preferring structs aligned with the player's
+     *   coordinate offset and memory region) and sorts verified moving mobs strictly closest-to-furthest.
      */
     fun buildScanWasmNearbyEntitiesScript(
         playerByteAddress: Long,
@@ -630,7 +633,8 @@ object WasmPointerAndEntityScripts {
         structCoordOffset: Int = 0,
         minRadius: Double = 1.5,
         maxRadius: Double = 250.0,
-        maxYDelta: Double = 60.0
+        maxYDelta: Double = 60.0,
+        dwellMs: Int = 1200
     ): String {
         val safePlayerAddr = playerByteAddress.coerceAtLeast(0L)
         val safePx = if (playerX.isFinite()) playerX.toString() else "0.0"
@@ -640,6 +644,7 @@ object WasmPointerAndEntityScripts {
         val safeMinR = minRadius.coerceIn(0.5, 50.0)
         val safeMaxR = maxRadius.coerceIn(10.0, 2000.0)
         val safeMaxY = maxYDelta.coerceIn(5.0, 500.0)
+        val safeDwellMs = dwellMs.coerceIn(600, 5000)
 
         return """
         (async function() {
@@ -671,119 +676,240 @@ object WasmPointerAndEntityScripts {
             const h32 = heaps.heap32;
             const lenF32 = hf32.length;
 
-            // Refresh live player address & coordinates if active HUD pointer is running
-            let playerAddr = $safePlayerAddr;
-            let px = Number($safePx);
-            let py = Number($safePy);
-            let pz = Number($safePz);
-            if (__ptrWatch && __ptrWatch.hudPointerId && Array.isArray(__ptrWatch.chains)) {
-              for (let i = 0; i < __ptrWatch.chains.length; i++) {
-                if (__ptrWatch.chains[i].id === __ptrWatch.hudPointerId) {
-                  const d = __peDerefChain(__ptrWatch.chains[i], heaps);
-                  if (d.isVerifiedLive && d.addr > 0) {
-                    playerAddr = d.addr;
-                    px = d.x;
-                    py = d.y;
-                    pz = d.z;
+            const readLivePlayer = function(fallbackAddr, fallbackX, fallbackY, fallbackZ) {
+              let addr = fallbackAddr;
+              let rx = fallbackX;
+              let ry = fallbackY;
+              let rz = fallbackZ;
+              if (__ptrWatch && __ptrWatch.hudPointerId && Array.isArray(__ptrWatch.chains)) {
+                for (let i = 0; i < __ptrWatch.chains.length; i++) {
+                  if (__ptrWatch.chains[i].id === __ptrWatch.hudPointerId) {
+                    const d = __peDerefChain(__ptrWatch.chains[i], heaps);
+                    if (d.isVerifiedLive && d.addr > 0) {
+                      return { addr: d.addr, x: d.x, y: d.y, z: d.z };
+                    }
+                    break;
                   }
-                  break;
                 }
               }
-            } else if (playerAddr > 0 && ((playerAddr >>> 2) + 2) < lenF32) {
-              const pIdx = playerAddr >>> 2;
-              if (Number.isFinite(hf32[pIdx]) && Number.isFinite(hf32[pIdx + 1]) && Number.isFinite(hf32[pIdx + 2])) {
-                px = hf32[pIdx];
-                py = hf32[pIdx + 1];
-                pz = hf32[pIdx + 2];
+              if (addr > 0 && ((addr >>> 2) + 2) < lenF32) {
+                const pIdx = addr >>> 2;
+                if (Number.isFinite(hf32[pIdx]) && Number.isFinite(hf32[pIdx + 1]) && Number.isFinite(hf32[pIdx + 2])) {
+                  rx = hf32[pIdx];
+                  ry = hf32[pIdx + 1];
+                  rz = hf32[pIdx + 2];
+                }
               }
-            }
+              return { addr: addr, x: rx, y: ry, z: rz };
+            };
 
-            const playerFloatIdx = playerAddr >>> 2;
+            const p0 = readLivePlayer($safePlayerAddr, Number($safePx), Number($safePy), Number($safePz));
+            const playerAddr0 = p0.addr;
+            const px0 = p0.x;
+            const py0 = p0.y;
+            const pz0 = p0.z;
+            const playerFloatIdx = playerAddr0 >>> 2;
+
             const STRUCT_OFF = $safeStructOff;
             const MIN_R = Number($safeMinR);
             const MAX_R = Number($safeMaxR);
             const MIN_R2 = MIN_R * MIN_R;
             const MAX_R2 = MAX_R * MAX_R;
             const MAX_Y = Number($safeMaxY);
+            const DWELL_MS = $safeDwellMs;
             const START_IDX = lenF32 > 4096 ? 256 : 0;
             const CHUNK_FLOATS = 262144; // 1 MB per non-blocking slice
-            const MAX_RAW_HITS = 2000;
+            const MAX_PASS1_SNAP = 200000; // Compact TypedArrays (~3.2 MB transient, zero premature 2k cutoff)
 
-            __peStatus('RUNNING', 'Step 3 WASM: scanning HEAPF32 for nearby entities…');
+            const snapIdx = new Int32Array(MAX_PASS1_SNAP);
+            const snapX0 = new Float32Array(MAX_PASS1_SNAP);
+            const snapY0 = new Float32Array(MAX_PASS1_SNAP);
+            const snapZ0 = new Float32Array(MAX_PASS1_SNAP);
+            let snapCount = 0;
 
-            const rawHits = [];
-            for (let base = START_IDX; base < lenF32 - 2 && rawHits.length < MAX_RAW_HITS; base += CHUNK_FLOATS) {
+            __peStatus('RUNNING', 'Pass 1/2: scanning 100% of HEAPF32 for nearby coords…');
+
+            for (let base = START_IDX; base < lenF32 - 2 && snapCount < MAX_PASS1_SNAP; base += CHUNK_FLOATS) {
               if (mySeq !== __entState.scanSeq) return;
               const end = Math.min(base + CHUNK_FLOATS, lenF32 - 2);
-              for (let i = base; i < end && rawHits.length < MAX_RAW_HITS; i++) {
+              for (let i = base; i < end && snapCount < MAX_PASS1_SNAP; i++) {
                 // Skip player's own immediate struct vicinity
-                if (playerFloatIdx > 0 && Math.abs(i - playerFloatIdx) <= 16) continue;
+                if (playerFloatIdx > 0 && Math.abs(i - playerFloatIdx) <= 24) continue;
 
                 const vx = hf32[i];
                 if (vx !== vx) continue;
-                const dx = vx - px;
+                const dx = vx - px0;
                 if (dx < -MAX_R || dx > MAX_R) continue;
 
                 const vy = hf32[i + 1];
                 if (vy !== vy) continue;
-                const dy = vy - py;
+                const dy = vy - py0;
                 if (dy < -MAX_Y || dy > MAX_Y) continue;
 
                 const vz = hf32[i + 2];
                 if (vz !== vz) continue;
-                const dz = vz - pz;
+                const dz = vz - pz0;
                 if (dz < -MAX_R || dz > MAX_R) continue;
 
                 const dist2 = dx * dx + dy * dy + dz * dz;
                 if (dist2 < MIN_R2 || dist2 > MAX_R2) continue;
 
-                // Reject degenerate zero-plane or NaN-like values
+                // Reject degenerate origin-plane floats
                 if (Math.abs(vx) < 0.001 && Math.abs(vz) < 0.001) continue;
 
-                const byteAddr = i * 4;
-                const structBase = (STRUCT_OFF > 0 && byteAddr >= STRUCT_OFF) ? (byteAddr - STRUCT_OFF) : byteAddr;
-                const matchesOffsetMod = (STRUCT_OFF > 0 && ((byteAddr - STRUCT_OFF) & 15) === 0);
-                rawHits.push({
-                  heapIndex: i,
-                  byteAddr: byteAddr,
-                  structBase: structBase,
-                  matchesOffsetMod: matchesOffsetMod,
-                  x: vx,
-                  y: vy,
-                  z: vz,
-                  dx: dx,
-                  dy: dy,
-                  dz: dz,
-                  dist: Math.sqrt(dist2)
-                });
+                snapIdx[snapCount] = i;
+                snapX0[snapCount] = vx;
+                snapY0[snapCount] = vy;
+                snapZ0[snapCount] = vz;
+                snapCount++;
                 // Advance past this Vec3 so overlapping (Y, Z, next) slots aren't double-counted
                 i += 2;
               }
-              if (end < lenF32 - 2 && rawHits.length < MAX_RAW_HITS) {
+              if (end < lenF32 - 2 && snapCount < MAX_PASS1_SNAP) {
                 await __peYield(12);
               }
             }
 
             if (mySeq !== __entState.scanSeq) return;
 
-            // Sort by distance ascending, preferring aligned struct matches when equidistant
-            rawHits.sort(function(a, b) {
-              if (Math.abs(a.dist - b.dist) > 0.05) return a.dist - b.dist;
+            // Dwell Window — Dual Checkpoints (halfDwell + fullDwell) to catch patrolling & turning mobs
+            const halfDwell = Math.round(DWELL_MS / 2);
+            const remDwell = Math.max(200, DWELL_MS - halfDwell);
+            __peStatus(
+              'RUNNING',
+              'Pass 2/2: observing ' + snapCount + ' coords for mob motion (' + (DWELL_MS / 1000).toFixed(1) + 's)…'
+            );
+
+            await __peYield(halfDwell);
+            if (mySeq !== __entState.scanSeq) return;
+
+            const pMid = readLivePlayer(playerAddr0, px0, py0, pz0);
+            const pdxMid = pMid.x - px0;
+            const pdyMid = pMid.y - py0;
+            const pdzMid = pMid.z - pz0;
+            const pMoveMid = Math.sqrt(pdxMid * pdxMid + pdyMid * pdyMid + pdzMid * pdzMid);
+
+            const midIndependentMove = new Float32Array(snapCount);
+            for (let k = 0; k < snapCount; k++) {
+              const idx = snapIdx[k];
+              if (idx + 2 >= lenF32) continue;
+              const mx = hf32[idx];
+              const my = hf32[idx + 1];
+              const mz = hf32[idx + 2];
+              if (!Number.isFinite(mx) || !Number.isFinite(my) || !Number.isFinite(mz)) continue;
+              const ex = mx - snapX0[k];
+              const ey = my - snapY0[k];
+              const ez = mz - snapZ0[k];
+              const mDist = Math.sqrt(ex * ex + ey * ey + ez * ez);
+              if (mDist >= 0.03 && mDist <= 80.0) {
+                let isPlayerMirror = false;
+                if (pMoveMid >= 0.03) {
+                  const rdx = ex - pdxMid;
+                  const rdy = ey - pdyMid;
+                  const rdz = ez - pdzMid;
+                  if (Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz) < 0.15) {
+                    isPlayerMirror = true;
+                  }
+                }
+                if (!isPlayerMirror) {
+                  midIndependentMove[k] = mDist;
+                }
+              }
+            }
+
+            await __peYield(remDwell);
+            if (mySeq !== __entState.scanSeq) return;
+
+            const p1 = readLivePlayer(playerAddr0, px0, py0, pz0);
+            const playerAddr = p1.addr;
+            const px = p1.x;
+            const py = p1.y;
+            const pz = p1.z;
+            const pdxFull = px - px0;
+            const pdyFull = py - py0;
+            const pdzFull = pz - pz0;
+            const pMoveFull = Math.sqrt(pdxFull * pdxFull + pdyFull * pdyFull + pdzFull * pdzFull);
+
+            const movingHits = [];
+            for (let k = 0; k < snapCount; k++) {
+              const idx = snapIdx[k];
+              if (idx + 2 >= lenF32) continue;
+              const vx = hf32[idx];
+              const vy = hf32[idx + 1];
+              const vz = hf32[idx + 2];
+              if (!Number.isFinite(vx) || !Number.isFinite(vy) || !Number.isFinite(vz)) continue;
+              if (Math.abs(vx) < 0.001 && Math.abs(vz) < 0.001) continue;
+
+              const ex = vx - snapX0[k];
+              const ey = vy - snapY0[k];
+              const ez = vz - snapZ0[k];
+              const fullMove = Math.sqrt(ex * ex + ey * ey + ez * ez);
+              let validFullMove = 0;
+              if (fullMove >= 0.03 && fullMove <= 80.0) {
+                let isPlayerMirror = false;
+                if (pMoveFull >= 0.03) {
+                  const rdx = ex - pdxFull;
+                  const rdy = ey - pdyFull;
+                  const rdz = ez - pdzFull;
+                  if (Math.sqrt(rdx * rdx + rdy * rdy + rdz * rdz) < 0.15) {
+                    isPlayerMirror = true;
+                  }
+                }
+                if (!isPlayerMirror) {
+                  validFullMove = fullMove;
+                }
+              }
+
+              const bestMove = Math.max(validFullMove, midIndependentMove[k]);
+              if (bestMove < 0.03 || bestMove > 80.0) continue;
+
+              const dx = vx - px;
+              const dy = vy - py;
+              const dz = vz - pz;
+              if (Math.abs(dy) > MAX_Y) continue;
+              const dist2 = dx * dx + dy * dy + dz * dz;
+              if (dist2 < MIN_R2 || dist2 > MAX_R2) continue;
+
+              const byteAddr = idx * 4;
+              const structBase = (STRUCT_OFF > 0 && byteAddr >= STRUCT_OFF) ? (byteAddr - STRUCT_OFF) : byteAddr;
+              const matchesOffsetMod = (STRUCT_OFF > 0 && ((byteAddr - STRUCT_OFF) & 15) === 0);
+              const heapProximity = playerAddr > 0 ? Math.abs(byteAddr - playerAddr) : byteAddr;
+
+              movingHits.push({
+                heapIndex: idx,
+                byteAddr: byteAddr,
+                structBase: structBase,
+                matchesOffsetMod: matchesOffsetMod,
+                heapProximity: heapProximity,
+                x: vx,
+                y: vy,
+                z: vz,
+                dx: dx,
+                dy: dy,
+                dz: dz,
+                dist: Math.sqrt(dist2),
+                selfMoveDelta: bestMove
+              });
+            }
+
+            // Alignment-aware spatial deduplication (collapse physics/render clones within 0.35u of the same mob,
+            // preferring candidates whose address matches player struct alignment & heap pool proximity)
+            movingHits.sort(function(a, b) {
               if (a.matchesOffsetMod !== b.matchesOffsetMod) return a.matchesOffsetMod ? -1 : 1;
-              return a.heapIndex - b.heapIndex;
+              if (a.heapProximity !== b.heapProximity) return a.heapProximity - b.heapProximity;
+              return a.dist - b.dist;
             });
 
-            // Spatial deduplication: keep distinct entity positions (collapse render/physics clones within 0.25u)
             const deduped = [];
-            for (let i = 0; i < rawHits.length && deduped.length < 40; i++) {
-              const cand = rawHits[i];
+            for (let i = 0; i < movingHits.length && deduped.length < 60; i++) {
+              const cand = movingHits[i];
               let isClone = false;
               for (let j = 0; j < deduped.length; j++) {
                 const ex = deduped[j];
                 const ddx = cand.x - ex.x;
                 const ddy = cand.y - ex.y;
                 const ddz = cand.z - ex.z;
-                if ((ddx * ddx + ddy * ddy + ddz * ddz) < 0.0625) {
+                if ((ddx * ddx + ddy * ddy + ddz * ddz) < 0.1225) { // 0.35u squared
                   isClone = true;
                   break;
                 }
@@ -792,6 +918,12 @@ object WasmPointerAndEntityScripts {
                 deduped.push(cand);
               }
             }
+
+            // Final presentation order: strictly closest to furthest
+            deduped.sort(function(a, b) {
+              if (Math.abs(a.dist - b.dist) > 0.001) return a.dist - b.dist;
+              return a.heapIndex - b.heapIndex;
+            });
 
             const vw = window.innerWidth || 0;
             const vh = window.innerHeight || 0;
@@ -811,7 +943,7 @@ object WasmPointerAndEntityScripts {
               const hexCoord = __peFormatHex(e.byteAddr);
               const hexStruct = __peFormatHex(e.structBase);
               const relTag = 'Δ(' + e.dx.toFixed(1) + ', ' + e.dy.toFixed(1) + ', ' + e.dz.toFixed(1) + ')';
-              const entityName = 'WASM Entity #' + (i + 1);
+              const entityName = 'Moving Mob #' + (i + 1);
               const entityPath = 'HEAPF32[' + e.heapIndex + '] @ ' + hexCoord;
               const decoded = __peReadEntitySchema(e.byteAddr, heaps) || {};
               const activeTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
@@ -841,15 +973,21 @@ object WasmPointerAndEntityScripts {
                 worldX: Number(e.x.toFixed(3)),
                 worldY: Number(e.y.toFixed(3)),
                 worldZ: Number(e.z.toFixed(3)),
+                deltaX: Number(e.dx.toFixed(3)),
+                deltaZ: Number(e.dz.toFixed(3)),
                 distanceToPlayer: Number(e.dist.toFixed(2)),
+                distanceDelta: null,
+                selfMoveDelta: Number(e.selfMoveDelta.toFixed(3)),
+                isConfirmedMoving: true,
                 screenX: 0,
                 screenY: 0,
                 inViewport: e.dist <= 65.0,
                 sampleKeys: [
                   'WASM_STRUCT',
+                  'MOVING',
                   'struct=' + hexStruct,
                   relTag,
-                  STRUCT_OFF > 0 ? ('off=+0x' + STRUCT_OFF.toString(16).toUpperCase()) : 'spatial-vec3'
+                  STRUCT_OFF > 0 ? ('off=+0x' + STRUCT_OFF.toString(16).toUpperCase()) : 'two-pass-vec3'
                 ]
               });
               tracked.push({
@@ -858,7 +996,11 @@ object WasmPointerAndEntityScripts {
                 path: entityPath,
                 heapIndex: e.heapIndex,
                 byteAddr: e.byteAddr,
-                structBase: e.structBase
+                structBase: e.structBase,
+                prevX: e.x,
+                prevY: e.y,
+                prevZ: e.z,
+                prevDist: e.dist
               });
             }
 
@@ -866,22 +1008,27 @@ object WasmPointerAndEntityScripts {
             __entState.structOffset = STRUCT_OFF;
             __entState.tracked = tracked;
 
+            const staticFilteredCount = Math.max(0, snapCount - movingHits.length);
             const durationMs = Number((performance.now() - startMs).toFixed(1));
             __peStatus(
               entities.length > 0 ? 'COMPLETED' : 'IDLE',
-              'Step 3 WASM: ' + entities.length + ' nearby entities (' + durationMs + 'ms)'
+              'Two-Pass WASM: ' + entities.length + ' moving mobs (' + staticFilteredCount + ' static dropped)'
             );
             __peEmit('ENTITY', {
               stage: 'WASM_ENTITIES_DISCOVERED',
+              twoPass: true,
+              dwellMs: DWELL_MS,
               durationMs: durationMs,
               heapSourceLabel: heaps.label,
               playerByteAddress: playerAddr,
               playerCoords: { x: Number(px.toFixed(3)), y: Number(py.toFixed(3)), z: Number(pz.toFixed(3)) },
               structCoordOffset: STRUCT_OFF,
-              rawCandidateCount: rawHits.length,
+              pass1CandidateCount: snapCount,
+              rawCandidateCount: movingHits.length,
+              staticFilteredCount: staticFilteredCount,
               viewportWidth: vw,
               viewportHeight: vh,
-              projectionMode: 'WASM Spatial HEAPF32 (radius ' + MIN_R + '..' + MAX_R + 'u)',
+              projectionMode: 'WASM Two-Pass Moving Mobs (' + (DWELL_MS / 1000).toFixed(1) + 's)',
               arrayPath: heaps.label + ' near ' + __peFormatHex(playerAddr),
               entities: entities
             });
@@ -899,7 +1046,8 @@ object WasmPointerAndEntityScripts {
 
     /**
      * Starts a read-only 500ms live position refresh loop for the discovered WASM nearby entities,
-     * recomputing world `(X, Y, Z)` and distance to the player's live dereferenced coordinates.
+     * recomputing world `(X, Y, Z)`, relative `(ΔX, ΔZ)` compass vector, live distance trend (`distanceDelta`),
+     * entity self-movement (`selfMoveDelta`), and sorting strictly closest-to-furthest every tick.
      */
     fun buildStartWasmEntitiesLiveRefreshScript(): String = """
         (function() {
@@ -961,6 +1109,17 @@ object WasmPointerAndEntityScripts {
                   const dy = hasPlayer ? (y - py) : 0;
                   const dz = hasPlayer ? (z - pz) : 0;
                   const dist = hasPlayer ? Math.sqrt(dx * dx + dy * dy + dz * dz) : 0;
+                  const distDelta = (hasPlayer && typeof t.prevDist === 'number')
+                    ? Number((dist - t.prevDist).toFixed(3))
+                    : null;
+                  const selfMove = (typeof t.prevX === 'number')
+                    ? Math.sqrt((x - t.prevX) * (x - t.prevX) + (y - t.prevY) * (y - t.prevY) + (z - t.prevZ) * (z - t.prevZ))
+                    : 0;
+                  t.prevX = x;
+                  t.prevY = y;
+                  t.prevZ = z;
+                  if (hasPlayer) t.prevDist = dist;
+
                   const decoded = __peReadEntitySchema(t.byteAddr, heaps) || {};
                   const activeTargetCoord = (window.__wvTargetScan && window.__wvTargetScan.lastResolvedCoordAddr > 0)
                     ? window.__wvTargetScan.lastResolvedCoordAddr : 0;
@@ -988,12 +1147,18 @@ object WasmPointerAndEntityScripts {
                     worldX: Number(x.toFixed(3)),
                     worldY: Number(y.toFixed(3)),
                     worldZ: Number(z.toFixed(3)),
+                    deltaX: hasPlayer ? Number(dx.toFixed(3)) : null,
+                    deltaZ: hasPlayer ? Number(dz.toFixed(3)) : null,
                     distanceToPlayer: Number(dist.toFixed(2)),
+                    distanceDelta: distDelta,
+                    selfMoveDelta: Number(selfMove.toFixed(3)),
+                    isConfirmedMoving: true,
                     screenX: 0,
                     screenY: 0,
                     inViewport: dist <= 65.0,
                     sampleKeys: [
                       'WASM_STRUCT',
+                      'MOVING',
                       'struct=' + __peFormatHex(t.structBase),
                       'Δ(' + dx.toFixed(1) + ', ' + dy.toFixed(1) + ', ' + dz.toFixed(1) + ')'
                     ]

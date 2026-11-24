@@ -674,6 +674,14 @@ class DiagnosticsViewModel : ViewModel() {
 
     // Step 3: Player-Anchored Visual Entity Discovery (WASM HEAPF32 Nearby Entity Scan + JS Fallback)
     fun runStep3ScanEntities() {
+        runStep3ScanEntitiesWithDwell(dwellMs = 1200)
+    }
+
+    fun runStep3ScanEntitiesLonger() {
+        runStep3ScanEntitiesWithDwell(dwellMs = 2500)
+    }
+
+    private fun runStep3ScanEntitiesWithDwell(dwellMs: Int) {
         val state = _uiState.value
         val fd = state.wasmFloatDelta
         val activeHudChain = fd.activeHudPointerId?.let { id ->
@@ -715,11 +723,12 @@ class DiagnosticsViewModel : ViewModel() {
             }
 
             val hexPlayer = formatHexAddress(playerAddr)
-            onScanStatusChanged(AsyncScanStatus.RUNNING, "Step 3 (WASM): Scanning HEAPF32 near $hexPlayer…")
+            val dwellLabel = String.format(Locale.US, "%.1fs", dwellMs / 1000.0)
+            onScanStatusChanged(AsyncScanStatus.RUNNING, "Two-Pass WASM ($dwellLabel): Scanning 100% HEAPF32…")
             appendLog(
                 LogCategory.ENTITY,
-                "Step 3 (WASM): Scanning HEAPF32 for nearby entities around $hexPlayer…",
-                "Player=(${String.format(Locale.US, "%.2f", px)}, ${String.format(Locale.US, "%.2f", py)}, ${String.format(Locale.US, "%.2f", pz)}), structOffset=+0x${structOffset.toString(16).uppercase(Locale.US)}, radius=1.5..250u"
+                "Step 3 Two-Pass WASM ($dwellLabel): Scanning 100% HEAPF32 for moving mobs around $hexPlayer…",
+                "Player=(${String.format(Locale.US, "%.2f", px)}, ${String.format(Locale.US, "%.2f", py)}, ${String.format(Locale.US, "%.2f", pz)}), structOffset=+0x${structOffset.toString(16).uppercase(Locale.US)}, radius=1.5..250u, dwell=${dwellMs}ms"
             )
             _effects.tryEmit(
                 DiagnosticsEffect.EvaluateJs(
@@ -728,7 +737,8 @@ class DiagnosticsViewModel : ViewModel() {
                         playerX = px,
                         playerY = py,
                         playerZ = pz,
-                        structCoordOffset = structOffset
+                        structCoordOffset = structOffset,
+                        dwellMs = dwellMs
                     )
                 )
             )
@@ -777,9 +787,37 @@ class DiagnosticsViewModel : ViewModel() {
         val tick = json.optInt("tick", 1)
         val parsed = parseWasmEntitiesArray(json.optJSONArray("entities"))
         _uiState.update { state ->
+            val prevByKey = state.discoveredEntities.associateBy { it.selectionKey }
+            val livePlayer = state.livePlayerCoords
+            val enriched = parsed.map { item ->
+                val prev = prevByKey[item.selectionKey]
+                val computedDistDelta = item.distanceDelta ?: prev?.let {
+                    item.distanceToPlayer - it.distanceToPlayer
+                }
+                val computedDx = item.deltaX ?: livePlayer?.let { item.worldX - it.x }
+                val computedDz = item.deltaZ ?: livePlayer?.let { item.worldZ - it.z }
+                val computedSelfMove = if (item.selfMoveDelta > 0.0) {
+                    item.selfMoveDelta
+                } else if (prev != null) {
+                    val mx = item.worldX - prev.worldX
+                    val my = item.worldY - prev.worldY
+                    val mz = item.worldZ - prev.worldZ
+                    kotlin.math.sqrt(mx * mx + my * my + mz * mz)
+                } else {
+                    0.0
+                }
+                item.copy(
+                    deltaX = computedDx,
+                    deltaZ = computedDz,
+                    distanceDelta = computedDistDelta,
+                    selfMoveDelta = computedSelfMove,
+                    isConfirmedMoving = item.isConfirmedMoving || (prev?.isConfirmedMoving == true) || computedSelfMove >= 0.03
+                )
+            }.sortedBy { it.distanceToPlayer }
+
             state.copy(
-                discoveredEntities = parsed,
-                lastEntityCount = parsed.size,
+                discoveredEntities = enriched,
+                lastEntityCount = enriched.size,
                 isWasmEntitiesLivePolling = true,
                 wasmEntityLiveTickCount = tick
             )
@@ -3565,20 +3603,25 @@ class DiagnosticsViewModel : ViewModel() {
                     _effects.tryEmit(DiagnosticsEffect.ShowToast(errorMsg))
                     "Step 3 (WASM): $errorMsg"
                 } else {
+                    val isTwoPass = json.optBoolean("twoPass", false)
+                    val dwellMs = json.optInt("dwellMs", 0)
                     val durationMs = json.optDouble("durationMs", 0.0)
                     val arrayPath = json.optString("arrayPath", "window.HEAPF32")
                     val mode = json.optString("projectionMode", "WASM Spatial HEAPF32")
                     val vpW = json.optInt("viewportWidth", 0)
                     val vpH = json.optInt("viewportHeight", 0)
                     val rawCount = json.optInt("rawCandidateCount", 0)
+                    val staticFiltered = json.optInt("staticFilteredCount", 0)
                     val parsedEntities = parseWasmEntitiesArray(json.optJSONArray("entities"))
+                        .sortedBy { it.distanceToPlayer }
+                    val shouldAutoStartLive = isTwoPass && parsedEntities.isNotEmpty()
 
                     _uiState.update { state ->
                         val nextScan = state.scanCounter + 1
                         val mergedStaging = if (parsedEntities.isNotEmpty()) {
                             mergeIntoStagingBuffer(
                                 existing = state.stagingBuffer,
-                                incoming = listOf(arrayPath to "WASM nearby entities (${parsedEntities.size} detected)"),
+                                incoming = listOf(arrayPath to "WASM moving mobs (${parsedEntities.size} detected)"),
                                 sourceStep = "Step 3 WASM",
                                 scanNumber = nextScan,
                                 timestamp = nowTs
@@ -3593,20 +3636,45 @@ class DiagnosticsViewModel : ViewModel() {
                             entityViewportHeight = vpH,
                             discoveredEntities = parsedEntities,
                             lastEntityCount = parsedEntities.size,
-                            isWasmEntitiesLivePolling = false,
+                            lastStaticEntitiesFilteredCount = staticFiltered,
+                            lastEntityScanDwellMs = dwellMs,
+                            lastEntityScanCompleted = true,
+                            isWasmEntitiesLivePolling = shouldAutoStartLive,
                             wasmEntityLiveTickCount = 0,
                             stagingBuffer = mergedStaging,
                             scanStatus = if (parsedEntities.isNotEmpty()) AsyncScanStatus.COMPLETED else AsyncScanStatus.IDLE,
-                            scanStatusDetail = "Step 3 WASM: ${parsedEntities.size} nearby (${durationMs}ms)"
+                            scanStatusDetail = if (isTwoPass) {
+                                "Two-Pass: ${parsedEntities.size} moving ($staticFiltered static dropped)"
+                            } else {
+                                "Step 3 WASM: ${parsedEntities.size} nearby (${durationMs}ms)"
+                            }
+                        )
+                    }
+                    if (shouldAutoStartLive) {
+                        _effects.tryEmit(
+                            DiagnosticsEffect.EvaluateJs(
+                                WasmPointerAndEntityScripts.buildStartWasmEntitiesLiveRefreshScript()
+                            )
                         )
                     }
                     if (parsedEntities.isNotEmpty()) {
-                        _effects.tryEmit(
-                            DiagnosticsEffect.ShowToast("Found ${parsedEntities.size} nearby WASM entities — open Entities tab")
-                        )
-                        "Step 3 (WASM, ${durationMs}ms): Found ${parsedEntities.size} nearby entities (from $rawCount raw hits) in $arrayPath"
+                        val toastMsg = if (isTwoPass) {
+                            "Found ${parsedEntities.size} moving mobs ($staticFiltered static dropped) — Live tracking active"
+                        } else {
+                            "Found ${parsedEntities.size} nearby WASM entities — open Entities tab"
+                        }
+                        _effects.tryEmit(DiagnosticsEffect.ShowToast(toastMsg))
+                        if (isTwoPass) {
+                            "Step 3 Two-Pass (${durationMs}ms): ${parsedEntities.size} moving mobs closest→furthest ($staticFiltered static coords filtered) in $arrayPath"
+                        } else {
+                            "Step 3 (WASM, ${durationMs}ms): Found ${parsedEntities.size} nearby entities (from $rawCount raw hits) in $arrayPath"
+                        }
                     } else {
-                        "Step 3 (WASM, ${durationMs}ms): 0 nearby entity coordinates found within 1.5..250u of player"
+                        if (isTwoPass) {
+                            "Step 3 Two-Pass (${durationMs}ms): 0 moving mobs found ($staticFiltered static coords dropped). Try Retry Longer Scan (2.5s)."
+                        } else {
+                            "Step 3 (WASM, ${durationMs}ms): 0 nearby entity coordinates found within 1.5..250u of player"
+                        }
                     }
                 }
             }
@@ -4213,6 +4281,8 @@ class DiagnosticsViewModel : ViewModel() {
                 val obj = array.optJSONObject(i) ?: continue
                 fun optNullableInt(key: String): Int? =
                     if (obj.has(key) && !obj.isNull(key)) obj.optInt(key) else null
+                fun optNullableDouble(key: String): Double? =
+                    if (obj.has(key) && !obj.isNull(key)) obj.optDouble(key).takeIf { it.isFinite() } else null
                 val resolvedName = if (obj.has("resolvedName") && !obj.isNull("resolvedName")) {
                     obj.optString("resolvedName", "").takeIf { it.isNotBlank() }
                 } else null
@@ -4241,7 +4311,12 @@ class DiagnosticsViewModel : ViewModel() {
                         maxFp = optNullableInt("maxFp"),
                         aggroRawValue = optNullableInt("aggroRawValue"),
                         isAggro = isAggro,
-                        isActiveGameTarget = obj.optBoolean("isActiveGameTarget", false)
+                        isActiveGameTarget = obj.optBoolean("isActiveGameTarget", false),
+                        deltaX = optNullableDouble("deltaX"),
+                        deltaZ = optNullableDouble("deltaZ"),
+                        distanceDelta = optNullableDouble("distanceDelta"),
+                        selfMoveDelta = obj.optDouble("selfMoveDelta", 0.0).takeIf { it.isFinite() } ?: 0.0,
+                        isConfirmedMoving = obj.optBoolean("isConfirmedMoving", false)
                     )
                 )
             }

@@ -503,6 +503,7 @@ private fun StagingCandidateCard(
 fun EntityInspectionConsoleView(
     state: DiagnosticsUiState,
     onRescanEntities: () -> Unit,
+    onRescanEntitiesLonger: () -> Unit,
     onToggleLiveEntities: () -> Unit,
     onOpenTargetFinder: () -> Unit,
     onOpenProber: () -> Unit,
@@ -543,7 +544,7 @@ fun EntityInspectionConsoleView(
                     verticalArrangement = Arrangement.spacedBy(2.dp)
                 ) {
                     Text(
-                        text = state.discoveredEntityArrayPath ?: "Nearby Entities (Not Scanned)",
+                        text = state.discoveredEntityArrayPath ?: "Nearby Moving Mobs (Not Scanned)",
                         style = MaterialTheme.typography.titleSmall,
                         fontFamily = JetBrainsMonoFontFamily,
                         fontWeight = FontWeight.Bold,
@@ -552,7 +553,14 @@ fun EntityInspectionConsoleView(
                         overflow = TextOverflow.Ellipsis
                     )
                     val meta = buildString {
-                        append("${state.discoveredEntities.size} detected")
+                        if (state.lastEntityScanDwellMs > 0) {
+                            append("${state.discoveredEntities.size} moving")
+                            if (state.lastStaticEntitiesFilteredCount > 0) {
+                                append(" • ${state.lastStaticEntitiesFilteredCount} static dropped")
+                            }
+                        } else {
+                            append("${state.discoveredEntities.size} detected")
+                        }
                         if (state.isWasmEntitiesLivePolling) append(" • LIVE #${state.wasmEntityLiveTickCount}")
                         if (state.structProber.schema.hasAnyBound) {
                             append(" • ${state.structProber.schema.boundCount} offsets")
@@ -716,7 +724,7 @@ fun EntityInspectionConsoleView(
             ) {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.ViewInAr,
@@ -724,16 +732,56 @@ fun EntityInspectionConsoleView(
                         tint = TelemetryViolet.copy(alpha = 0.8f),
                         modifier = Modifier.size(28.dp)
                     )
+                    val filteredStatic = state.lastStaticEntitiesFilteredCount
+                    val showedZeroAfterTwoPass = state.lastEntityScanCompleted && filteredStatic > 0
                     Text(
-                        text = stringResource(R.string.entities_empty_title),
+                        text = stringResource(
+                            if (showedZeroAfterTwoPass) R.string.entities_zero_moving_title
+                            else R.string.entities_empty_title
+                        ),
                         style = MaterialTheme.typography.titleSmall,
                         color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = stringResource(R.string.entities_empty_subtitle),
+                        text = if (showedZeroAfterTwoPass) {
+                            stringResource(R.string.entities_zero_moving_subtitle, filteredStatic)
+                        } else {
+                            stringResource(R.string.entities_empty_subtitle)
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (isWasmEntityMode && state.lastEntityScanCompleted) {
+                        Surface(
+                            onClick = onRescanEntitiesLonger,
+                            shape = RoundedCornerShape(8.dp),
+                            color = TelemetryViolet.copy(alpha = 0.22f),
+                            border = BorderStroke(1.dp, TelemetryViolet),
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .testTag("retry_longer_entity_scan_button")
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = null,
+                                    tint = TelemetryViolet,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = stringResource(R.string.action_retry_longer_entity_scan),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = TelemetryViolet
+                                )
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -749,6 +797,7 @@ fun EntityInspectionConsoleView(
                     val isTracked = state.trackedEntityKey == entity.selectionKey
                     EntitySampleCard(
                         entity = entity,
+                        playerCoords = state.livePlayerCoords,
                         isTracked = isTracked,
                         onToggleTrack = { onToggleTrackEntity(entity.selectionKey) },
                         onProbeEntity = { onProbeEntity(entity) },
@@ -840,16 +889,28 @@ private fun ReadOnlyEntityLocationTrackerCard(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
+                val trackerDelta = entity.distanceDelta
+                val trackerArrow = when {
+                    trackerDelta != null && trackerDelta <= -0.08 -> " ↓"
+                    trackerDelta != null && trackerDelta >= 0.08 -> " ↑"
+                    else -> ""
+                }
+                val trackerBadgeColor = when {
+                    isAtMob -> SignalEmerald
+                    trackerDelta != null && trackerDelta <= -0.08 -> SignalEmerald
+                    trackerDelta != null && trackerDelta >= 0.08 -> AlertCoral
+                    else -> ElectricCyan
+                }
                 Surface(
-                    color = (if (isAtMob) SignalEmerald else ElectricCyan).copy(alpha = 0.22f),
+                    color = trackerBadgeColor.copy(alpha = 0.22f),
                     shape = RoundedCornerShape(5.dp)
                 ) {
                     Text(
-                        text = if (isAtMob) "AT MOB ✓ (${fmt2(liveDist)}u)" else "${fmt2(liveDist)}u • $headingText",
+                        text = if (isAtMob) "AT MOB ✓ (${fmt2(liveDist)}u)" else "${fmt2(liveDist)}u$trackerArrow • $headingText",
                         style = MaterialTheme.typography.labelSmall,
                         fontFamily = JetBrainsMonoFontFamily,
                         fontWeight = FontWeight.Bold,
-                        color = if (isAtMob) SignalEmerald else ElectricCyan,
+                        color = trackerBadgeColor,
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
                 }
@@ -955,10 +1016,18 @@ private fun ReadOnlyEntityLocationTrackerCard(
     }
 }
 
+internal fun formatCompassArrowLabel(dx: Double, dz: Double): String {
+    val angleRad = kotlin.math.atan2(dx, dz)
+    val deg = ((Math.toDegrees(angleRad) % 360.0) + 360.0) % 360.0
+    val dirs = listOf("↑ N", "↗ NE", "→ E", "↘ SE", "↓ S", "↙ SW", "← W", "↖ NW")
+    val idx = (((deg + 22.5) % 360.0) / 45.0).toInt().coerceIn(0, 7)
+    return dirs[idx]
+}
+
 private fun formatCompassHeading(dx: Double, dz: Double): String {
     val angleRad = kotlin.math.atan2(dx, dz)
     val deg = ((Math.toDegrees(angleRad) % 360.0) + 360.0) % 360.0
-    val dirs = listOf("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    val dirs = listOf("↑ N", "↗ NE", "→ E", "↘ SE", "↓ S", "↙ SW", "← W", "↖ NW")
     val idx = (((deg + 22.5) % 360.0) / 45.0).toInt().coerceIn(0, 7)
     return "${dirs[idx]} ${deg.toInt()}°"
 }
@@ -971,6 +1040,7 @@ private fun fmtSigned2(value: Double): String {
 @Composable
 private fun EntitySampleCard(
     entity: DiscoveredEntitySample,
+    playerCoords: PlayerCoordinates?,
     isTracked: Boolean,
     onToggleTrack: () -> Unit,
     onProbeEntity: () -> Unit,
@@ -984,6 +1054,15 @@ private fun EntitySampleCard(
         entity.inViewport -> TelemetryViolet.copy(alpha = 0.6f)
         else -> ObsidianBorder
     }
+    val dx = entity.deltaX ?: playerCoords?.let { entity.worldX - it.x }
+    val dz = entity.deltaZ ?: playerCoords?.let { entity.worldZ - it.z }
+    val compassChipText = if (dx != null && dz != null && (kotlin.math.abs(dx) > 0.01 || kotlin.math.abs(dz) > 0.01)) {
+        formatCompassArrowLabel(dx, dz)
+    } else null
+    val distDelta = entity.distanceDelta
+    val isApproaching = distDelta != null && distDelta <= -0.08
+    val isReceding = distDelta != null && distDelta >= 0.08
+
     Surface(
         shape = RoundedCornerShape(8.dp),
         color = when {
@@ -1048,19 +1127,91 @@ private fun EntitySampleCard(
                         )
                     }
                 }
+                if (entity.isConfirmedMoving || entity.selfMoveDelta >= 0.03) {
+                    Surface(
+                        color = SignalEmerald.copy(alpha = 0.16f),
+                        shape = RoundedCornerShape(4.dp)
+                    ) {
+                        Text(
+                            text = if (entity.selfMoveDelta >= 0.03) "WALKING" else "MOVED",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = SignalEmerald,
+                            fontSize = 9.sp,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+            }
+
+            // Navigation strip: 8-point compass direction + live distance + closer/farther arrow
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                if (compassChipText != null) {
+                    Surface(
+                        color = ElectricCyan.copy(alpha = 0.18f),
+                        border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.55f)),
+                        shape = RoundedCornerShape(5.dp),
+                        modifier = Modifier.testTag("entity_compass_${entity.selectionKey}")
+                    ) {
+                        Text(
+                            text = compassChipText,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = ElectricCyan,
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+
                 Surface(
-                    color = ElectricCyan.copy(alpha = 0.16f),
-                    shape = RoundedCornerShape(4.dp)
+                    color = ElectricCyan.copy(alpha = 0.12f),
+                    shape = RoundedCornerShape(5.dp)
                 ) {
                     Text(
                         text = "${fmt2(entity.distanceToPlayer)}u",
                         style = MaterialTheme.typography.labelSmall,
                         fontFamily = JetBrainsMonoFontFamily,
                         fontWeight = FontWeight.Bold,
-                        color = ElectricCyan,
-                        fontSize = 9.sp,
-                        modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp)
+                        color = MaterialTheme.colorScheme.onSurface,
+                        fontSize = 10.sp,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                     )
+                }
+
+                if (distDelta != null) {
+                    val trendColor = when {
+                        isApproaching -> SignalEmerald
+                        isReceding -> AlertCoral
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                    val trendText = when {
+                        isApproaching -> "↓ CLOSER ${String.format(Locale.US, "%.1f", distDelta)}u"
+                        isReceding -> "↑ FARTHER +${String.format(Locale.US, "%.1f", distDelta)}u"
+                        else -> "• STEADY"
+                    }
+                    Surface(
+                        color = trendColor.copy(alpha = if (isApproaching || isReceding) 0.2f else 0.1f),
+                        border = BorderStroke(1.dp, trendColor.copy(alpha = if (isApproaching || isReceding) 0.6f else 0.25f)),
+                        shape = RoundedCornerShape(5.dp),
+                        modifier = Modifier.testTag("entity_trend_${entity.selectionKey}")
+                    ) {
+                        Text(
+                            text = trendText,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontFamily = JetBrainsMonoFontFamily,
+                            fontWeight = FontWeight.Bold,
+                            color = trendColor,
+                            fontSize = 10.sp,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
                 }
             }
 

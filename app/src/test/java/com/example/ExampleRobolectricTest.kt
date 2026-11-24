@@ -1035,4 +1035,53 @@ class ExampleRobolectricTest {
         assertEquals(ProberSubTab.TARGET_FINDER, vm.uiState.value.activeProberSubTab)
         assertTrue(vm.uiState.value.targetScanner.isScanning)
     }
+
+    @Test
+    fun `two-pass entity scan sorts closest to furthest auto-starts live refresh and computes closer vs farther distance trends`() {
+        val vm = DiagnosticsViewModel()
+
+        // Seed live player pointer
+        vm.onTelemetryFromBridge(
+            "WASM",
+            """{"stage":"WASM_POINTER_SCAN_COMPLETE","durationMs":8.0,"targetByteAddress":65011712,"totalL1":1,"totalL2":0,"chains":[{"id":"L1_0x00135C64_+0x98","depth":1,"basePointerAddress":1268836,"offsets":[152],"resolvedTargetAddress":65011712,"resolvedX":6961.98,"resolvedY":100.0,"resolvedZ":3309.76,"isLikelyStatic":true,"isVerifiedLive":true,"expression":"*(0x00135C64) + 0x98"}]}"""
+        )
+
+        // Trigger standard two-pass scan
+        vm.runStep3ScanEntities()
+        assertEquals(AsyncScanStatus.RUNNING, vm.uiState.value.scanStatus)
+
+        // Receive two-pass result intentionally out-of-order to verify strict closest->furthest sorting + auto-live
+        vm.onTelemetryFromBridge(
+            "ENTITY",
+            """{"stage":"WASM_ENTITIES_DISCOVERED","twoPass":true,"dwellMs":1200,"durationMs":1240.5,"staticFilteredCount":3420,"pass1CandidateCount":3426,"rawCandidateCount":6,"arrayPath":"window.HEAPF32 near 0x03E00000","projectionMode":"WASM Two-Pass Moving Mobs (1.2s)","viewportWidth":1080,"viewportHeight":1920,"entities":[{"name":"Moving Mob #2","id":"0x03E02400","path":"HEAPF32[16255270] @ 0x03E02498","coordByteAddress":65021080,"heapIndex":16255270,"worldX":6996.98,"worldY":100.0,"worldZ":3309.76,"deltaX":35.0,"deltaZ":0.0,"distanceToPlayer":35.0,"selfMoveDelta":2.4,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","MOVING"]},{"name":"Moving Mob #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6975.0,"worldY":100.0,"worldZ":3322.8,"deltaX":13.02,"deltaZ":13.04,"distanceToPlayer":18.5,"selfMoveDelta":1.8,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","MOVING"]}]}"""
+        )
+
+        val afterScan = vm.uiState.value
+        assertTrue(afterScan.isWasmEntitiesLivePolling) // Auto-started on two-pass discovery
+        assertEquals(3420, afterScan.lastStaticEntitiesFilteredCount)
+        assertEquals(1200, afterScan.lastEntityScanDwellMs)
+        assertTrue(afterScan.lastEntityScanCompleted)
+        assertEquals(2, afterScan.discoveredEntities.size)
+        // Strictly closest to furthest
+        assertEquals("0x03E01000", afterScan.discoveredEntities[0].id)
+        assertEquals(18.5, afterScan.discoveredEntities[0].distanceToPlayer, 0.01)
+        assertEquals("0x03E02400", afterScan.discoveredEntities[1].id)
+        assertEquals(35.0, afterScan.discoveredEntities[1].distanceToPlayer, 0.01)
+        assertTrue(afterScan.discoveredEntities[0].isConfirmedMoving)
+
+        // Receive 500ms Live tick: Mob #1 gets closer (18.5 -> 12.1), Mob #2 gets farther (35.0 -> 41.5)
+        vm.onWasmEntitiesUpdatedFromBridge(
+            """{"stage":"WASM_ENTITIES_TICK","tick":2,"entities":[{"name":"Moving Mob #2","id":"0x03E02400","path":"HEAPF32[16255270] @ 0x03E02498","coordByteAddress":65021080,"heapIndex":16255270,"worldX":7003.48,"worldY":100.0,"worldZ":3309.76,"deltaX":41.5,"deltaZ":0.0,"distanceToPlayer":41.5,"selfMoveDelta":0.6,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","MOVING"]},{"name":"Moving Mob #1","id":"0x03E01000","path":"HEAPF32[16253990] @ 0x03E01098","coordByteAddress":65015960,"heapIndex":16253990,"worldX":6970.5,"worldY":100.0,"worldZ":3318.3,"deltaX":8.52,"deltaZ":8.54,"distanceToPlayer":12.1,"selfMoveDelta":0.9,"isConfirmedMoving":true,"screenX":0,"screenY":0,"inViewport":true,"sampleKeys":["WASM_STRUCT","MOVING"]}]}"""
+        )
+
+        val afterTick = vm.uiState.value.discoveredEntities
+        assertEquals("0x03E01000", afterTick[0].id)
+        assertTrue(afterTick[0].distanceDelta != null && afterTick[0].distanceDelta!! < -5.0) // ↓ CLOSER
+        assertEquals("0x03E02400", afterTick[1].id)
+        assertTrue(afterTick[1].distanceDelta != null && afterTick[1].distanceDelta!! > 5.0) // ↑ FARTHER
+
+        // Longer 2.5s retry scan action enters RUNNING cleanly
+        vm.runStep3ScanEntitiesLonger()
+        assertEquals(AsyncScanStatus.RUNNING, vm.uiState.value.scanStatus)
+    }
 }
